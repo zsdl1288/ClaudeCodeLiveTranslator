@@ -1,0 +1,5 @@
+raw_output.log
+untranslated.log
+__pycache__/
+*.pyc
+.DS_Store
