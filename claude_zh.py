@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Claude Code CLI 中文化包装器 v2.1
+Claude Code CLI 中文化包装器 v2.2
 直接在终端运行，实时翻译 Claude Code 输出中的英文 UI 文字。
 
 用法:  python claude-zh.py [参数...]
@@ -146,7 +146,7 @@ def main():
     env = os.environ.copy()
     env["CLAUDE_CLI_ZH_WRAPPED"] = "1"
 
-    print("\033[1;36mClaude Code 中文化 v2.1\033[0m")
+    print("\033[1;36mClaude Code 中文化 v2.2\033[0m")
     print("\033[90m词条 {} 条\033[0m".format(len(_PHRASES)))
 
     rows, cols = _get_win_size()
@@ -161,19 +161,28 @@ def main():
     exit_code = 0
     lock = threading.Lock()
 
-    # ── PTY → stdout (微缓冲 100ms 合并碎片后翻译) ──
+    # ── PTY → stdout (30ms 微缓冲合并碎片，在行/帧边界 flush) ──
     def reader():
         nonlocal alive, exit_code
         buf = ""
-        last_data_time = time.time()
+        last_flush = time.time()
+        # 帧边界信号 — 这些出现时立即 flush（不等待超时）
+        FRAME_SIGNALS = ('\n', '\x1b[H', '\x1b[2J', '\x1b[J')
 
         def do_flush():
-            nonlocal buf
+            nonlocal buf, last_flush
             if buf:
                 with lock:
                     sys.stdout.write(_translate(buf))
                     sys.stdout.flush()
                 buf = ""
+                last_flush = time.time()
+
+        def has_frame_signal(s: str) -> bool:
+            for sig in FRAME_SIGNALS:
+                if sig in s:
+                    return True
+            return False
 
         while alive:
             try:
@@ -182,27 +191,27 @@ def main():
                 if isinstance(data, bytes):
                     data = data.decode("utf-8", errors="replace")
                 if data:
-                    # 距上次收到数据超过 100ms → 说明是新一帧，flush 上一帧
-                    if buf and now - last_data_time > 0.1:
-                        do_flush()
                     buf += data
-                    last_data_time = now
-                    # 这些条件出现时立刻 flush（屏幕刷新信号）
-                    if '\x1b[H' in data or '\x1b[2J' in data or '\x1b[?25h' in data or '\x1b[?25l' in data:
+                    # 帧/行边界 → 立即 flush
+                    if has_frame_signal(data):
                         do_flush()
-                    elif len(buf) > 4096:
+                    # 30ms 超时 → flush（人眼不可感知，但足以合并碎片）
+                    elif now - last_flush > 0.03:
+                        do_flush()
+                    # 安全阀 — 超长缓冲
+                    elif len(buf) > 8192:
                         do_flush()
                 else:
-                    # 无数据，flush 残留
+                    # 空闲 → flush 残留
                     do_flush()
-                    time.sleep(0.01)
+                    time.sleep(0.005)
             except (OSError, EOFError):
                 alive = False
                 break
             except Exception:
                 break
         do_flush()
-        # drain
+        # drain 剩余数据
         try:
             while True:
                 r = pty.read(4096)
