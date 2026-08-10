@@ -9,7 +9,7 @@ echo.
 set "INSTALL_DIR=%USERPROFILE%\.claude\cli-zh"
 
 echo [1/3] 安装 Python 依赖...
-pip install pywinpty -q
+pip install pywinpty deep-translator -q
 if %ERRORLEVEL% NEQ 0 (
     echo 错误: pywinpty 安装失败
     pause
