@@ -161,43 +161,47 @@ def main():
     exit_code = 0
     lock = threading.Lock()
 
-    # ── PTY → stdout ──
+    # ── PTY → stdout (微缓冲 100ms 合并碎片后翻译) ──
     def reader():
         nonlocal alive, exit_code
         buf = ""
+        last_data_time = time.time()
+
+        def do_flush():
+            nonlocal buf
+            if buf:
+                with lock:
+                    sys.stdout.write(_translate(buf))
+                    sys.stdout.flush()
+                buf = ""
+
         while alive:
             try:
                 data = pty.read(4096)
+                now = time.time()
                 if isinstance(data, bytes):
                     data = data.decode("utf-8", errors="replace")
                 if data:
-                    # 积累碎片
+                    # 距上次收到数据超过 100ms → 说明是新一帧，flush 上一帧
+                    if buf and now - last_data_time > 0.1:
+                        do_flush()
                     buf += data
-                    # 屏幕刷新或够大了就 flush
-                    if '\x1b[H' in buf or '\x1b[2J' in buf or len(buf) > 4096 or '\n' in buf[-60:]:
-                        # _debug_raw(buf)
-                        with lock:
-                            sys.stdout.write(_translate(buf))
-                            sys.stdout.flush()
-                        buf = ""
+                    last_data_time = now
+                    # 这些条件出现时立刻 flush（屏幕刷新信号）
+                    if '\x1b[H' in data or '\x1b[2J' in data or '\x1b[?25h' in data or '\x1b[?25l' in data:
+                        do_flush()
+                    elif len(buf) > 4096:
+                        do_flush()
                 else:
-                    # 无数据 → flush 残留 + 短暂休眠
-                    if buf:
-                        # _debug_raw(buf)
-                        with lock:
-                            sys.stdout.write(_translate(buf))
-                            sys.stdout.flush()
-                        buf = ""
+                    # 无数据，flush 残留
+                    do_flush()
                     time.sleep(0.01)
             except (OSError, EOFError):
                 alive = False
                 break
             except Exception:
                 break
-        # 最后的缓冲
-        if buf:
-            sys.stdout.write(_translate(buf))
-            sys.stdout.flush()
+        do_flush()
         # drain
         try:
             while True:
