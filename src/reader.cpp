@@ -175,7 +175,12 @@ struct ResponseText {
     void add(const std::wstring& value, bool monospace, const std::string& block, bool standalone = false) {
         if (standalone || previous_standalone || (!block.empty() && !paragraph.empty() && block != paragraph)) {
             flush_code();
-            if (!text.empty() && text.back() != L'\n') text += L'\n';
+            // These are verified structural paragraphs, not visual soft wraps.
+            // Keep their boundary through sentence splitting for display grouping.
+            if (!text.empty()) {
+                if (text.back() != L'\n') text += L'\n';
+                if (text.size() < 2 || text[text.size() - 2] != L'\n') text += L'\n';
+            }
         }
         if (!block.empty()) paragraph = block;
         if (monospace) code += value;
@@ -251,6 +256,23 @@ class Reader {
         auto result = node(std::move(element));
         parents_.emplace(child->id, result);
         return result;
+    }
+    std::string display_paragraph(const N& item, const N& boundary) {
+        // Inline Text/strong/link siblings share a semantic paragraph. A nearest
+        // arbitrary Text node alone is not evidence of a new paragraph.
+        N current = item, fallback = item;
+        for (int depth = 0; current && depth < 64; ++depth) {
+            const auto role = lower(current->aria_role);
+            const auto type_name = lower(current->localized_type);
+            if (role == L"paragraph" || type_name == L"paragraph" || type_name == L"段落" ||
+                current->heading_level || current->type == UIA_ListItemControlTypeId ||
+                current->type == UIA_DataItemControlTypeId || current->type == UIA_HeaderItemControlTypeId ||
+                has_class(current->class_name, L"font-claude-response")) return current->id;
+            if (current->id == boundary->id) break;
+            fallback = current;
+            current = parent(current);
+        }
+        return fallback->id;
     }
     std::vector<N> descendants(const N& root, CONTROLTYPEID control = 0, std::size_t limit = 100000) {
         Ptr<IUIAutomationCondition> condition;
@@ -546,6 +568,7 @@ class Reader {
                 }
             }
             if (text.empty()) continue;
+            paragraph = display_paragraph(item, message);
             if (type == UIA_ListItemControlTypeId) { paragraph = item->id; text = L"- " + text; }
             else if (type == UIA_DataItemControlTypeId || type == UIA_HeaderItemControlTypeId) paragraph = item->id;
             const bool monospace = rx(font, mono_font);
@@ -645,7 +668,7 @@ class Reader {
     }
     std::vector<Block> semantic_blocks(const N& window, DWORD pid) {
         std::vector<Block> result;
-        std::unordered_map<std::string, std::wstring> builders;
+        std::unordered_map<std::string, ResponseText> builders;
         std::unordered_map<std::string, bool> user_messages;
         const auto semantic_nodes = descendants(window, 0, 10000);
         const auto preferred_names = preferred_container_names(semantic_nodes);
@@ -661,12 +684,12 @@ class Reader {
             if (blank(item->name) || item->name.size() > 64000 || item->class_name.find(L"sr-only") != std::wstring::npos || is_assistant_marker(item) || is_user_marker(item)) continue;
             try {
                 auto current = parent(item);
-                std::string key, strong_key, message_key; bool skip = false;
+                std::string key, strong_key, message_key; N owner, strong_owner, message_owner; bool skip = false;
                 for (int depth = 0; current && current->id != window->id && depth < 24; ++depth, current = parent(current)) {
                     const auto semantic = current->class_name + L" " + current->automation_id;
                     if (current->type == UIA_EditControlTypeId || current->type == UIA_ButtonControlTypeId || current->type == UIA_ToolBarControlTypeId || rx(semantic, excluded_semantic)) { skip = true; break; }
-                    if (rx(semantic, assistant_semantic)) key = std::to_string(pid) + "|semantic|" + current->id;
-                    if (rx(semantic, strong_assistant_semantic)) strong_key = std::to_string(pid) + "|semantic|" + current->id;
+                    if (rx(semantic, assistant_semantic)) { key = std::to_string(pid) + "|semantic|" + current->id; owner = current; }
+                    if (rx(semantic, strong_assistant_semantic)) { strong_key = std::to_string(pid) + "|semantic|" + current->id; strong_owner = current; }
                     if (is_message(current) || lower(current->aria_role) == L"article" || has_class(current->class_name, L"group/message-row")) {
                         auto found = user_messages.find(current->id);
                         if (found == user_messages.end()) {
@@ -675,20 +698,23 @@ class Reader {
                             found = user_messages.emplace(current->id, user).first;
                         }
                         if (found->second) { skip = true; break; }
-                        message_key = std::to_string(pid) + (lower(current->aria_role) == L"article" || is_message(current) ? "|message|" : "|row|") + current->id;
+                        message_key = std::to_string(pid) + (lower(current->aria_role) == L"article" || is_message(current) ? "|message|" : "|row|") + current->id; message_owner = current;
                     }
                 }
                 if (skip || key.empty()) continue;
                 // Styled paragraphs share one structural message/assistant output block.
-                if (!message_key.empty()) key = message_key;
-                else if (!strong_key.empty()) key = strong_key;
+                if (!message_key.empty()) { key = message_key; owner = message_owner; }
+                else if (!strong_key.empty()) { key = strong_key; owner = strong_owner; }
                 key += "|answer|message-body";
-                if (!builders.count(key)) { builders.emplace(key, std::wstring{}); result.push_back({key, "answer", {}}); }
-                auto& text = builders.at(key);
-                if (text.size() + item->name.size() < 64000) text += (item->heading_level ? std::wstring(item->heading_level, L'#') + L" " : item->type == UIA_ListItemControlTypeId ? L"- " : L"") + item->name + L"\n";
+                if (!builders.count(key)) { builders.emplace(key, ResponseText{}); result.push_back({key, "answer", {}}); }
+                auto& builder = builders.at(key);
+                if (builder.text.size() + item->name.size() + 16 < 64000) {
+                    auto value = (item->heading_level ? std::wstring(item->heading_level, L'#') + L" " : item->type == UIA_ListItemControlTypeId ? L"- " : L"") + item->name + L"\n";
+                    builder.add(value, false, display_paragraph(item, owner), item->heading_level != 0);
+                }
             } catch (const UiaError&) {}
         }
-        for (auto& block : result) block.text = builders.at(block.key);
+        for (auto& block : result) block.text = builders.at(block.key).finish();
         // Semantic-only Code layouts: keep only the newest assistant container.
         if (result.size() > 1) return {std::move(result.back())};
         return result;

@@ -70,6 +70,66 @@ void native_format_checks() {
     check(GetForegroundWindow() != edit, "formatter activated hidden caller-owned RichEdit");
     DestroyWindow(edit); FreeLibrary(library);
 }
+void native_paragraph_checks() {
+    const auto library = LoadLibraryW(L"Msftedit.dll");
+    check(library != nullptr, "paragraph RichEdit library could not load");
+    const HWND edit = CreateWindowExW(0, MSFTEDIT_CLASS, L"", WS_POPUP | ES_MULTILINE | ES_READONLY,
+        -20000, -20000, 340, 1200, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    check(edit != nullptr, "paragraph RichEdit could not be created");
+    SendMessageW(edit, EM_SETTARGETDEVICE, 0, 0);
+    RECT bounds{8, 4, 332, 1196};
+    SendMessageW(edit, EM_SETRECT, 0, reinterpret_cast<LPARAM>(&bounds));
+    const std::wstring long_body = L"中文、标点与 English words 的长列表正文应在窄窗中自然换行，并让后续文字与第一行正文对齐。继续阅读这一条目，不能把回卷文字排到编号下方。";
+    const auto layout = cclive::make_text_layout(L"# 首标题\n正文段落。\n## 后续标题\n1. " + long_body + L"\n10. " + long_body + L"\n100) " + long_body + L"\n  7. " + long_body + L"\n- " + long_body + L"\n  - " + long_body + L"\n普通收尾。");
+    auto paragraph_style = [&](LONG position) {
+        CHARRANGE range{position, position}; SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
+        PARAFORMAT2 value{}; value.cbSize = sizeof(value);
+        SendMessageW(edit, EM_GETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&value)); return value;
+    };
+    auto point_at = [&](LONG position) {
+        POINTL point{}; SendMessageW(edit, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&point), position); return point;
+    };
+    for (const int points : {8, 10, 18, 40}) {
+        SetWindowTextW(edit, layout.text.c_str());
+        cclive::apply_text_layout(edit, layout, points, 96);
+        const auto normal = paragraph_style(layout.paragraphs[1].start);
+        check(normal.bLineSpacingRule == 5 && normal.dyLineSpacing == 25 && normal.dySpaceAfter == points * 6, "body line/paragraph rhythm did not scale with point size");
+        check(normal.dxStartIndent == 0 && normal.dxOffset == 0 && normal.wNumbering == 0 && normal.cTabCount == 0, "normal paragraph inherited list indentation or tabs");
+        check(paragraph_style(0).dySpaceBefore == 0 && paragraph_style(layout.paragraphs[2].start).dySpaceBefore == points * 12, "first and subsequent heading spacing incorrect");
+        LONG ordered_x = -1;
+        for (const auto& paragraph : layout.paragraphs) if (paragraph.ordered || paragraph.bullet) {
+            const auto format = paragraph_style(paragraph.start);
+            check(format.dySpaceAfter == points * 2 && format.dxOffset >= points * 36 && format.cTabCount == 1, "list spacing, hanging indent or tab column did not scale");
+            check(format.wNumbering == (paragraph.bullet ? PFN_BULLET : 0), "source-owned ordered list was automatically renumbered");
+            const LONG body = paragraph.start + (paragraph.ordered ? paragraph.marker_length + 1 : 0);
+            CHARRANGE range{body, body}; SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
+            SendMessageW(edit, EM_SCROLLCARET, 0, 0);
+            const auto first = point_at(body);
+            const auto line = SendMessageW(edit, EM_EXLINEFROMCHAR, 0, body);
+            const LONG next = static_cast<LONG>(SendMessageW(edit, EM_LINEINDEX, line + 1, 0));
+            check(next > body && next < paragraph.start + paragraph.length, "long list fixture did not wrap inside its paragraph");
+            const auto wrapped = point_at(next);
+            if (std::abs(first.x - wrapped.x) > 2)
+                std::cerr << "wrap x: font=" << points << " ordered=" << paragraph.ordered << " nested=" << paragraph.indent_level << " first=" << first.x << " wrap=" << wrapped.x << '\n';
+            check(std::abs(first.x - wrapped.x) <= 2 && wrapped.y > first.y, "wrapped list text did not align with first-line body column");
+            if (paragraph.ordered && paragraph.indent_level == 0) {
+                if (ordered_x < 0) ordered_x = first.x;
+                check(std::abs(first.x - ordered_x) <= 2, "one, two and three digit source numbers have different body columns");
+            }
+        }
+        const auto plain = cclive::make_text_layout(L"普通中文正文替换列表。");
+        SetWindowTextW(edit, plain.text.c_str()); cclive::apply_text_layout(edit, plain, points, 96);
+        const auto reset = paragraph_style(0);
+        check(reset.dxStartIndent == 0 && reset.dxOffset == 0 && reset.cTabCount == 0 && reset.wNumbering == 0, "list to plain replacement left native numbering, tabs or hanging indent");
+    }
+    const auto long_number = cclive::make_text_layout(L"1. " + long_body + L"\n987654321. " + long_body);
+    SetWindowTextW(edit, long_number.text.c_str()); cclive::apply_text_layout(edit, long_number, 10, 96);
+    const auto first_body = point_at(long_number.paragraphs[0].start + 3);
+    const auto large_body = point_at(long_number.paragraphs[1].start + 11);
+    check(std::abs(first_body.x - large_body.x) <= 2, "long original source number exceeded the measured list tab column");
+    check(GetForegroundWindow() != edit, "paragraph formatting activated hidden RichEdit");
+    DestroyWindow(edit); FreeLibrary(library);
+}
 int main() {
     try {
         const auto plain = cclive::make_text_layout(L"你好\nsecond\r\nthird\r");
@@ -87,9 +147,22 @@ int main() {
         const auto unicode = cclive::make_text_layout(L"\U0001F600 **文本**");
         check(unicode.ranges.size() == 1 && static_cast<std::size_t>(unicode.ranges[0].start) == unicode.text.find(L"文本") && unicode.ranges[0].length == 2, "Unicode range offsets are not UTF16 positions");
         const auto bullet = cclive::make_text_layout(L"- first\n  * nested\n+ third\n1. Own number\n2) Own number");
-        check(bullet.text == L"first\rnested\rthird\r1. Own number\r2) Own number", "list markers or content-owned numbers were altered incorrectly");
+        check(bullet.text == L"first\rnested\rthird\r1.\tOwn number\r2)\tOwn number", "list markers or content-owned numbers were altered incorrectly");
         check(bullet.paragraphs[0].bullet && bullet.paragraphs[1].bullet && bullet.paragraphs[2].bullet && !bullet.paragraphs[3].bullet, "unordered list scope incorrect");
         check(bullet.paragraphs[1].indent_level == 1, "nested list indentation was lost");
+        check(bullet.paragraphs[3].ordered && bullet.paragraphs[3].marker_length == 2 && bullet.paragraphs[4].ordered, "source-owned ordered marker metadata missing");
+        const auto numbered = cclive::make_text_layout(L"7. 中文\n10)   下一项\n  23. 嵌套\n1.正文\n3.14 decimal\n1.test");
+        check(numbered.text == L"7.\t中文\r10)\t下一项\r23.\t嵌套\r1.\t正文\r3.14 decimal\r1.test", "original list numbers, CJK content or literal decimal/path changed");
+        check(numbered.paragraphs[2].ordered && numbered.paragraphs[2].indent_level == 1 && !numbered.paragraphs[4].ordered && !numbered.paragraphs[5].ordered, "ordered list scope or nesting incorrect");
+        const auto gaps = cclive::make_text_layout(L"段一\n\n \t\n\n段二\n\n\n");
+        check(gaps.text == L"段一\r\r段二\r" && gaps.paragraphs.size() == 4, "repeated blank paragraphs were not collapsed to one");
+        const auto literal_code = cclive::make_text_layout(L"```\nline\n\n\n  \nend\n```");
+        check(literal_code.text == L"```\rline\r\r\r  \rend\r```", "blank-line cleanup altered fenced code");
+        const auto inline_code = cclive::make_text_layout(L"路径 `a **b**` 与 **加粗 `x*y`**；\\**literal** \\`tick\\`。");
+        check(inline_code.text == L"路径 a **b** 与 加粗 x*y；\\**literal** \\`tick\\`。", "inline code or escaped Markdown lost literal content");
+        check(styles(inline_code, cclive::TextStyle::Code) == 2 && styles(inline_code, cclive::TextStyle::Bold) == 1, "inline code failed to protect literal emphasis delimiters");
+        check(cclive::make_text_layout(L"before `unfinished **literal**").text == L"before `unfinished **literal**", "unfinished inline code was consumed");
+        check(cclive::make_text_layout(L"``x`y``").text == L"x`y", "multi-backtick inline delimiter lost a literal backtick");
         const auto code = cclive::make_text_layout(L"```cpp\n# Not heading **literal**\n- literal\n```\n**outside**");
         check(code.text == L"```cpp\r# Not heading **literal**\r- literal\r```\routside", "fenced code was parsed as prose or modified");
         check(styles(code, cclive::TextStyle::Code) == 4 && styles(code, cclive::TextStyle::Heading) == 0 && styles(code, cclive::TextStyle::Bold) == 1, "fenced code formatting boundaries incorrect");
@@ -110,6 +183,7 @@ int main() {
                 check(paragraph.start >= 0 && paragraph.length >= 0 && static_cast<std::size_t>(paragraph.start + paragraph.length) <= layout->text.size(), "paragraph range extends outside rendered text");
         }
         native_format_checks();
+        native_paragraph_checks();
         std::cout << checks << " text layout checks, 0 failures\n";
         return 0;
     } catch (const std::exception& error) {

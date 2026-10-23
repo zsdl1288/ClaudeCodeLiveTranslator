@@ -26,6 +26,8 @@ struct TextParagraphStyle {
     int indent_level = 0;
     bool bullet = false;
     bool code = false;
+    bool ordered = false;
+    int marker_length = 0; // Source-owned number and separator before the display tab.
 };
 struct TextLayout {
     // Single CR paragraph separators match RichEdit's UTF-16 character positions.

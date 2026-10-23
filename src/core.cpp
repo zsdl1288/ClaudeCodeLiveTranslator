@@ -491,7 +491,7 @@ std::string translate(const Settings& s,const std::string& text,const Delta& del
     check_cancel(cancel);if(trim(result).empty())throw TranslationError("翻译服务未返回译文，请检查模型与服务配置。");return result;
 }
 
-std::vector<std::string> split_sentences(const std::string& input) {
+std::vector<TextSegment> split_text_segments(const std::string& input) {
     auto text=to_wide(input);std::wstring clean;std::size_t p=0,plain=0;wchar_t opened=0;std::size_t open_count=0;
     while(p<text.size()){
         wchar_t c=text[p];if((c==L'`'||c==L'~')&&p+2<text.size()&&text[p+1]==c&&text[p+2]==c){
@@ -536,12 +536,13 @@ std::vector<std::string> split_sentences(const std::string& input) {
         }
     }
     flush();
-    std::vector<std::string> result;
+    std::vector<TextSegment> result;
     const std::wregex abbreviation(L"\\b(?:e\\.g|i\\.e|Mr|Mrs|Ms|Dr|Prof|vs|etc|St)\\.$",std::regex_constants::icase);
     const std::wregex initials(L"(?:\\b[A-Za-z]\\.){2,}$");
-    for (const auto& unit : units) {
+    for (std::size_t paragraph = 0; paragraph < units.size(); ++paragraph) {
+        const auto& unit = units[paragraph];
         if (unit.structural) {
-            result.push_back(to_utf8(unit.text));
+            result.push_back({to_utf8(unit.text), paragraph});
             continue;
         }
         const auto& para = unit.text;
@@ -551,10 +552,15 @@ std::vector<std::string> split_sentences(const std::string& input) {
             std::size_t stop=i+1;while(stop<para.size()&&std::wstring(L"\"'\u2019\u201d)]").find(para[stop])!=std::wstring::npos)++stop;
             if(stop<para.size()&&!iswspace(para[stop]))continue;
             auto prefix=para.substr(start,stop-start);if(std::regex_search(prefix,abbreviation)||std::regex_search(prefix,initials))continue;
-            auto candidate=trimw(prefix);if(!candidate.empty())result.push_back(to_utf8(candidate));start=stop;i=stop-1;
+            auto candidate=trimw(prefix);if(!candidate.empty())result.push_back({to_utf8(candidate), paragraph});start=stop;i=stop-1;
         }
-        auto tail=trimw(para.substr(start));if(!tail.empty())result.push_back(to_utf8(tail));
+        auto tail=trimw(para.substr(start));if(!tail.empty())result.push_back({to_utf8(tail), paragraph});
     }
+    return result;
+}
+std::vector<std::string> split_sentences(const std::string& input) {
+    std::vector<std::string> result;
+    for (auto& segment : split_text_segments(input)) result.push_back(std::move(segment.text));
     return result;
 }
 Ledger::Ledger(int settle_ms):settle_(settle_ms){if(settle_ms<0)throw std::invalid_argument("settle_ms must not be negative");}
@@ -580,11 +586,11 @@ std::vector<json> Ledger::observe_at(const json& snapshot,std::int64_t now){
         auto pos=std::find_if(blocks_.begin(),blocks_.end(),[&](const Block& b){return b.key==in.key;});Block block;
         if(pos!=blocks_.end()){block=std::move(*pos);blocks_.erase(pos);}else{block.key=in.key;block.kind=in.kind;}
         bool absent=!block.present,kind_changed=block.kind!=in.kind;block.kind=in.kind;block.present=true;
-        auto candidates=split_sentences(in.segments[0].text);if(candidates.size()>4096)candidates.resize(4096);
+        auto candidates=split_text_segments(in.segments[0].text);if(candidates.size()>4096)candidates.resize(4096);
         std::size_t count=(std::max)(candidates.size(),block.segments.size());
-        for(std::size_t i=0;i<count;++i){std::string candidate=i<candidates.size()?candidates[i]:"";
-            if(i>=block.segments.size()){Segment seg;seg.text=candidate;seg.changed=now;block.segments.push_back(std::move(seg));continue;}
-            auto& slot=block.segments[i];if(candidate!=slot.text||kind_changed){slot.text=candidate;slot.changed=now;}
+        for(std::size_t i=0;i<count;++i){std::string candidate=i<candidates.size()?candidates[i].text:"";std::size_t paragraph=i<candidates.size()?candidates[i].paragraph:0;
+            if(i>=block.segments.size()){Segment seg;seg.text=candidate;seg.paragraph=paragraph;seg.changed=now;block.segments.push_back(std::move(seg));continue;}
+            auto& slot=block.segments[i];if(candidate!=slot.text||kind_changed||paragraph!=slot.paragraph){slot.text=candidate;slot.paragraph=paragraph;slot.changed=now;}
             else if(absent&&(!slot.emitted||slot.text!=slot.emitted_text))slot.changed=now;
         }
         blocks_.push_back(std::move(block));
@@ -595,10 +601,10 @@ std::vector<json> Ledger::flush_at(std::int64_t now){
     std::vector<json> out;
     for(auto& block:blocks_){if(!block.present)continue;for(std::size_t i=0;i<block.segments.size();++i){auto& slot=block.segments[i];if(now-slot.changed<settle_)continue;
         std::string wanted=english(slot.text)?slot.text:"";
-        if(slot.emitted&&slot.emitted_text==wanted&&slot.emitted_kind==block.kind)continue;
-        if(wanted.empty()&&slot.emitted_text.empty()){slot.emitted=true;slot.emitted_text="";slot.emitted_kind=block.kind;continue;}
-        ++slot.revision;out.push_back({{"type","text"},{"key",json::array({epoch_,block.key,i}).dump()},{"block_key",block.key},{"segment",i},{"text",wanted},{"kind",block.kind},{"epoch",epoch_},{"revision",slot.revision},{"stable",true}});
-        slot.emitted=true;slot.emitted_text=wanted;slot.emitted_kind=block.kind;
+        if(slot.emitted&&slot.emitted_text==wanted&&slot.emitted_kind==block.kind&&slot.emitted_paragraph==slot.paragraph)continue;
+        if(wanted.empty()&&slot.emitted_text.empty()){slot.emitted=true;slot.emitted_text="";slot.emitted_kind=block.kind;slot.emitted_paragraph=slot.paragraph;continue;}
+        ++slot.revision;out.push_back({{"type","text"},{"key",json::array({epoch_,block.key,i}).dump()},{"block_key",block.key},{"segment",i},{"paragraph",slot.paragraph},{"text",wanted},{"kind",block.kind},{"epoch",epoch_},{"revision",slot.revision},{"stable",true}});
+        slot.emitted=true;slot.emitted_text=wanted;slot.emitted_kind=block.kind;slot.emitted_paragraph=slot.paragraph;
     }}return out;
 }
 }

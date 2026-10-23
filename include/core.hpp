@@ -44,6 +44,12 @@ public:
 using Delta = std::function<void(const std::string&)>;
 std::string translate(const Settings&, const std::string& utf8, const Delta&, const std::atomic_bool& cancel);
 // Parsing helpers are also used by the native regression checks.
+// Display grouping is separate from independent translation/stability slots.
+struct TextSegment {
+    std::string text;
+    std::size_t paragraph = 0;
+};
+std::vector<TextSegment> split_text_segments(const std::string& utf8);
 std::vector<std::string> split_sentences(const std::string& utf8);
 std::string parse_openai_content(const nlohmann::json& data, bool streaming);
 // Baidu protocol helpers perform no network calls and never include credentials in errors.
@@ -64,6 +70,7 @@ public:
 private:
     struct Segment {
         std::string text, emitted_text, emitted_kind;
+        std::size_t paragraph = 0, emitted_paragraph = 0;
         std::int64_t changed = 0;
         unsigned revision = 0;
         bool emitted = false;

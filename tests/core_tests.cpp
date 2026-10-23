@@ -124,6 +124,20 @@ int main(){
             auto events=structured.observe_at(snap("## Progress\n- Inspect project\n- Run checks"),0);
             check(texts(events)==std::vector<std::string>({"## Progress","- Inspect project","- Run checks"}),"Ledger emits separate heading and list records for text layout");
         }
+        {
+            const auto grouped=split_text_segments("First sentence. Second sentence.\n\nThird paragraph.\n## Heading\n- First item\n- Second item");
+            check(grouped.size()==6&&grouped[0].paragraph==grouped[1].paragraph&&grouped[1].paragraph!=grouped[2].paragraph&&grouped[2].paragraph!=grouped[3].paragraph&&grouped[3].paragraph!=grouped[4].paragraph&&grouped[4].paragraph!=grouped[5].paragraph,"Display metadata preserves original paragraphs, headings and individual list items");
+            const auto wrapped=split_text_segments("A soft\nwrap. Another sentence.");
+            check(wrapped.size()==2&&wrapped[0].paragraph==wrapped[1].paragraph,"Soft wrapping does not create artificial display paragraphs");
+            Ledger grouping(0);
+            const auto first=grouping.observe_at(snap("First sentence. Second sentence.\n\nThird paragraph."),0);
+            check(first.size()==3&&first[0]["paragraph"]==first[1]["paragraph"]&&first[1]["paragraph"]!=first[2]["paragraph"],"Ledger carries display paragraph metadata without changing sentence slots");
+            const auto changed=grouping.observe_at(snap("First sentence.\n\nSecond sentence.\n\nThird paragraph."),10);
+            check(changed.size()==2&&changed[0]["key"]==first[1]["key"]&&changed[0]["text"]==first[1]["text"]&&changed[0]["paragraph"]!=first[1]["paragraph"],"Paragraph-only edits update display metadata while retaining translation keys and source text");
+            check(grouping.observe_at(snap("First sentence.\n\nSecond sentence.\n\nThird paragraph."),20).empty(),"Paragraph metadata repaints are deduplicated");
+            const auto mixed=split_text_segments("你好。 English content.");
+            check(mixed.size()==2&&mixed[0].paragraph==mixed[1].paragraph,"A non-English sentence does not break subsequent paragraph grouping");
+        }
         check(split_sentences("Dr. Smith uses version 3.14. This is ready.")==std::vector<std::string>({"Dr. Smith uses version 3.14.","This is ready."}),"Abbreviation and decimal sentence slots");
         check(split_sentences("First prose.\n~~~js\nconst secret='x';\n~~~\nSecond prose.\n```py\nprint('y')\n```\nThird prose.")==std::vector<std::string>({"First prose.","Second prose.","Third prose."}),"Multiple fences excluded");
         check(split_sentences("The explanation is ready.\n```python\nprint('Secret')")==std::vector<std::string>({"The explanation is ready."}),"Unclosed streaming fence excluded");

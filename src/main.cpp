@@ -1218,6 +1218,9 @@ struct Record {
       state = "waiting";
   uint64_t serial = 0, version = 0;
   bool pendingReplacement = false;
+  std::string layoutBlock;
+  std::size_t layoutParagraph = 0;
+  bool hasLayout = false;
 };
 class App;
 struct Config {
@@ -1466,6 +1469,14 @@ public:
   std::shared_ptr<Worker> worker = std::make_shared<Worker>(bus);
   std::shared_ptr<Watcher> watcher;
   Clock::time_point lastRender = Clock::now(), demoStart, testStart;
+  struct BodyRender {
+    std::wstring input, displayed;
+    uint64_t styleRevision = 0, replacements = 0, formats = 0;
+    int fontPoints = 0, dpi = 0;
+    bool valid = false;
+  };
+  std::map<HWND, BodyRender> renderedBodies;
+  uint64_t bodyStyleRevision = 0;
   int demoStep = -1;
   std::unique_ptr<cclive::Ledger> demoLedger;
   Config *config = nullptr;
@@ -1549,6 +1560,7 @@ public:
     return w;
   }
   void fonts() {
+    ++bodyStyleRevision;
     HFONT nextFont = CreateFontW(
         -MulDiv(settings.font_size, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE,
         FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -1721,8 +1733,8 @@ public:
       SendMessageW(edit, EM_SETCHARFORMAT, SCF_DEFAULT, (LPARAM)&cf);
       SendMessageW(edit, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
     }
-    statusLabel = control(L"STATIC", L"", SS_LEFT, 0, smallFont);
-    countLabel = control(L"STATIC", L"0 段", SS_RIGHT, 0, smallFont);
+    statusLabel = control(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 0, smallFont);
+    countLabel = control(L"STATIC", L"0 段", SS_RIGHT | SS_ENDELLIPSIS, 0, smallFont);
     foot = control(L"STATIC", L"后台只读 · 不截图、不点击、不修改客户端", 0, 0,
                    smallFont);
     EnableWindow(refreshButton, !(demo || selfTest));
@@ -1789,8 +1801,8 @@ public:
       move(sourceEdit, m, top + s(8), paneW, paneH);
     int tx = settings.show_original ? m + paneW + gap : m;
     move(translationEdit, tx, top + s(8), paneW, paneH);
-    move(statusLabel, m, height - s(26), bodyW - s(130), s(20));
-    move(countLabel, width - m - s(124), height - s(26), s(124), s(20));
+    move(statusLabel, m, height - s(26), bodyW - s(366), s(20));
+    move(countLabel, width - m - s(360), height - s(26), s(360), s(20));
     InvalidateRect(hwnd, nullptr, FALSE);
   }
   void paintDividers(HDC dc) const {
@@ -1919,6 +1931,9 @@ public:
                        {"translation", record.translation},
                        {"state", record.state},
                        {"pending_replacement", record.pendingReplacement},
+                       {"has_layout", record.hasLayout},
+                       {"layout_block", record.layoutBlock},
+                       {"layout_paragraph", record.layoutParagraph},
                        {"error", record.error},
                        {"source_signature", record.sourceSignature},
                        {"serial", record.serial}});
@@ -2091,6 +2106,17 @@ public:
                     ? "done"
                 : matching && state == "error" ? "error"
                                                : "waiting";
+            if (item.value("has_layout", false) && item.contains("layout_block") &&
+                item["layout_block"].is_string() &&
+                !item["layout_block"].get_ref<const std::string &>().empty() &&
+                item.contains("layout_paragraph") &&
+                item["layout_paragraph"].is_number_integer() &&
+                (item["layout_paragraph"].is_number_unsigned() ||
+                 item["layout_paragraph"].get<int64_t>() >= 0)) {
+              record.hasLayout = true;
+              record.layoutBlock = item["layout_block"].get<std::string>();
+              record.layoutParagraph = item["layout_paragraph"].get<std::size_t>();
+            }
             record.version = ++revision;
             records.push_back(std::move(record));
             if (records.size() >= 240)
@@ -2432,6 +2458,7 @@ public:
       if (it != records.end())
         replayCandidates.erase(it->key);
     }
+    bool createdRecord = false;
     if (it == records.end()) {
       std::string memo;
       if (auto replay = windowReplayMemo.find(incomingSignature);
@@ -2467,6 +2494,22 @@ public:
       record.state = memo.empty() ? "waiting" : "done";
       records.push_back(std::move(record));
       it = std::prev(records.end());
+      createdRecord = true;
+    }
+    // Layout changes do not invalidate a translation or change its source key.
+    bool layoutChanged = false;
+    if (v.contains("block_key") && v["block_key"].is_string() &&
+        !v["block_key"].get_ref<const std::string &>().empty() &&
+        v.contains("paragraph") && v["paragraph"].is_number_integer() &&
+        (v["paragraph"].is_number_unsigned() ||
+         v["paragraph"].get<int64_t>() >= 0)) {
+      const auto block = v["block_key"].get<std::string>();
+      const auto paragraph = v["paragraph"].get<std::size_t>();
+      layoutChanged = !it->hasLayout || it->layoutBlock != block ||
+                      it->layoutParagraph != paragraph;
+      it->hasLayout = true;
+      it->layoutBlock = block;
+      it->layoutParagraph = paragraph;
     }
     sourceAliases[key] = {it->key, v.value("block_key", "")};
     if (!windowReplayMemo.empty() && v.contains("source_index") &&
@@ -2474,7 +2517,8 @@ public:
         v["source_index"].get<std::size_t>() >= windowReplayLastIndex)
       windowReplayMemo.clear();
     if ((it->source == source || it->sourceSignature == incomingSignature) &&
-        (it->state == "done" || it->state == "queued" ||
+        ((!createdRecord && layoutChanged) ||
+         it->state == "done" || it->state == "queued" ||
          it->state == "translating" || it->state == "rate_limited" ||
          it->state == "paused")) {
       dirty = cacheDirty = true;
@@ -2633,6 +2677,23 @@ public:
       status(e.what());
     }
   }
+  static std::wstring displayContent(const std::string &raw) {
+    auto value = wide(raw);
+    const auto first = value.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring::npos)
+      return {};
+    // Remove empty edge lines, preserving the first content line's indentation.
+    const auto newline = value.find_last_of(L"\r\n", first);
+    const auto begin = newline == std::wstring::npos ? 0 : newline + 1;
+    const auto last = value.find_last_not_of(L" \t\r\n");
+    return value.substr(begin, last - begin + 1);
+  }
+  static bool cjkBoundary(wchar_t value) {
+    return (value >= 0x2e80 && value <= 0x9fff) ||
+           (value >= 0xac00 && value <= 0xd7af) ||
+           (value >= 0xf900 && value <= 0xfaff) ||
+           (value >= 0xff00 && value <= 0xffef);
+  }
   std::wstring output(bool original) const {
     if (records.empty())
       return original ? L"英文原文将在这里显示"
@@ -2641,36 +2702,54 @@ public:
     std::wstring value;
     size_t begin = records.size(), chars = 0;
     while (begin > 0) {
-      auto &r = records[begin - 1];
-      size_t add = original ? r.source.size()
-                            : r.translation.size() + r.error.size() + 100;
+      const auto &record = records[begin - 1];
+      const size_t add = original ? record.source.size() : record.translation.size();
       if (chars + add > 1000000 && begin < records.size())
         break;
       chars += add;
       --begin;
     }
     if (begin)
-      value = L"仅显示最近保留的字幕内容。\r\n\r\n";
-    for (size_t i = begin; i < records.size(); ++i) {
-      const auto &r = records[i];
-
-      if (original)
-        value += wide(r.source);
-      else {
-        value += wide(r.translation);
-        if (r.state != "done" || r.pendingReplacement) {
-          if (!r.translation.empty())
-            value += r.pendingReplacement ? L"  更新中 · " : L"  ";
-          value += wide(!r.error.empty()           ? r.error
-                        : r.state == "paused"      ? "已暂停"
-                        : r.state == "stopped"     ? "已停止"
-                        : r.state == "translating" ? "翻译中…"
-                                                   : "等待翻译…");
-        }
+      value = L"仅显示最近保留的字幕内容。";
+    const Record *previous = nullptr;
+    for (size_t index = begin; index < records.size(); ++index) {
+      const auto &record = records[index];
+      auto content = displayContent(original ? record.source : record.translation);
+      if (content.empty()) {
+        // Do not join completed text across an untranslated or failed sentence.
+        previous = nullptr;
+        continue;
       }
-      value += L"\r\n";
+      if (!value.empty()) {
+        const bool sameParagraph = previous && previous->hasLayout &&
+            record.hasLayout && previous->layoutBlock == record.layoutBlock &&
+            previous->layoutParagraph == record.layoutParagraph;
+        if (!sameParagraph)
+          value += L"\r\n";
+        else if (!iswspace(value.back()) && !iswspace(content.front()) &&
+                 !cjkBoundary(value.back()) && !cjkBoundary(content.front()))
+          value += L' ';
+      }
+      value += content;
+      previous = &record;
     }
     return value;
+  }
+  std::wstring progressCaption() const {
+    std::size_t done = 0, waiting = 0, updating = 0, errors = 0;
+    for (const auto &record : records) {
+      if (record.pendingReplacement)
+        ++updating;
+      if (record.state == "error")
+        ++errors;
+      else if (record.state == "done" && !record.pendingReplacement)
+        ++done;
+      else if (!record.pendingReplacement)
+        ++waiting;
+    }
+    return L"已译 " + std::to_wstring(done) + L" · 待译 " +
+        std::to_wstring(waiting) + L" · 更新中 " + std::to_wstring(updating) +
+        L" · 失败 " + std::to_wstring(errors);
   }
   bool &follows(HWND edit) {
     return edit == sourceEdit ? followingSource : followingTranslation;
@@ -2728,6 +2807,12 @@ public:
     return result;
   }
   void editText(HWND edit, const std::wstring &value) {
+    auto &rendered = renderedBodies[edit];
+    if (rendered.valid && rendered.input == value &&
+        rendered.styleRevision == bodyStyleRevision &&
+        rendered.fontPoints == settings.font_size && rendered.dpi == dpi)
+      return;
+    auto formatted = cclive::make_text_layout(value);
     bool bottom = follows(edit);
     ScrollGuard guard(internalScroll);
     POINT scroll{};
@@ -2735,14 +2820,20 @@ public:
     CHARRANGE selected{};
     SendMessageW(edit, EM_EXGETSEL, 0, (LPARAM)&selected);
     SendMessageW(edit, WM_SETREDRAW, FALSE, 0);
-    // Both panes use identical Markdown parsing and native RichEdit styles.
-    auto formatted = cclive::make_text_layout(value);
-    SetWindowTextW(edit, formatted.text.c_str());
+    // A style refresh need not replace identical text or disturb its selection.
+    if (!rendered.valid || rendered.displayed != formatted.text) {
+      SetWindowTextW(edit, formatted.text.c_str());
+      ++rendered.replacements;
+    }
     cclive::apply_text_layout(edit, formatted, settings.font_size, dpi);
+    ++rendered.formats;
+    rendered.input = value;
+    rendered.displayed = formatted.text;
+    rendered.styleRevision = bodyStyleRevision;
+    rendered.fontPoints = settings.font_size;
+    rendered.dpi = dpi;
+    rendered.valid = true;
     SendMessageW(edit, EM_EXSETSEL, 0, (LPARAM)&selected);
-    // RichEdit can defer layout while redraw is disabled. Restore redraw before
-    // consulting the new extent or scrolling, otherwise the old end position
-    // can be mistaken for a deliberate user scroll on the following update.
     SendMessageW(edit, WM_SETREDRAW, TRUE, 0);
     SendMessageW(edit, EM_GETLINECOUNT, 0, 0);
     if (bottom)
@@ -2757,12 +2848,7 @@ public:
     if (settings.show_original)
       editText(sourceEdit, output(true));
     editText(translationEdit, output(false));
-    size_t count =
-        std::count_if(records.begin(), records.end(),
-                      [](const Record &r) { return r.state == "done"; });
-    auto caption = std::to_wstring(count) + L" / " +
-                   std::to_wstring(records.size()) + L" 段";
-    SetWindowTextW(countLabel, caption.c_str());
+    SetWindowTextW(countLabel, progressCaption().c_str());
     dirty = false;
     lastRender = Clock::now();
   }
@@ -2820,7 +2906,64 @@ public:
            : running            ? "设置已应用；继续翻译"
                                 : "设置已应用");
   }
+  void layoutDemo() {
+    activeTaskId = "offline-layout-preview";
+    activeTaskTitle = "段落与列表排版演示（合成内容）";
+    activeIdentityQuality = "url";
+    activeProfile = translationProfile();
+    updateTaskTitle();
+    auto add = [&](const std::string &source, const std::string &translated,
+                   std::size_t paragraph, const std::string &state = "done",
+                   bool replacement = false, const std::string &error = "") {
+      Record record;
+      record.serial = ++serial;
+      record.version = ++revision;
+      record.key = "layout-demo-" + std::to_string(record.serial);
+      record.source = source;
+      record.sourceSignature = contentSignature(source);
+      record.translation = translated;
+      record.state = state;
+      record.error = error;
+      record.pendingReplacement = replacement;
+      record.hasLayout = true;
+      record.layoutBlock = "layout-demo-answer";
+      record.layoutParagraph = paragraph;
+      records.push_back(std::move(record));
+    };
+    add("## Paragraphs that read naturally", "## 让段落自然连贯", 0);
+    add("The translator preserves complete paragraphs.",
+        "翻译窗口会保留完整段落。", 1);
+    add("Sentences from the same paragraph stay together as the window narrows.",
+        "同一段内的句子会自然衔接，缩窄窗口后也会按照中文习惯换行，不再每句话单独占一行。", 1);
+    add("This is a separate paragraph with a clear boundary.",
+        "这是另一个独立段落，应与上面的完整段落保持适量间距。段落边界来自原文结构，无需根据句号猜测。", 12);
+    add("## A clear plan", "## 清晰的阅读顺序", 2);
+    add("- Keep completed translations visible while a revised sentence is being translated, even when the source refreshes or a request takes longer than expected.",
+        "- 在原文持续更新、翻译请求耗时较长时，保留已经确认的译文，直到新版本完整返回。较长的列表内容应自然换行，并与首行正文保持对齐。", 3);
+    add("  - Preserve nested items and keep the detail attached to its parent so a narrower window remains easy to read.",
+        "  - 保留嵌套列表及其层级关系。窗口变窄后，补充说明仍应保持清晰的缩进，不与相邻项目混在一起。", 4);
+    add("1. Check the original paragraph structure, headings, and item boundaries before combining translated sentences.",
+        "1. 先确认原文段落、标题和列表边界，再合并同段译句。即使一项包含较长的说明，换行后也应保持正文对齐。", 5);
+    add("10. Keep file names such as `src/main.cpp`, model names, and API identifiers unchanged in the translation.",
+        "10. 保留 `src/main.cpp`、模型名称和 API 标识，保证中英文混排时仍然容易辨认。较宽的两位数编号也应与换行后的正文列对齐，不把后续文字挤成另一种缩进。", 6);
+    add("### Reading without interruptions", "### 阅读时减少打扰", 7);
+    add("A revised paragraph is being translated.",
+        "这段已确认的译文会在更新期间保留，新结果完成后再整体替换。", 8, "queued", true);
+    add("This sentence is waiting for translation.", "", 9, "queued");
+    add("This synthetic request failed and can be retried.", "", 10,
+        "error", false, "离线演示错误，可重试");
+    trimRecords();
+    dirty = cacheDirty = true;
+    status("离线排版示例 · 可缩窄窗口或切换原文；不读取 Claude、不访问网络");
+  }
   void synthetic() {
+    if (demo && !selfTest) {
+      if (running && demoStep < 0) {
+        demoStep = 18;
+        layoutDemo();
+      }
+      return;
+    }
     if (!running || !demoLedger)
       return;
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2951,7 +3094,8 @@ public:
       it->error = "更新翻译未完成，可重试";
     dirty = cacheDirty = true;
     if (it->state == "error")
-      status("部分文字翻译失败，可检查设置后重试");
+      status(it->error.empty() ? "部分文字翻译失败，可检查设置后重试"
+                               : "翻译失败：" + it->error + "（可重试）");
     else if (it->state == "rate_limited")
       status(it->error);
     else if (previousState == "rate_limited" &&
@@ -3987,7 +4131,8 @@ public:
               records[0].source == "A genuinely revised source sentence." &&
               records[0].translation == "current translation" &&
               replacementVersion > completedVersion &&
-              output(false).find(L"更新中") != std::wstring::npos);
+              output(false) == L"current translation" &&
+              progressCaption().find(L"更新中 1") != std::wstring::npos);
     acceptResult(result(generation, completedVersion, "stale completed source"));
     check("previous_source_result_cannot_commit_replacement",
           records[0].translation == "current translation" &&
@@ -4215,6 +4360,92 @@ public:
           output(false).rfind(L"Caption 30", 0) == 0 &&
               output(false).find(L"31. Caption") == std::wstring::npos);
     clear();
+    auto layoutRecord = [&](const std::string &source, const std::string &translated,
+                            const std::string &block, std::size_t paragraph,
+                            bool known = true) {
+      Record record;
+      record.key = "paragraph-fixture-" + std::to_string(++serial);
+      record.source = source;
+      record.translation = translated;
+      record.state = "done";
+      record.hasLayout = known;
+      record.layoutBlock = block;
+      record.layoutParagraph = paragraph;
+      record.version = ++revision;
+      return record;
+    };
+    records = {layoutRecord("First sentence.", "第一句。", "block-A", 0),
+               layoutRecord("Second sentence.", "第二句。", "block-A", 0),
+               layoutRecord("New paragraph.", "新的段落。", "block-A", 1),
+               layoutRecord("Other block.", "另一个块。", "block-B", 1),
+               layoutRecord("Legacy source.", "历史独立段。", "", 0, false)};
+    check("same_paragraph_CJK_sentences_join_without_artificial_spaces",
+          output(false) == L"第一句。第二句。\r\n新的段落。\r\n另一个块。\r\n历史独立段。");
+    check("same_paragraph_English_sentences_keep_one_space",
+          output(true) == L"First sentence. Second sentence.\r\nNew paragraph.\r\nOther block.\r\nLegacy source.");
+    records[0].translation = "\r\n\n第一句。\r\n";
+    records[1].translation = "\n第二句。\n\n";
+    check("display_removes_empty_edge_lines_without_changing_cached_translation",
+          output(false).rfind(L"第一句。第二句。\r\n", 0) == 0 &&
+              records[0].translation == "\r\n\n第一句。\r\n");
+    records[0].translation = "保留的旧译文。";
+    records[0].pendingReplacement = true;
+    records[0].state = "translating";
+    records[1].translation.clear();
+    records[1].state = "queued";
+    records[2].translation.clear();
+    records[2].state = "error";
+    records[2].error = "synthetic_long_error_details";
+    check("translation_body_excludes_waiting_updating_and_error_messages",
+          output(false) == L"保留的旧译文。\r\n另一个块。\r\n历史独立段。" &&
+              output(false).find(L"翻译中") == std::wstring::npos &&
+              output(false).find(L"更新中") == std::wstring::npos &&
+              output(false).find(L"synthetic_long_error_details") == std::wstring::npos);
+    check("footer_reports_waiting_updates_and_failures_outside_body",
+          progressCaption() == L"已译 2 · 待译 1 · 更新中 1 · 失败 1");
+    const bool layoutOriginal = settings.show_original;
+    const bool layoutFollowing = followingSource;
+    settings.show_original = true;
+    render();
+    const auto sourceReplacements = renderedBodies[sourceEdit].replacements;
+    const auto sourceFormats = renderedBodies[sourceEdit].formats;
+    const auto translationReplacements = renderedBodies[translationEdit].replacements;
+    render();
+    check("unchanged_render_skips_both_RichEdit_replacements_and_formatting",
+          renderedBodies[sourceEdit].replacements == sourceReplacements &&
+              renderedBodies[sourceEdit].formats == sourceFormats &&
+              renderedBodies[translationEdit].replacements == translationReplacements);
+    followingSource = false;
+    CHARRANGE layoutSelection{1, 4};
+    SendMessageW(sourceEdit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&layoutSelection));
+    records[3].translation += "增量内容。";
+    render();
+    CHARRANGE layoutSelectionAfter{};
+    SendMessageW(sourceEdit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&layoutSelectionAfter));
+    check("translation_delta_does_not_rewrite_unchanged_original_or_selection",
+          renderedBodies[sourceEdit].replacements == sourceReplacements &&
+              renderedBodies[sourceEdit].formats == sourceFormats &&
+              layoutSelectionAfter.cpMin == layoutSelection.cpMin &&
+              layoutSelectionAfter.cpMax == layoutSelection.cpMax);
+    const auto layoutFont = settings.font_size;
+    const auto beforeFontFormat = renderedBodies[translationEdit].formats;
+    const auto beforeFontReplace = renderedBodies[translationEdit].replacements;
+    settings.font_size = layoutFont == 40 ? 39 : layoutFont + 1;
+    render();
+    CHARRANGE fontProbe{0, 1};
+    SendMessageW(translationEdit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&fontProbe));
+    CHARFORMAT2W updatedStyle{};
+    updatedStyle.cbSize = sizeof(updatedStyle);
+    SendMessageW(translationEdit, EM_GETCHARFORMAT, SCF_SELECTION,
+                 reinterpret_cast<LPARAM>(&updatedStyle));
+    check("font_size_change_forces_format_without_replacing_identical_body",
+          renderedBodies[translationEdit].formats == beforeFontFormat + 1 &&
+              renderedBodies[translationEdit].replacements == beforeFontReplace &&
+              updatedStyle.yHeight == settings.font_size * 20);
+    settings.font_size = layoutFont;
+    settings.show_original = layoutOriginal;
+    followingSource = layoutFollowing;
+    clear();
     std::string manyLines;
     for (int n = 0; n < 140; ++n)
       manyLines += "Row " + std::to_string(n) + "\n";
@@ -4300,6 +4531,56 @@ public:
                     {"translation", translated},
                     {"error", ""}});
     };
+    accept(taskMeta("layout-cache-task", {"First layout source.", "Second layout source."}));
+    auto firstLayoutEvent = taskText("layout-cache-task", "layout-runtime-1", "First layout source.");
+    firstLayoutEvent["block_key"] = "layout-cache-block";
+    firstLayoutEvent["paragraph"] = 0;
+    accept(firstLayoutEvent);
+    complete(0, "第一句缓存译文。");
+    auto secondLayoutEvent = taskText("layout-cache-task", "layout-runtime-2", "Second layout source.");
+    secondLayoutEvent["block_key"] = "layout-cache-block";
+    secondLayoutEvent["paragraph"] = 0;
+    accept(secondLayoutEvent);
+    complete(1, "第二句缓存译文。");
+    const auto layoutVersion = records[0].version;
+    const auto beforeLayoutMetadata = worker->submitted.load();
+    firstLayoutEvent["paragraph"] = 3;
+    accept(firstLayoutEvent);
+    check("metadata_only_paragraph_change_keeps_completed_translation_and_version",
+          records[0].hasLayout && records[0].layoutBlock == "layout-cache-block" &&
+              records[0].layoutParagraph == 3 && records[0].version == layoutVersion &&
+              records[0].state == "done" &&
+              records[0].translation == "第一句缓存译文。" &&
+              worker->submitted.load() == beforeLayoutMetadata);
+    std::size_t changedParagraph = 4;
+    for (const auto &state : {"error", "stopped", "waiting"}) {
+      records[0].state = state;
+      firstLayoutEvent["paragraph"] = changedParagraph++;
+      accept(firstLayoutEvent);
+      check(state == std::string("error")
+                ? "paragraph_only_update_does_not_retry_failed_translation"
+            : state == std::string("stopped")
+                ? "paragraph_only_update_does_not_restart_stopped_translation"
+                : "paragraph_only_update_does_not_enqueue_waiting_translation",
+            records[0].state == state && records[0].version == layoutVersion &&
+                records[0].translation == "第一句缓存译文。" &&
+                worker->submitted.load() == beforeLayoutMetadata);
+    }
+    records[0].state = "done";
+    firstLayoutEvent["paragraph"] = 3;
+    accept(firstLayoutEvent);
+    const auto savedLayoutPayload = taskPayload();
+    check("RAM_payload_preserves_layout_block_and_paragraph_metadata",
+          savedLayoutPayload["records"][0].value("has_layout", false) &&
+              savedLayoutPayload["records"][0].value("layout_block", "") == "layout-cache-block" &&
+              savedLayoutPayload["records"][0].value("layout_paragraph", 0) == 3);
+    accept(taskMeta("layout-cache-other", {}));
+    accept(taskMeta("layout-cache-task", {"First layout source.", "Second layout source."}));
+    check("RAM_task_restore_preserves_independent_paragraph_boundaries",
+          records.size() == 2 && records[0].hasLayout && records[1].hasLayout &&
+              records[0].layoutBlock == "layout-cache-block" &&
+              records[0].layoutParagraph == 3 && records[1].layoutParagraph == 0 &&
+              output(false) == L"第一句缓存译文。\r\n第二句缓存译文。");
     const std::string taskA = "test-task-A", taskB = "test-task-B";
     const std::string sourceA = "First source for task A.",
                       sourceA2 = "Second source for task A.";

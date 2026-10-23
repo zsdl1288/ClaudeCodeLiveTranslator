@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <nlohmann/json.hpp>
 #include "task_identity.hpp"
+#include "core.hpp"
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -212,6 +213,12 @@ int wmain(int argc, wchar_t** argv) {
         require(semantic.value("type", "") == "snapshot", "semantic-only snapshot failed");
         const auto semantic_text = block_text(semantic);
         require(semantic_text.find("The implementation is ready.") != std::string::npos, "semantic assistant body not extracted");
+        require(semantic_text.find("\n\nSecond semantic paragraph.") != std::string::npos, "Semantic fallback flattened verified paragraph boundaries");
+        const auto semantic_parts = cclive::split_text_segments(semantic_text);
+        auto semantic_first = std::find_if(semantic_parts.begin(), semantic_parts.end(), [](const cclive::TextSegment& part) { return part.text.find("The implementation is ready.") != std::string::npos; });
+        auto semantic_next = std::find_if(semantic_parts.begin(), semantic_parts.end(), [](const cclive::TextSegment& part) { return part.text == "Second semantic paragraph."; });
+        auto semantic_inline = std::find_if(semantic_parts.begin(), semantic_parts.end(), [](const cclive::TextSegment& part) { return part.text == "Inline continuation in that paragraph."; });
+        require(semantic_first != semantic_parts.end() && semantic_next != semantic_parts.end() && semantic_inline != semantic_parts.end() && semantic_first->paragraph != semantic_next->paragraph && semantic_next->paragraph == semantic_inline->paragraph, "Semantic fallback must retain real paragraphs while grouping inline siblings");
         require(semantic_text.find("PREVIOUS ANSWER MUST NOT BE TRANSLATED") == std::string::npos, "semantic fallback queued old assistant history");
         require(semantic_text.find("USER INPUT MUST NOT BE TRANSLATED") == std::string::npos, "semantic fallback leaked user ancestor text");
         require(GetForegroundWindow() != semantic_hwnd, "semantic fallback activated fixture");
@@ -230,6 +237,12 @@ int wmain(int argc, wchar_t** argv) {
         require(article_text.find("The implementation is ready.") != std::string::npos, "Chinese article lost first body paragraph");
         require(article_text.find("Second body paragraph must be preserved.") != std::string::npos, "Chinese article lost middle body paragraph");
         require(article_text.find("Short tail.") != std::string::npos, "Chinese article lost final short paragraph");
+        require(article_text.find("\n\nSecond body paragraph must be preserved.") != std::string::npos, "Reader flattened a verified paragraph boundary into a soft wrap");
+        require(article_text.find("Second body paragraph must be preserved. Inline continuation stays in the same paragraph.") != std::string::npos, "Inline siblings in one paragraph gained an artificial paragraph boundary");
+        const auto article_parts = cclive::split_text_segments(article_text);
+        auto first_part = std::find_if(article_parts.begin(), article_parts.end(), [](const cclive::TextSegment& part) { return part.text.find("The implementation is ready.") != std::string::npos; });
+        auto second_part = std::find_if(article_parts.begin(), article_parts.end(), [](const cclive::TextSegment& part) { return part.text.find("Second body paragraph") != std::string::npos; });
+        require(first_part != article_parts.end() && second_part != article_parts.end() && first_part->paragraph != second_part->paragraph, "Reader paragraphs were merged during sentence splitting");
         require(article_text.find("HEADING SUMMARY") == std::string::npos, "heading summary was treated as body");
         require(article_text.find("USER INPUT") == std::string::npos, "Chinese user marker failed to reject message");
         require(article_text.find("PREVIOUS ANSWER") == std::string::npos, "Chinese article selected old history");
@@ -438,8 +451,10 @@ int wmain(int argc, wchar_t** argv) {
             const auto headings = read_once(app, heading_hwnd);
             require(headings.value("type", "") == "snapshot", "semantic heading snapshot failed");
             const auto heading_text = block_text(headings);
-            require(heading_text.find("Opening body paragraph.\n# Heading One\nBody after first heading.") != std::string::npos, "heading did not retain separate semantic line boundaries");
-            require(heading_text.find("\n## Heading Two\n### Heading Three\n") != std::string::npos, "explicit UIA heading levels 2/3 not preserved");
+            auto heading_lines = heading_text;
+            for (std::size_t pos = 0; (pos = heading_lines.find("\n\n", pos)) != std::string::npos;) heading_lines.erase(pos, 1);
+            require(heading_lines.find("Opening body paragraph.\n# Heading One\nBody after first heading.") != std::string::npos, "heading did not retain separate semantic line boundaries");
+            require(heading_lines.find("\n## Heading Two\n### Heading Three\n") != std::string::npos, "explicit UIA heading levels 2/3 not preserved");
             require(heading_text.find("Heading One", heading_text.find("Heading One") + 1) == std::string::npos, "heading Name duplicated its child Text");
             require(heading_text.find("Unknown level remains plain.") != std::string::npos && heading_text.find("# Unknown level") == std::string::npos, "unknown heading level was guessed");
             require(heading_text.find("Unsupported level remains plain.") != std::string::npos && heading_text.find("# Unsupported level") == std::string::npos, "unsupported heading level was guessed");

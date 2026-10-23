@@ -279,6 +279,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
                 8, 210, 600, 50, article, nullptr, GetModuleHandleW(nullptr), nullptr);
             CreateWindowExW(0, L"STATIC", L"Second body paragraph must be preserved.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
                 0, 0, 590, 40, second_paragraph, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L" Inline continuation stays in the same paragraph.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 24, 590, 24, second_paragraph, nullptr, GetModuleHandleW(nullptr), nullptr);
             const HWND last_paragraph = CreateWindowExW(0, L"font-claude-response", L"", WS_CHILD | WS_VISIBLE,
                 8, 270, 600, 50, article, nullptr, GetModuleHandleW(nullptr), nullptr);
             CreateWindowExW(0, L"STATIC", L"Short tail.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
@@ -300,8 +302,16 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
                 8, 8, 600, 30, old_container, nullptr, GetModuleHandleW(nullptr), nullptr);
             const HWND container = CreateWindowExW(0, L"assistant-message", L"Latest response", WS_CHILD | WS_VISIBLE,
                 8, 8, 620, 330, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND first_semantic_paragraph = CreateWindowExW(0, L"font-claude-response", L"", WS_CHILD | WS_VISIBLE,
+                8, 8, 600, 210, container, nullptr, GetModuleHandleW(nullptr), nullptr);
             body = CreateWindowExW(0, L"STATIC", L"Reading the project files.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
-                8, 8, 600, 300, container, nullptr, GetModuleHandleW(nullptr), nullptr);
+                0, 0, 590, 200, first_semantic_paragraph, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND next_semantic_paragraph = CreateWindowExW(0, L"font-claude-response", L"", WS_CHILD | WS_VISIBLE,
+                8, 230, 600, 70, container, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Second semantic paragraph.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 0, 590, 25, next_semantic_paragraph, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Inline continuation in that paragraph.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 30, 590, 25, next_semantic_paragraph, nullptr, GetModuleHandleW(nullptr), nullptr);
             const HWND user_container = CreateWindowExW(0, L"user-message", L"User content", WS_CHILD | WS_VISIBLE,
                 8, 420, 620, 50, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
             const HWND misleading = CreateWindowExW(0, L"assistant-message", L"Nested styling", WS_CHILD | WS_VISIBLE,
