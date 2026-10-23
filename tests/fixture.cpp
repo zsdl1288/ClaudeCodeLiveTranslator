@@ -1,0 +1,387 @@
+// Synthetic UI Automation test fixture; no real Claude content or network.
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
+#include <windows.h>
+#include <shellapi.h>
+#include <UIAutomation.h>
+#include <atomic>
+#include <fstream>
+#include <filesystem>
+#include <iterator>
+#include <mutex>
+#include <string>
+namespace {
+HWND body = nullptr;
+std::wstring source_file;
+std::string last_text;
+bool semantic_mode = false;
+bool article_mode = false;
+bool feed_mode = false, rich_list_mode = false, identity_mode = false;
+HWND identity_document = nullptr;
+bool identity_race_mode = false;
+bool heading_mode = false, heading_semantic_mode = false;
+std::atomic<int> identity_reads{0};
+std::mutex identity_mutex;
+std::wstring identity_url;
+bool stream_list_mode = false, semantic_list_mode = false;
+HWND stream_article = nullptr, stream_heading = nullptr;
+std::wstring decode_utf8(const std::string& value) {
+    const int size = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
+    std::wstring result(size, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size);
+    return result;
+}
+void reload() {
+    std::ifstream stream(std::filesystem::path(source_file), std::ios::binary);
+    if (!stream) return;
+    const std::string text((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+    if (text == last_text) return;
+    last_text = text;
+    if (identity_mode) {
+        const auto split = text.find('\n');
+        if (split != std::string::npos) {
+            { std::lock_guard<std::mutex> guard(identity_mutex); identity_url = decode_utf8(text.substr(0, split)); }
+            auto title = text.substr(split + 1);
+            while (!title.empty() && (title.back() == '\r' || title.back() == '\n')) title.pop_back();
+            if (identity_document) SetWindowTextW(identity_document, decode_utf8(title).c_str());
+        }
+        return;
+    }
+    if (body) SetWindowTextW(body, decode_utf8(text).c_str());
+    if (stream_heading && text.find("HEADING_READY") != std::string::npos) {
+        SetWindowTextW(stream_heading, L"Claude 已回复：HEADING SUMMARY MUST NOT BE TRANSLATED");
+        SetWindowTextW(stream_article, L"消息 2");
+    }
+}
+class FeedProvider final : public IRawElementProviderSimple, public IValueProvider {
+    std::atomic<ULONG> refs_{1};
+    HWND hwnd_;
+    bool article_, list_item_, document_;
+    int heading_level_ = -1;
+public:
+    explicit FeedProvider(HWND hwnd) : hwnd_(hwnd) {
+        wchar_t name[64]{}; GetClassNameW(hwnd, name, 64); article_ = std::wstring(name) == L"CCLiveFixtureArticle"; list_item_ = std::wstring(name) == L"CCLiveFixtureRichItem"; document_ = std::wstring(name) == L"CCLiveFixtureDocument";
+        const std::wstring class_name(name);
+        const std::wstring heading_prefix = L"CCLiveFixtureHeading";
+        if (class_name.find(heading_prefix) == 0 && class_name.size() == heading_prefix.size() + 1) heading_level_ = class_name.back() - L'0';
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override {
+        if (!result) return E_POINTER;
+        *result = nullptr;
+        if (iid == __uuidof(IUnknown) || iid == __uuidof(IRawElementProviderSimple)) { *result = static_cast<IRawElementProviderSimple*>(this); AddRef(); return S_OK; }
+        if (document_ && iid == __uuidof(IValueProvider)) { *result = static_cast<IValueProvider*>(this); AddRef(); return S_OK; }
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override { const auto refs = --refs_; if (!refs) delete this; return refs; }
+    HRESULT STDMETHODCALLTYPE get_ProviderOptions(ProviderOptions* options) override {
+        if (!options) return E_POINTER; *options = static_cast<ProviderOptions>(ProviderOptions_ServerSideProvider | ProviderOptions_UseComThreading); return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID pattern, IUnknown** result) override {
+        if (!result) return E_POINTER; *result = nullptr;
+        if (document_ && pattern == UIA_ValuePatternId) { *result = static_cast<IValueProvider*>(this); AddRef(); }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetValue(LPCWSTR) override { return E_ACCESSDENIED; }
+    HRESULT STDMETHODCALLTYPE get_Value(BSTR* result) override {
+        if (!result) return E_POINTER;
+        std::lock_guard<std::mutex> guard(identity_mutex);
+        const auto value = identity_race_mode && identity_reads.fetch_add(1) > 0 ? std::wstring(L"https://claude.ai/epitaxy/local_identity_race_b") : identity_url;
+        *result = SysAllocString(value.c_str()); return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_IsReadOnly(BOOL* result) override { if (!result) return E_POINTER; *result = TRUE; return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID property, VARIANT* result) override {
+        if (!result) return E_POINTER;
+        VariantInit(result);
+        if (property == UIA_AriaRolePropertyId) { result->vt = VT_BSTR; result->bstrVal = SysAllocString(heading_level_ >= 0 ? L"heading" : document_ ? L"document" : list_item_ ? L"listitem" : article_ ? L"article" : L"feed"); }
+        else if (property == UIA_ControlTypePropertyId) { result->vt = VT_I4; result->lVal = heading_level_ >= 0 ? UIA_TextControlTypeId : document_ ? UIA_DocumentControlTypeId : list_item_ ? UIA_ListItemControlTypeId : UIA_GroupControlTypeId; }
+        else if (property == UIA_NamePropertyId && (list_item_ || document_ || heading_level_ >= 0)) { wchar_t text[1024]{}; GetWindowTextW(hwnd_, text, 1024); result->vt = VT_BSTR; result->bstrVal = SysAllocString(text); }
+        else if (property == UIA_HeadingLevelPropertyId && heading_level_ >= 0) { result->vt = VT_I4; result->lVal = 80050 + heading_level_; }
+        else if (property == UIA_IsControlElementPropertyId || property == UIA_IsContentElementPropertyId) { result->vt = VT_BOOL; result->boolVal = VARIANT_TRUE; }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_HostRawElementProvider(IRawElementProviderSimple** result) override { return UiaHostProviderFromHwnd(hwnd_, result); }
+};
+LRESULT CALLBACK feed_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    auto* provider = reinterpret_cast<FeedProvider*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_GETOBJECT && static_cast<LONG>(lparam) == UiaRootObjectId) {
+        if (!provider) { provider = new FeedProvider(hwnd); SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(provider)); }
+        return UiaReturnRawElementProvider(hwnd, wparam, lparam, provider);
+    }
+    if (message == WM_NCDESTROY && provider) { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0); provider->Release(); }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_CREATE) {
+        if (heading_mode) {
+            const HWND assistant = CreateWindowExW(0, heading_semantic_mode ? L"assistant-message" : L"BUTTON", heading_semantic_mode ? L"" : L"Assistant message",
+                WS_CHILD | WS_VISIBLE | (heading_semantic_mode ? 0 : BS_GROUPBOX), 8, 8, 620, 600, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            if (!heading_semantic_mode) CreateWindowExW(0, L"STATIC", L"Claude responded:", WS_CHILD | WS_VISIBLE, 8, 20, 590, 24, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Opening body paragraph.", WS_CHILD | WS_VISIBLE, 8, 50, 590, 24, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND heading = CreateWindowExW(0, L"CCLiveFixtureHeading1", L"Heading One", WS_CHILD | WS_VISIBLE, 8, 80, 590, 30, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Heading One", WS_CHILD | WS_VISIBLE, 0, 0, 580, 24, heading, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Body after first heading.", WS_CHILD | WS_VISIBLE, 8, 116, 590, 24, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"CCLiveFixtureHeading2", L"Heading Two", WS_CHILD | WS_VISIBLE, 8, 148, 590, 30, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"CCLiveFixtureHeading3", L"Heading Three", WS_CHILD | WS_VISIBLE, 8, 184, 590, 30, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"CCLiveFixtureHeading0", L"Unknown level remains plain.", WS_CHILD | WS_VISIBLE, 8, 220, 590, 30, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"CCLiveFixtureHeading4", L"Unsupported level remains plain.", WS_CHILD | WS_VISIBLE, 8, 256, 590, 30, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Plain short title remains plain.", WS_CHILD | WS_VISIBLE, 8, 292, 590, 24, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND item = CreateWindowExW(0, L"CCLiveFixtureRichItem", L"Progress: Full rich-list body remains complete.", WS_CHILD | WS_VISIBLE, 8, 324, 590, 54, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Progress:", WS_CHILD | WS_VISIBLE, 0, 0, 580, 24, item, nullptr, GetModuleHandleW(nullptr), nullptr);
+            return 0;
+        }
+        if (identity_mode) {
+            identity_document = CreateWindowExW(0, L"CCLiveFixtureDocument", L"Identity fixture - Claude Code", WS_CHILD | WS_VISIBLE,
+                8, 8, 620, 400, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND assistant = CreateWindowExW(0, L"BUTTON", L"Assistant message", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                8, 8, 590, 300, identity_document, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Claude responded:", WS_CHILD | WS_VISIBLE, 8, 24, 550, 30, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Identity fixture assistant body.", WS_CHILD | WS_VISIBLE, 8, 58, 550, 200, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            reload(); SetTimer(hwnd, 1, 100, nullptr); return 0;
+        }
+        if (rich_list_mode) {
+            const HWND assistant = CreateWindowExW(0, L"BUTTON", L"Assistant message", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                8, 8, 620, 600, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Claude responded:", WS_CHILD | WS_VISIBLE, 8, 20, 590, 24, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND first = CreateWindowExW(0, L"CCLiveFixtureRichItem", L"Progress: Media Encoder now resumes the export successfully.", WS_CHILD | WS_VISIBLE,
+                8, 50, 590, 60, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Progress:", WS_CHILD | WS_VISIBLE, 0, 0, 550, 30, first, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND second = CreateWindowExW(0, L"CCLiveFixtureRichItem", L"New problem: The output path requires permission.", WS_CHILD | WS_VISIBLE,
+                8, 120, 590, 60, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"New problem:", WS_CHILD | WS_VISIBLE, 0, 0, 550, 30, second, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND auxiliary = CreateWindowExW(0, L"CCLiveFixtureRichItem", L"Safe label. AUXILIARY MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE,
+                8, 190, 590, 80, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Safe label.", WS_CHILD | WS_VISIBLE, 0, 0, 550, 30, auxiliary, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"BUTTON", L"AUXILIARY MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE, 0, 32, 550, 30, auxiliary, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND code_item = CreateWindowExW(0, L"CCLiveFixtureRichItem", L"CODE AGGREGATE MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE,
+                8, 280, 590, 100, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND code = CreateWindowExW(0, L"group/copy", L"Sample code", WS_CHILD | WS_VISIBLE,
+                0, 0, 550, 70, code_item, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"CODE CHILD MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE, 0, 0, 530, 30, code, nullptr, GetModuleHandleW(nullptr), nullptr);
+            return 0;
+        }
+        if (stream_list_mode || semantic_list_mode) {
+            auto list = [](HWND parent, int y, bool safe) {
+                const HWND control = CreateWindowExW(0, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
+                    8, y, 560, 100, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+                SendMessageW(control, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(safe ? L"Streaming list item one must be translated." : L"USER LIST MUST NOT BE TRANSLATED"));
+                if (safe) {
+                    SendMessageW(control, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Streaming list item two must be translated."));
+                    SendMessageW(control, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Short list tail."));
+                }
+                return control;
+            };
+            if (semantic_list_mode) {
+                const HWND safe = CreateWindowExW(0, L"assistant-message", L"", WS_CHILD | WS_VISIBLE, 8, 8, 600, 200, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                list(safe, 8, true);
+                const HWND user = CreateWindowExW(0, L"user-message", L"", WS_CHILD | WS_VISIBLE, 8, 220, 600, 200, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                const HWND misleading = CreateWindowExW(0, L"assistant-message", L"", WS_CHILD | WS_VISIBLE, 0, 0, 590, 150, user, nullptr, GetModuleHandleW(nullptr), nullptr);
+                list(misleading, 8, false);
+                list(hwnd, 450, false);
+            } else {
+                const HWND feed = CreateWindowExW(0, L"CCLiveFixtureFeed", L"", WS_CHILD | WS_VISIBLE, 8, 8, 600, 650, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                const HWND user = CreateWindowExW(0, L"CCLiveFixtureArticle", L"消息 1", WS_CHILD | WS_VISIBLE, 8, 8, 580, 160, feed, nullptr, GetModuleHandleW(nullptr), nullptr);
+                CreateWindowExW(0, L"STATIC", L"您说：USER HEADING SUMMARY", WS_CHILD | WS_VISIBLE, 0, 0, 550, 24, user, nullptr, GetModuleHandleW(nullptr), nullptr);
+                list(user, 28, false);
+                stream_article = CreateWindowExW(0, L"CCLiveFixtureArticle", L"", WS_CHILD | WS_VISIBLE, 8, 180, 580, 260, feed, nullptr, GetModuleHandleW(nullptr), nullptr);
+                stream_heading = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 0, 0, 550, 24, stream_article, nullptr, GetModuleHandleW(nullptr), nullptr);
+                const HWND row = CreateWindowExW(0, L"group/message-row", L"", WS_CHILD | WS_VISIBLE, 0, 28, 570, 220, stream_article, nullptr, GetModuleHandleW(nullptr), nullptr);
+                list(row, 0, true);
+                const HWND input = CreateWindowExW(0, L"EDIT", L"COMPOSER MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE, 0, 110, 550, 50, row, nullptr, GetModuleHandleW(nullptr), nullptr);
+                CreateWindowExW(0, L"STATIC", L"INPUT CHILD MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE, 0, 0, 500, 30, input, nullptr, GetModuleHandleW(nullptr), nullptr);
+                list(hwnd, 680, false);
+                reload(); SetTimer(hwnd, 1, 100, nullptr);
+            }
+            return 0;
+        }
+        if (feed_mode) {
+            const HWND feed = CreateWindowExW(0, L"CCLiveFixtureFeed", L"Synthetic conversation", WS_CHILD | WS_VISIBLE,
+                8, 8, 620, 700, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND old_article = CreateWindowExW(0, L"article", L"消息 86", WS_CHILD | WS_VISIBLE,
+                8, 8, 600, 60, feed, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Claude 已回复：OLD HEADING SUMMARY", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 0, 590, 24, old_article, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"PREVIOUS ANSWER MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 26, 590, 24, old_article, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND article = CreateWindowExW(0, L"article", L"消息 88", WS_CHILD | WS_VISIBLE,
+                8, 80, 600, 60, feed, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Claude 已回复：HEADING SUMMARY MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 0, 590, 24, article, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"A short first tool title.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 26, 590, 24, article, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND first_row = CreateWindowExW(0, L"group/message-row", L"", WS_CHILD | WS_VISIBLE,
+                8, 150, 600, 100, feed, nullptr, GetModuleHandleW(nullptr), nullptr);
+            body = CreateWindowExW(0, L"STATIC", L"Reading the project files.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 0, 590, 100, first_row, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND second_row = CreateWindowExW(0, L"group/message-row", L"", WS_CHILD | WS_VISIBLE,
+                8, 260, 600, 60, feed, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Second body paragraph must be preserved.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 0, 590, 60, second_row, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND last_row = CreateWindowExW(0, L"group/message-row", L"", WS_CHILD | WS_VISIBLE,
+                8, 330, 600, 40, feed, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Short tail.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 0, 590, 40, last_row, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND user_article = CreateWindowExW(0, L"article", L"消息 89", WS_CHILD | WS_VISIBLE,
+                8, 380, 600, 60, feed, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"您说：USER HEADING SUMMARY MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 0, 590, 24, user_article, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"USER INPUT MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 26, 590, 24, user_article, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND user_row = CreateWindowExW(0, L"group/message-row", L"", WS_CHILD | WS_VISIBLE,
+                8, 450, 600, 40, feed, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"USER SIBLING ROW MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 0, 590, 40, user_row, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"SIDEBAR TEXT MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                8, 740, 590, 40, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            reload(); SetTimer(hwnd, 1, 100, nullptr); return 0;
+        }
+        if (article_mode) {
+            const HWND old_article = CreateWindowExW(0, L"article", L"消息 86", WS_CHILD | WS_VISIBLE,
+                8, 500, 620, 60, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Claude 已回复：OLD HEADING SUMMARY", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                8, 8, 590, 24, old_article, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"PREVIOUS ANSWER MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                8, 32, 590, 24, old_article, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND article = CreateWindowExW(0, L"article", L"消息 88", WS_CHILD | WS_VISIBLE,
+                8, 8, 620, 440, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Claude 已回复：HEADING SUMMARY MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                8, 8, 590, 24, article, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND first_paragraph = CreateWindowExW(0, L"font-claude-response", L"", WS_CHILD | WS_VISIBLE,
+                8, 40, 600, 160, article, nullptr, GetModuleHandleW(nullptr), nullptr);
+            body = CreateWindowExW(0, L"STATIC", L"Reading the project files.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 0, 590, 160, first_paragraph, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND second_paragraph = CreateWindowExW(0, L"font-claude-response", L"", WS_CHILD | WS_VISIBLE,
+                8, 210, 600, 50, article, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Second body paragraph must be preserved.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 0, 590, 40, second_paragraph, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND last_paragraph = CreateWindowExW(0, L"font-claude-response", L"", WS_CHILD | WS_VISIBLE,
+                8, 270, 600, 50, article, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Short tail.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 0, 590, 40, last_paragraph, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND user_article = CreateWindowExW(0, L"article", L"消息 89", WS_CHILD | WS_VISIBLE,
+                8, 570, 620, 90, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"您说：USER HEADING SUMMARY MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                8, 8, 590, 24, user_article, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND misleading = CreateWindowExW(0, L"font-claude-response", L"", WS_CHILD | WS_VISIBLE,
+                8, 40, 600, 40, user_article, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"USER INPUT MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                0, 0, 590, 30, misleading, nullptr, GetModuleHandleW(nullptr), nullptr);
+            reload(); SetTimer(hwnd, 1, 100, nullptr); return 0;
+        }
+        if (semantic_mode) {
+            const HWND old_container = CreateWindowExW(0, L"assistant-message", L"Previous response", WS_CHILD | WS_VISIBLE,
+                8, 350, 620, 50, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"PREVIOUS ANSWER MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                8, 8, 600, 30, old_container, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND container = CreateWindowExW(0, L"assistant-message", L"Latest response", WS_CHILD | WS_VISIBLE,
+                8, 8, 620, 330, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            body = CreateWindowExW(0, L"STATIC", L"Reading the project files.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                8, 8, 600, 300, container, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND user_container = CreateWindowExW(0, L"user-message", L"User content", WS_CHILD | WS_VISIBLE,
+                8, 420, 620, 50, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND misleading = CreateWindowExW(0, L"assistant-message", L"Nested styling", WS_CHILD | WS_VISIBLE,
+                0, 0, 600, 40, user_container, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"USER INPUT MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                8, 8, 580, 30, misleading, nullptr, GetModuleHandleW(nullptr), nullptr);
+            reload();
+            SetTimer(hwnd, 1, 100, nullptr);
+            return 0;
+        }
+        const HWND old_group = CreateWindowExW(0, L"BUTTON", L"Assistant message", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+            8, 350, 620, 60, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        CreateWindowExW(0, L"STATIC", L"PREVIOUS ANSWER MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+            12, 24, 590, 24, old_group, nullptr, GetModuleHandleW(nullptr), nullptr);
+        const HWND group = CreateWindowExW(0, L"BUTTON", L"Assistant message", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+            8, 8, 620, 330, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        CreateWindowExW(0, L"STATIC", L"Claude responded:", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+            12, 24, 560, 24, group, nullptr, GetModuleHandleW(nullptr), nullptr);
+        body = CreateWindowExW(0, L"STATIC", L"Reading the project files.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+            12, 52, 590, 220, group, nullptr, GetModuleHandleW(nullptr), nullptr);
+        const HWND user_group = CreateWindowExW(0, L"BUTTON", L"Message 3 of 3", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+            8, 420, 620, 60, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        CreateWindowExW(0, L"STATIC", L"USER INPUT MUST NOT BE TRANSLATED", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+            12, 24, 590, 24, user_group, nullptr, GetModuleHandleW(nullptr), nullptr);
+        reload();
+        SetTimer(hwnd, 1, 100, nullptr);
+        return 0;
+    }
+    if (message == WM_TIMER) { reload(); return 0; }
+    if (message == WM_DESTROY) { KillTimer(hwnd, 1); PostQuitMessage(0); return 0; }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+}
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    int count = 0;
+    LPWSTR* args = CommandLineToArgvW(GetCommandLineW(), &count);
+    if (args && count > 1) source_file = args[1];
+    if (args && count > 2) semantic_mode = std::wstring(args[2]) == L"--semantic";
+    if (args && count > 2) article_mode = std::wstring(args[2]) == L"--article";
+    if (args && count > 2) feed_mode = std::wstring(args[2]) == L"--feed";
+    if (args && count > 2) rich_list_mode = std::wstring(args[2]) == L"--rich-list";
+    if (args && count > 2) identity_mode = std::wstring(args[2]) == L"--identity" || std::wstring(args[2]) == L"--identity-race";
+    if (args && count > 2) identity_race_mode = std::wstring(args[2]) == L"--identity-race";
+    if (args && count > 2) stream_list_mode = std::wstring(args[2]) == L"--stream-list";
+    if (args && count > 2) semantic_list_mode = std::wstring(args[2]) == L"--semantic-list";
+    if (args && count > 2) heading_mode = std::wstring(args[2]) == L"--headings" || std::wstring(args[2]) == L"--semantic-headings";
+    if (args && count > 2) heading_semantic_mode = std::wstring(args[2]) == L"--semantic-headings";
+    if (args) LocalFree(args);
+    WNDCLASSW window_class{};
+    window_class.lpfnWndProc = window_proc;
+    window_class.hInstance = instance;
+    window_class.lpszClassName = L"CCLiveFixtureWindow";
+    if (!RegisterClassW(&window_class)) return 1;
+    WNDCLASSW semantic_class{};
+    semantic_class.lpfnWndProc = DefWindowProcW;
+    semantic_class.hInstance = instance;
+    semantic_class.lpszClassName = L"assistant-message";
+    if (!RegisterClassW(&semantic_class)) return 3;
+    semantic_class.lpszClassName = L"user-message";
+    if (!RegisterClassW(&semantic_class)) return 4;
+    semantic_class.lpszClassName = L"article";
+    if (!RegisterClassW(&semantic_class)) return 5;
+    semantic_class.lpszClassName = L"font-claude-response";
+    if (!RegisterClassW(&semantic_class)) return 6;
+    semantic_class.lpszClassName = L"group/message-row";
+    if (!RegisterClassW(&semantic_class)) return 7;
+    semantic_class.lpszClassName = L"CCLiveFixtureFeed";
+    semantic_class.lpfnWndProc = feed_proc;
+    if (!RegisterClassW(&semantic_class)) return 8;
+    semantic_class.lpszClassName = L"CCLiveFixtureArticle";
+    if (!RegisterClassW(&semantic_class)) return 9;
+    semantic_class.lpszClassName = L"CCLiveFixtureRichItem";
+    if (!RegisterClassW(&semantic_class)) return 10;
+    semantic_class.lpszClassName = L"group/copy";
+    semantic_class.lpfnWndProc = DefWindowProcW;
+    if (!RegisterClassW(&semantic_class)) return 11;
+    semantic_class.lpszClassName = L"CCLiveFixtureDocument";
+    semantic_class.lpfnWndProc = feed_proc;
+    if (!RegisterClassW(&semantic_class)) return 12;
+    for (int level = 0; level <= 4; ++level) {
+        const auto name = L"CCLiveFixtureHeading" + std::to_wstring(level);
+        semantic_class.lpszClassName = name.c_str();
+        if (!RegisterClassW(&semantic_class)) return 13;
+    }
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const HWND hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, window_class.lpszClassName,
+        L"CCLive synthetic accessibility fixture", WS_OVERLAPPEDWINDOW,
+        -20000, -20000, 660, 400, nullptr, nullptr, instance, nullptr);
+    if (!hwnd) return 2;
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    MSG message;
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) { TranslateMessage(&message); DispatchMessageW(&message); }
+    return 0;
+}
+
+
+
+
+
+
+
+
+
+

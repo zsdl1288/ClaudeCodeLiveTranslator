@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none">
+  <title>Live translation</title>
+  <desc>Original copper and warm gray speech bubbles carrying an A and a Chinese text symbol.</desc>
+  <!-- The silhouettes remain open against a transparent desktop background. -->
+  <path d="M48 23H161C179 23 194 38 194 56V135C194 153 179 168 161 168H73L39 192L44 168C29 166 18 153 18 137V56C18 38 31 23 48 23Z" fill="#B8754F"/>
+  <!-- Hand-drawn geometric A; independent of any font installation. -->
+  <path d="M40 122L65 54H70L95 122M49 100H86" stroke="#F8F3E9" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M112 99H205C223 99 238 114 238 132V188C238 206 223 221 205 221H189L157 242L160 221H112C94 221 79 206 79 188V132C79 114 94 99 112 99Z" fill="#49443F" stroke="#F5EFE5" stroke-width="8" stroke-linejoin="round"/>
+  <!-- Geometric 文 symbol, with deliberately generous small-size strokes. -->
+  <path d="M157 123L163 132M121 144H197M139 155C147 174 164 190 195 201M181 155C171 175 150 191 122 202" stroke="#F8F3E9" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

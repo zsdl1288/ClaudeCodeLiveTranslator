@@ -1,0 +1,14 @@
+LLVM-MinGW 20260908 (LLVM/Clang 23.1.1), UCRT x86_64
+Official project: https://github.com/mstorsjo/llvm-mingw
+Release: https://github.com/mstorsjo/llvm-mingw/releases/tag/20260908
+Archive: https://github.com/mstorsjo/llvm-mingw/releases/download/20260908/llvm-mingw-20260908-ucrt-x86_64.zip
+Official release API SHA-256: 1bcf74d06b724aeecaa6412ca85f5b26fb1da770e7cdcefa9263c9c5c3ad34b6
+Archive checksum was verified before extraction.
+Toolchain is portable under toolchain/ and no global PATH or registry changes are required.
+
+nlohmann/json 3.12.0 (MIT)
+Official project: https://github.com/nlohmann/json
+Header: https://raw.githubusercontent.com/nlohmann/json/v3.12.0/single_include/nlohmann/json.hpp
+SHA-256: aaf127c04cb31c406e5b04a63f1ae89369fccde6d8fa7cdda1ed4f32dfc5de63
+License: https://raw.githubusercontent.com/nlohmann/json/v3.12.0/LICENSE.MIT
+Header checksum was verified.

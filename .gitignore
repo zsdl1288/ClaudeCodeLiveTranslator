@@ -1,5 +1,17 @@
-raw_output.log
-untranslated.log
-__pycache__/
-*.pyc
-.DS_Store
+/build-cpp/
+/build/
+/dist/
+/toolchain/
+/data/
+/work/
+/.cache/
+/.vs/
+/CMakeUserPresets.json
+*.user
+*.suo
+# Local credentials and diagnostic output
+.env
+.env.*
+!.env.example
+*.log
+/diagnostic-status.json
