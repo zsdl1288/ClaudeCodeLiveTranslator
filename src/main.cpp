@@ -913,6 +913,22 @@ struct Watcher {
       event["identity_pending"] = sourceIdentityPending;
       emit(std::move(event));
     };
+    auto ledgerContext = [&] {
+      return currentTaskId + (windowReplayNonce
+                                  ? "|window:" + std::to_string(windowReplayNonce)
+                                  : "");
+    };
+    auto unavailableBody = [&] {
+      if (taskChanged) {
+        identityOnly();
+        return;
+      }
+      // A temporarily empty view must suspend pending source, while completed
+      // captions and their aliases remain intact for the same task.
+      for (auto event : ledger.observe({{"context", ledgerContext()},
+                                       {"blocks", json::array()}}))
+        publishLedger(std::move(event));
+    };
     if (sourceIdentityPending) {
       // A new explicit URL is sufficient to switch tasks, but its body is not
       // trusted until the reader verifies that identity after extraction.
@@ -921,8 +937,7 @@ struct Watcher {
     }
     if (!snapshot.contains("blocks") || !snapshot["blocks"].is_array() ||
         snapshot["blocks"].empty()) {
-      if (taskChanged)
-        identityOnly();
+      unavailableBody();
       return;
     }
     auto effective = snapshot;
@@ -938,23 +953,21 @@ struct Watcher {
       auto key = raw["key"].get<std::string>();
       auto body = raw["text"].get<std::string>();
       // Match the reader's 128 blocks / 64000 UTF-16-unit acquisition bound.
-      if (key.empty() || key.size() > 4096 || body.size() > 64000 * 3)
+      if (key.empty() || key.size() > 4096 || body.empty() ||
+          body.size() > 64000 * 3)
         continue;
       auto previous = acceptedBodies.find(key);
       if (previous != acceptedBodies.end() &&
           body.size() < previous->second.size() &&
           previous->second.compare(0, body.size(), body) == 0)
         body = previous->second;
-      if (body.empty())
-        continue;
       auto block = raw;
       block["text"] = body;
       effective["blocks"].push_back(std::move(block));
       nextBodies[key] = std::move(body);
     }
     if (effective["blocks"].empty()) {
-      if (taskChanged)
-        identityOnly();
+      unavailableBody();
       return;
     }
     // Keep only the currently observed block set; no historical body cache.
@@ -1012,10 +1025,7 @@ struct Watcher {
     if (consistentTaskSnapshots < 2) {
       auto identityOnly = effective;
       identityOnly["blocks"] = json::array();
-      identityOnly["context"] =
-          currentTaskId + (windowReplayNonce
-                               ? "|window:" + std::to_string(windowReplayNonce)
-                               : "");
+      identityOnly["context"] = ledgerContext();
       for (auto event : ledger.observe(identityOnly))
         publishLedger(std::move(event));
       return;
@@ -1044,10 +1054,7 @@ struct Watcher {
     previousBlockKeys = std::move(blockKeys);
     previousSourceCount = sourceIndices.size();
     previousMinimum = minimumSourceIndex;
-    effective["context"] =
-        currentTaskId + (windowReplayNonce
-                             ? "|window:" + std::to_string(windowReplayNonce)
-                             : "");
+    effective["context"] = ledgerContext();
     for (auto event : ledger.observe(effective))
       publishLedger(std::move(event));
   }
@@ -5381,6 +5388,98 @@ public:
           activeTaskId == "large-task-B" && records.size() == 1 &&
               records[0].source == "Large source 0." &&
               !records[0].pendingReplacement);
+    // An empty verified view suspends an unsettled fragment, without deleting
+    // a completed caption or resetting a cropped-window Ledger context.
+    for (int emptyMode = 0; emptyMode < 2; ++emptyMode) {
+      auto pendingBus = std::make_shared<Bus>();
+      Watcher pendingSource(0, sourceGeneration, 60000, {}, pendingBus);
+      cclive::Ledger pendingLedger(60000);
+      const auto pendingTask = "empty-pending-task-" + std::to_string(emptyMode);
+      pendingSource.currentTaskId = pendingTask;
+      pendingSource.windowReplayNonce = 7;
+      auto pendingSnapshot = largeSnapshot(pendingTask, "pending-block", 1);
+      pendingSource.currentTask = {
+          {"task_id", pendingTask},
+          {"task_title", pendingSnapshot.at("task_title")},
+          {"identity_quality", pendingSnapshot.at("identity_quality")},
+          {"source_hwnd", pendingSnapshot.at("source_hwnd")},
+          {"source_pid", pendingSnapshot.at("source_pid")}};
+      pendingSnapshot["blocks"][0]["text"] = "Stable completed source.\n\n";
+      auto drainPending = [&] {
+        std::deque<json> events;
+        {
+          std::lock_guard<std::mutex> lock(pendingBus->mutex);
+          events.swap(pendingBus->source);
+        }
+        for (auto &event : events)
+          accept(std::move(event));
+      };
+      auto futureTick = [&] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   Clock::now().time_since_epoch()).count() + 60001;
+      };
+      pendingSource.publishSnapshot(pendingSnapshot, pendingLedger);
+      drainPending();
+      pendingSource.publishSnapshot(pendingSnapshot, pendingLedger);
+      drainPending();
+      for (auto event : pendingLedger.flush_at(futureTick()))
+        pendingSource.publishLedger(std::move(event));
+      drainPending();
+      const auto mode = std::to_string(emptyMode);
+      check(("empty_view_completed_setup_" + mode).c_str(),
+            records.size() == 1 && records.front().source == "Stable completed source.");
+      if (records.size() != 1)
+        continue;
+      complete(0, "已完成且应保留的字幕");
+      const auto completedKey = records.front().key;
+      const auto completedVersion = records.front().version;
+      pendingSnapshot["blocks"][0]["text"] =
+          "Stable completed source.\n\nOutdated pending fragment";
+      pendingSource.publishSnapshot(pendingSnapshot, pendingLedger);
+      drainPending();
+      const auto pendingIndices = pendingSource.sourceIndices;
+      const auto pendingSlots = pendingSource.forwardedSlots;
+      const auto pendingBodies = pendingSource.acceptedBodies;
+      const auto pendingAliasCount = sourceAliases.size();
+      auto unavailable = pendingSnapshot;
+      if (emptyMode == 0)
+        unavailable["blocks"] = json::array();
+      else
+        unavailable["blocks"][0]["text"] = "";
+      pendingSource.publishSnapshot(unavailable, pendingLedger);
+      const auto unavailableEvents = pendingLedger.flush_at(futureTick());
+      for (auto event : unavailableEvents)
+        pendingSource.publishLedger(std::move(event));
+      check(("empty_view_does_not_flush_old_pending_fragment_" + mode).c_str(),
+            unavailableEvents.empty() && pendingBus->source.empty() &&
+                pendingSource.sourceIndices == pendingIndices &&
+                pendingSource.forwardedSlots == pendingSlots &&
+                pendingSource.acceptedBodies == pendingBodies &&
+                sourceAliases.size() == pendingAliasCount);
+      drainPending();
+      check(("empty_view_keeps_completed_caption_and_version_" + mode).c_str(),
+            records.size() == 1 && records.front().key == completedKey &&
+                records.front().version == completedVersion &&
+                records.front().state == "done" &&
+                records.front().translation == "已完成且应保留的字幕");
+      pendingSnapshot["blocks"][0]["text"] =
+          "Stable completed source.\n\nCurrent live fragment";
+      pendingSource.publishSnapshot(pendingSnapshot, pendingLedger);
+      drainPending();
+      check(("restored_view_waits_for_current_fragment_to_settle_" + mode).c_str(),
+            pendingLedger.flush().empty() && records.size() == 1 &&
+                records.front().key == completedKey);
+      auto restoredEvents = pendingLedger.flush_at(futureTick());
+      for (auto event : restoredEvents)
+        pendingSource.publishLedger(std::move(event));
+      drainPending();
+      check(("restored_view_emits_only_current_fragment_" + mode).c_str(),
+            restoredEvents.size() == 1 &&
+                restoredEvents.front().value("text", "") == "Current live fragment" &&
+                records.size() == 2 && records.front().key == completedKey &&
+                records.front().translation == "已完成且应保留的字幕" &&
+                records.back().source == "Current live fragment");
+    }
     accept(taskMeta("pending-task-C", {"Pending cached source."}));
     accept(taskText("pending-task-C", "pending-runtime",
                     "Pending cached source."));

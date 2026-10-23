@@ -68,6 +68,7 @@ const std::wregex message_name(LR"(^(?:Message \d+(?: of \d+)?|消息\s*\d+(?:\s
 const std::wregex assistant_marker(LR"(^claude\s*(?:responded|已回复|回复)\s*[:：])", flags);
 const std::wregex user_marker(LR"(^(?:you said|您说|你说)\s*[:：])", flags);
 const std::wregex strong_assistant_semantic(LR"(assistant[-_/ ](?:message|content|response))", flags);
+const std::wregex strong_user_semantic(LR"(user[-_/ ](?:message|content))", flags);
 const std::wregex assistant_name(LR"(assistant|助手|claude response)", flags);
 const std::wregex thinking_title(LR"(^(?:Thought(?: for)?\b|Thinking\b|Reasoning\b|Show thinking\b|Hide thinking\b|思考|已思考))", flags);
 const std::wregex plain_thinking_title(LR"(^(?:Thought\b|Thinking\b|Reasoning\b|思考|已思考))", flags);
@@ -174,6 +175,7 @@ std::string safe_role(const std::wstring& role) {
     return value.empty() ? "empty" : "other";
 }
 struct Block { std::string key, kind; std::wstring text; };
+struct Selection { bool selected = false; std::vector<Block> blocks; N anchor; };
 struct ResponseText {
     std::wstring text, code;
     std::string paragraph;
@@ -648,46 +650,88 @@ class Reader {
             if (is_message(item) || lower(item->aria_role) == L"article") return std::to_string(pid) + "|message|" + item->id;
         return fallback;
     }
-    std::vector<Block> streaming_article_blocks(const N& window, DWORD pid, const std::vector<N>& all) {
+    Selection streaming_article_blocks(const N& window, DWORD pid, const std::vector<N>& all) {
         std::unordered_map<std::string, std::vector<N>> articles;
-        std::unordered_map<std::string, N> feeds;
+        N latest_feed;
         for (const auto& item : all) if (lower(item->aria_role) == L"article") {
             const auto feed = nearest_feed(item, window);
-            if (feed) { articles[feed->id].push_back(item); feeds[feed->id] = feed; }
+            if (feed) { articles[feed->id].push_back(item); latest_feed = feed; }
         }
-        for (const auto& item : articles) {
-            const auto& ordered = item.second;
-            if (ordered.size() < 2) continue;
-            const auto& previous = ordered[ordered.size() - 2];
-            const auto& latest = ordered.back();
-            bool preceding_user = false, latest_user = false, latest_assistant = false;
-            std::vector<N> selected;
-            for (const auto& node : all) {
-                if (inside(node, previous) && is_user_marker(node)) preceding_user = true;
-                if (!inside(node, latest)) continue;
-                if (is_user_marker(node)) latest_user = true;
-                if (is_assistant_marker(node)) latest_assistant = true;
-                bool row = false;
-                auto ancestor = parent(node);
-                for (int depth = 0; ancestor && ancestor->id != latest->id && depth < 32; ++depth, ancestor = parent(ancestor))
-                    if (has_class(ancestor->class_name, L"group/message-row")) { row = true; break; }
-                if (row) selected.push_back(node);
-            }
-            // Code's streaming article omits its speaker heading until completion.
-            // Infer only the newest article immediately after a proven user article,
-            // and only exposed message-row descendants; input/sidebar are excluded.
-            if (!preceding_user || latest_user || latest_assistant || selected.empty()) continue;
-            auto result = output_blocks(latest, std::to_string(pid) + "|message|" + latest->id, &selected, true);
-            result.erase(std::remove_if(result.begin(), result.end(), [](const Block& value) { return blank(value.text); }), result.end());
-            if (!result.empty()) return result;
+        if (!latest_feed) return {};
+        const auto& ordered = articles.at(latest_feed->id);
+        const auto& latest = ordered.back();
+        bool after_latest = false;
+        for (const auto& node : all) {
+            if (node->id == latest->id) after_latest = true;
+            if (after_latest && later_messages_boundary(node, latest_feed)) return {};
         }
-        return {};
+        const auto previous = ordered.size() > 1 ? ordered[ordered.size() - 2] : N{};
+        bool preceding_user = false, latest_user = false, latest_assistant = false;
+        std::vector<N> selected;
+        for (const auto& node : all) {
+            if (previous && inside(node, previous) && is_user_marker(node)) preceding_user = true;
+            if (!inside(node, latest)) continue;
+            if (is_user_marker(node)) latest_user = true;
+            if (is_assistant_marker(node)) latest_assistant = true;
+            bool row = false;
+            auto ancestor = parent(node);
+            for (int depth = 0; ancestor && ancestor->id != latest->id && depth < 32; ++depth, ancestor = parent(ancestor))
+                if (has_class(ancestor->class_name, L"group/message-row")) { row = true; break; }
+            if (row) selected.push_back(node);
+        }
+        // Let Feed selection account for later sibling rows and paging boundaries.
+        // It also treats an empty/user candidate as selected rather than history.
+        if (!preceding_user || latest_user || latest_assistant) return {};
+        auto result = output_blocks(latest, std::to_string(pid) + "|message|" + latest->id, &selected, true);
+        result.erase(std::remove_if(result.begin(), result.end(), [](const Block& value) { return blank(value.text); }), result.end());
+        return {true, std::move(result), latest};
     }
-    std::vector<Block> feed_blocks(const N& window, DWORD pid, const std::vector<N>& all) {
-        struct Segment { N feed, marker; bool assistant; std::vector<N> nodes; };
+    bool responding_status(const std::vector<N>& all) {
+        static const std::wregex label(LR"(^\s*Claude\s*(?:正在回复|is\s+responding)\s*(?:…|\.\.\.)?\s*$)", flags);
+        for (const auto& item : all) {
+            if (!rx(item->name, label)) continue;
+            if (is_status(item)) return true;
+            if (item->type != UIA_TextControlTypeId) continue;
+            auto ancestor = parent(item);
+            for (int depth = 0; ancestor && depth < 6; ++depth, ancestor = parent(ancestor))
+                if (is_status(ancestor)) return true;
+        }
+        return false;
+    }
+    bool later_messages_boundary(const N& item, const N& feed) {
+        static const std::wregex label(LR"(^\s*(?:加载后续消息|Load\s+later\s+messages)\s*$)", flags);
+        if (item->type != UIA_ButtonControlTypeId || !rx(item->name, label)) return false;
+        // Chromium flattens generic RawView wrappers. The paging control must be
+        // outside every message/response while still belonging to this Feed.
+        auto ancestor = parent(item);
+        for (int depth = 0; ancestor && depth < 64; ++depth, ancestor = parent(ancestor)) {
+            if (ancestor->id == feed->id) return true;
+            if (is_message(ancestor) || lower(ancestor->aria_role) == L"article" || response_boundary(ancestor) ||
+                rx(ancestor->class_name + L" " + ancestor->automation_id, strong_assistant_semantic)) return false;
+        }
+        return false;
+    }
+    bool strong_turn_boundary(const N& item, const N& feed) {
+        const auto semantic = item->class_name + L" " + item->automation_id;
+        if (item->type == UIA_TextControlTypeId ||
+            (!rx(semantic, strong_assistant_semantic) && !rx(semantic, strong_user_semantic))) return false;
+        auto ancestor = parent(item);
+        for (int depth = 0; ancestor && depth < 64; ++depth, ancestor = parent(ancestor)) {
+            if (ancestor->id == feed->id) return true;
+            const auto parent_semantic = ancestor->class_name + L" " + ancestor->automation_id;
+            if (is_message(ancestor) || lower(ancestor->aria_role) == L"article" || response_boundary(ancestor) ||
+                rx(parent_semantic, strong_assistant_semantic) || rx(parent_semantic, excluded_semantic) ||
+                is_status(ancestor) || ancestor->type == UIA_EditControlTypeId ||
+                ancestor->type == UIA_ButtonControlTypeId || ancestor->type == UIA_ToolBarControlTypeId) return false;
+        }
+        return false;
+    }
+    Selection feed_blocks(const N& window, DWORD pid, const std::vector<N>& all) {
+        struct Segment { N feed, container, marker; bool assistant = false; std::string key; std::vector<N> nodes; };
         std::vector<Segment> segments;
         std::unordered_map<std::string, std::size_t> active;
         std::unordered_map<std::string, N> owners;
+        const bool responding = responding_status(all);
         auto owner = [&](N item) -> N {
             const auto found = owners.find(item->id);
             if (found != owners.end()) return found->second;
@@ -700,32 +744,77 @@ class Reader {
         for (const auto& item : all) {
             const auto feed = owner(item);
             if (!feed) continue;
-            if (is_message(item)) active.erase(feed->id); // Wait for explicit speaker evidence.
-            if (is_assistant_marker(item) || is_user_marker(item)) {
-                segments.push_back({feed, item, !is_user_marker(item), {item}});
+            if (later_messages_boundary(item, feed)) {
+                // A completed history article before this paging button must not
+                // lend its speaker identity or key to the headless current stream.
+                segments.push_back({feed, {}, {}, responding,
+                    std::to_string(pid) + "|feed-stream|" + feed->id + "|" + item->id, {}});
                 active[feed->id] = segments.size() - 1;
+                continue;
+            }
+            const bool structural_message = is_message(item) || lower(item->aria_role) == L"article";
+            if (structural_message || strong_turn_boundary(item, feed)) {
+                const auto semantic = item->class_name + L" " + item->automation_id;
+                const bool assistant = !rx(semantic, strong_user_semantic) &&
+                    (rx(item->name, assistant_name) || rx(semantic, strong_assistant_semantic));
+                segments.push_back({feed, item, {}, assistant,
+                    std::to_string(pid) + (structural_message ? "|message|" : "|semantic|") + item->id, {}});
+                active[feed->id] = segments.size() - 1;
+            }
+            if (is_assistant_marker(item) || is_user_marker(item)) {
+                const auto current = active.find(feed->id);
+                if (current != active.end() && segments[current->second].container &&
+                    !segments[current->second].marker && inside(item, segments[current->second].container)) {
+                    auto& segment = segments[current->second];
+                    segment.marker = item; segment.assistant = !is_user_marker(item);
+                    if (is_message(segment.container) || lower(segment.container->aria_role) == L"article")
+                        segment.key = message_key(item, feed, pid);
+                    segment.nodes.push_back(item);
+                } else {
+                    segments.push_back({feed, {}, item, !is_user_marker(item), message_key(item, feed, pid), {item}});
+                    active[feed->id] = segments.size() - 1;
+                }
                 continue;
             }
             const auto current = active.find(feed->id);
             if (current != active.end()) segments[current->second].nodes.push_back(item);
         }
-        // Code emits one response as several sibling message rows after one speaker
-        // heading. Its article wrapper can contain only the first tool/title row.
-        // Feed + explicit speaker boundaries provide a complete, narrow response scope.
-        for (auto segment = segments.rbegin(); segment != segments.rend(); ++segment) {
-            if (!segment->assistant) continue;
-            auto result = output_blocks(segment->feed,
-                message_key(segment->marker, segment->feed, pid), &segment->nodes);
-            result.erase(std::remove_if(result.begin(), result.end(), [](const Block& value) { return blank(value.text); }), result.end());
-            if (!result.empty()) return result;
-        }
-        return {};
+        if (segments.empty()) return {};
+        // Select by structural order before attempting to read text. An empty,
+        // tool-only, user or unconfirmed candidate never falls back to old output.
+        const auto& segment = segments.back();
+        if (!segment.assistant) return {true, {}, segment.container ? segment.container : segment.marker};
+        auto result = output_blocks(segment.feed, segment.key, &segment.nodes, true);
+        result.erase(std::remove_if(result.begin(), result.end(), [](const Block& value) { return blank(value.text); }), result.end());
+        return {true, std::move(result), segment.container ? segment.container : segment.marker};
     }
-    std::vector<Block> semantic_blocks(const N& window, DWORD pid) {
+    Selection semantic_blocks(const N& window, DWORD pid) {
         std::vector<Block> result;
         std::unordered_map<std::string, ResponseText> builders;
         std::unordered_map<std::string, bool> user_messages;
         const auto semantic_nodes = descendants(window, 0, 10000);
+        static const std::wregex user_semantic(LR"(user[-_/ ](?:message|content))", flags);
+        static const std::wregex outside_semantic(LR"(composer|navigation|sidebar)", flags);
+        N selected_owner; bool selected_user = false;
+        for (const auto& item : semantic_nodes) {
+            if (item->type == UIA_TextControlTypeId) continue;
+            const auto semantic = item->class_name + L" " + item->automation_id;
+            if (!rx(semantic, assistant_semantic) && !rx(semantic, user_semantic)) continue;
+            N owner = item; bool user = rx(semantic, user_semantic), excluded = false;
+            auto ancestor = parent(item);
+            for (int depth = 0; ancestor && ancestor->id != window->id && depth < 64; ++depth, ancestor = parent(ancestor)) {
+                const auto parent_semantic = ancestor->class_name + L" " + ancestor->automation_id;
+                if (is_status(ancestor) || ancestor->type == UIA_EditControlTypeId || ancestor->type == UIA_ButtonControlTypeId ||
+                    ancestor->type == UIA_ToolBarControlTypeId || rx(parent_semantic, outside_semantic)) { excluded = true; break; }
+                if (rx(parent_semantic, user_semantic)) { owner = ancestor; user = true; }
+                else if (rx(parent_semantic, assistant_semantic)) owner = ancestor;
+            }
+            // Only outer semantic owners define a turn. Styled inner paragraphs
+            // and misleading assistant styling nested in a user are not new turns.
+            if (!excluded && owner->id == item->id) { selected_owner = item; selected_user = user; }
+        }
+        if (!selected_owner) return {};
+        if (selected_user) return {true, {}, selected_owner};
         const auto preferred_names = preferred_container_names(semantic_nodes);
         const auto auxiliary = auxiliary_regions(window, semantic_nodes);
         std::unordered_set<std::string> containers_with_text;
@@ -735,6 +824,7 @@ class Reader {
                 if (ancestor->type == UIA_ListItemControlTypeId || ancestor->type == UIA_DataItemControlTypeId || ancestor->type == UIA_HeaderItemControlTypeId || ancestor->heading_level) containers_with_text.insert(ancestor->id);
         }
         for (const auto& item : semantic_nodes) {
+            if (!inside(item, selected_owner)) continue;
             if (item->type != UIA_TextControlTypeId && !((item->heading_level || item->type == UIA_ListItemControlTypeId || item->type == UIA_DataItemControlTypeId || item->type == UIA_HeaderItemControlTypeId) && (!containers_with_text.count(item->id) || preferred_names.count(item->id)))) continue;
             if (covered_by_container_name(item, window, preferred_names)) continue;
             if (item->name.empty() || item->name.size() > 64000 || item->class_name.find(L"sr-only") != std::wstring::npos || is_status(item) || is_assistant_marker(item) || is_user_marker(item)) continue;
@@ -771,9 +861,8 @@ class Reader {
             } catch (const UiaError&) {}
         }
         for (auto& block : result) block.text = builders.at(block.key).finish();
-        // Semantic-only Code layouts: keep only the newest assistant container.
-        if (result.size() > 1) return {std::move(result.back())};
-        return result;
+        result.erase(std::remove_if(result.begin(), result.end(), [](const Block& value) { return blank(value.text); }), result.end());
+        return {true, std::move(result), selected_owner};
     }
 public:
     Reader() {
@@ -896,15 +985,30 @@ public:
             if (content->id == window->id || inside(item, content)) content_nodes.push_back(item);
         std::vector<N> messages;
         for (const auto& item : content_nodes) if (is_message(item)) messages.push_back(item);
-        std::vector<Block> blocks = streaming_article_blocks(content, pid, content_nodes);
-        if (blocks.empty()) blocks = feed_blocks(content, pid, content_nodes);
-        std::size_t tried = 0;
-        for (auto message = messages.rbegin(); message != messages.rend() && tried < 4 && blocks.empty(); ++message, ++tried) {
-            blocks = output_blocks(*message, std::to_string(pid) + "|message|" + (*message)->id, &content_nodes);
-            blocks.erase(std::remove_if(blocks.begin(), blocks.end(), [](const Block& block) { return blank(block.text); }), blocks.end());
-            if (!blocks.empty()) break;
+        auto selection = streaming_article_blocks(content, pid, content_nodes);
+        if (!selection.selected) selection = feed_blocks(content, pid, content_nodes);
+        if (!selection.selected) {
+            auto semantic = semantic_blocks(content, pid);
+            const auto message = messages.empty() ? N{} : messages.back();
+            bool use_semantic = semantic.selected && !message;
+            if (semantic.selected && message && !inside(semantic.anchor, message)) {
+                const auto named_position = std::find_if(content_nodes.begin(), content_nodes.end(), [&](const N& node) { return node->id == message->id; });
+                const auto semantic_position = std::find_if(content_nodes.begin(), content_nodes.end(), [&](const N& node) { return node->id == semantic.anchor->id; });
+                // Compare candidates in the same selected Document enumeration.
+                // A semantic descendant belongs to its named message and must not
+                // override that message's thinking/tool/answer classification.
+                if (named_position == content_nodes.end() || semantic_position == content_nodes.end()) {
+                    selection.selected = true; // Unverified mixed ordering: wait.
+                } else use_semantic = semantic_position > named_position;
+            }
+            if (!selection.selected && use_semantic) selection = std::move(semantic);
+            else if (!selection.selected && message) {
+                selection.selected = true; selection.anchor = message;
+                selection.blocks = output_blocks(message, std::to_string(pid) + "|message|" + message->id, &content_nodes);
+                selection.blocks.erase(std::remove_if(selection.blocks.begin(), selection.blocks.end(), [](const Block& block) { return blank(block.text); }), selection.blocks.end());
+            }
         }
-        if (blocks.empty()) blocks = semantic_blocks(content, pid);
+        const auto& blocks = selection.blocks;
         json output = json::array();
         for (const auto& block : blocks) {
             if (output.size() == 128) break;

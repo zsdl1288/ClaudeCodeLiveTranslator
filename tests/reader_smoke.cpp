@@ -173,8 +173,63 @@ int wmain(int argc, wchar_t** argv) {
         const fs::path app = fs::absolute(argv[2]);
         const fs::path input = fixture.parent_path() / "fixture-input.txt";
         write_source(input, "Reading the project files.");
-        std::wstring command = quote(fixture.wstring()) + L" " + quote(input.wstring());
+        std::wstring command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" --ready";
         STARTUPINFOW startup{}; startup.cb = sizeof(startup); startup.dwFlags = STARTF_USESHOWWINDOW; startup.wShowWindow = SW_SHOWNOACTIVATE;
+        for (const std::wstring mode : {L"--named-semantic-history", L"--semantic-named-history", L"--paging-history", L"--paging-headless-history", L"--named-history", L"--feed-history", L"--semantic-history", L"--feed-semantic-history"}) {
+            const bool paging = mode == L"--paging-history" || mode == L"--paging-headless-history";
+            write_source(input, paging ? "stream\nCURRENT STREAM MUST BE TRANSLATED." : "ready\nCURRENT ANSWER MUST BE TRANSLATED.");
+            auto history_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" " + mode + L" --ready";
+            Child history_window;
+            require(CreateProcessW(fixture.c_str(), history_command.data(), nullptr, nullptr, FALSE, 0, nullptr, fixture.parent_path().c_str(), &startup, &history_window.process), "history-transition fixture could not start");
+            HWND history_hwnd = nullptr;
+            for (int retry = 0; retry < 50 && !history_hwnd; ++retry) { Sleep(50); history_hwnd = find_window(history_window.process.dwProcessId); }
+            require(history_hwnd != nullptr, "history-transition fixture window did not appear");
+            Sleep(150);
+            auto captured = read_once(app, history_hwnd);
+            if (block_text(captured).find("HISTORICAL ANSWER") != std::string::npos) throw std::runtime_error("historical article attached to current assistant candidate [" + std::string(mode.begin(), mode.end()) + "]");
+            require(block_text(captured).find(paging ? "CURRENT STREAM" : "CURRENT ANSWER") != std::string::npos, "latest synthetic assistant body was not captured");
+            if (mode == L"--semantic-named-history") {
+                const auto& mixed_blocks = captured.at("blocks");
+                require(std::any_of(mixed_blocks.begin(), mixed_blocks.end(), [](const json& block) { return block.value("kind", "") == "thinking" && block.value("text", "").find("CURRENT THINKING ONLY.") != std::string::npos; }), "semantic descendant overrode latest named message thinking classification");
+            }
+            if (paging) {
+                const auto stream_key = captured.at("blocks").at(0).at("key");
+                write_source(input, "stream\nCURRENT STREAM MUST BE TRANSLATED. A growing tail."); Sleep(200);
+                const auto growing = read_once(app, history_hwnd);
+                require(growing.at("blocks").at(0).at("key") == stream_key && block_text(growing).find("A growing tail.") != std::string::npos, "paged stream growth changed source identity or lost new text");
+                write_source(input, "idle\nCURRENT STREAM MUST BE TRANSLATED."); Sleep(200);
+                require(read_once(app, history_hwnd).at("blocks").empty(), "unconfirmed headless tail inherited old assistant identity after response status ended");
+            }
+            for (const char* stage : {"empty", "tool", "waiting"}) {
+                write_source(input, std::string(stage) + "\nCURRENT USER INPUT MUST NOT BE TRANSLATED."); Sleep(200);
+                const auto waiting = read_once(app, history_hwnd);
+                if (!waiting.at("blocks").empty()) throw std::runtime_error("latest empty/tool/user turn fell back to an older assistant response [" + std::string(mode.begin(), mode.end()) + "/" + stage + "]: " + waiting.dump());
+            }
+            write_source(input, "ready\nA FRESH ANSWER AFTER WAITING."); Sleep(200);
+            const auto resumed = read_once(app, history_hwnd);
+            require(block_text(resumed).find("A FRESH ANSWER AFTER WAITING.") != std::string::npos && block_text(resumed).find("HISTORICAL ANSWER") == std::string::npos, "latest assistant failed to resume without replaying history");
+            require(GetForegroundWindow() != history_hwnd, "history-transition capture activated fixture");
+            report["checks"].push_back(mode == L"--named-semantic-history" ? "newer outer semantic turn outranks old named message while empty/tool/user states wait" : mode == L"--semantic-named-history" ? "newer named message outranks old semantic turn and retains nested thinking/answer classification" : paging ? "paging boundary separates old article from status-proven headless assistant stream; unknown/empty/tool/user states never replay history" : (mode == L"--feed-history" || mode == L"--feed-semantic-history") ? "latest Feed candidate stays selected while empty, showing tools or awaiting assistant" : mode == L"--semantic-history" ? "semantic latest candidate selection precedes text extraction and never falls back to history" : "latest named message stays selected while empty, showing tools or awaiting assistant");
+            PostMessageW(history_hwnd, WM_CLOSE, 0, 0); WaitForSingleObject(history_window.process.hProcess, 2000);
+        }
+        for (const std::wstring mode : {L"", L"--semantic", L"--article", L"--feed", L"--semantic-list"}) {
+            write_source(input, "Reading the project files.");
+            auto waiting_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" " + mode;
+            Child waiting_window;
+            require(CreateProcessW(fixture.c_str(), waiting_command.data(), nullptr, nullptr, FALSE, 0, nullptr, fixture.parent_path().c_str(), &startup, &waiting_window.process), "waiting-user fixture could not start");
+            HWND waiting_hwnd = nullptr;
+            for (int retry = 0; retry < 50 && !waiting_hwnd; ++retry) { Sleep(50); waiting_hwnd = find_window(waiting_window.process.dwProcessId); }
+            require(waiting_hwnd != nullptr, "waiting-user fixture window did not appear");
+            require(read_once(app, waiting_hwnd).at("blocks").empty(), "static trailing user/unknown message replayed an earlier assistant instead of waiting");
+            if (mode == L"--article") {
+                const auto waiting_info = read_once(app, waiting_hwnd, true, true);
+                require(waiting_info.value("message_count", 0) >= 3 && waiting_info.value("assistant_markers", 0) >= 2 && waiting_info.value("user_markers", 0) >= 1, "waiting diagnostic missed original Chinese message/user markers");
+                require(waiting_info.value("blocks_count", 1) == 0 && !waiting_info.value("body_included", true), "waiting diagnostic extracted old body or exposed source text");
+            }
+            PostMessageW(waiting_hwnd, WM_CLOSE, 0, 0); WaitForSingleObject(waiting_window.process.hProcess, 2000);
+        }
+        report["checks"].push_back("trailing user/unknown turns in original named/article/Feed/semantic fixtures wait without replay; separate ready variants retain complete paragraph coverage");
+        write_source(input, "Reading the project files.");
         Child window;
         require(CreateProcessW(fixture.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, fixture.parent_path().c_str(), &startup, &window.process), "fixture could not start");
         HWND hwnd = nullptr;
@@ -203,7 +258,7 @@ int wmain(int argc, wchar_t** argv) {
         report["checks"].push_back("reader never activates its own synthetic source");
         PostMessageW(hwnd, WM_CLOSE, 0, 0);
         WaitForSingleObject(window.process.hProcess, 2000);
-        std::wstring semantic_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" --semantic";
+        std::wstring semantic_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" --semantic --ready";
         Child semantic_window;
         require(CreateProcessW(fixture.c_str(), semantic_command.data(), nullptr, nullptr, FALSE, 0, nullptr, fixture.parent_path().c_str(), &startup, &semantic_window.process), "semantic fixture could not start");
         HWND semantic_hwnd = nullptr;
@@ -225,7 +280,7 @@ int wmain(int argc, wchar_t** argv) {
         report["checks"].push_back("semantic-only fallback selects latest assistant and rejects nested user content");
         PostMessageW(semantic_hwnd, WM_CLOSE, 0, 0);
         WaitForSingleObject(semantic_window.process.hProcess, 2000);
-        std::wstring article_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" --article";
+        std::wstring article_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" --article --ready";
         Child article_window;
         require(CreateProcessW(fixture.c_str(), article_command.data(), nullptr, nullptr, FALSE, 0, nullptr, fixture.parent_path().c_str(), &startup, &article_window.process), "article fixture could not start");
         HWND article_hwnd = nullptr;
@@ -249,7 +304,7 @@ int wmain(int argc, wchar_t** argv) {
         report["checks"].push_back("Chinese article headings select complete multi-paragraph assistant body and exclude user/summary/history");
         const auto info = read_once(app, article_hwnd, true, true);
         require(info.value("type", "") == "reader-info" && !info.value("body_included", true), "structural diagnostic unexpectedly contains body");
-        require(info.value("message_count", 0) >= 3 && info.value("assistant_markers", 0) >= 2 && info.value("user_markers", 0) >= 1, "structural diagnostic missed Chinese message markers");
+        require(info.value("message_count", 0) >= 2 && info.value("assistant_markers", 0) >= 2 && info.value("user_markers", 0) == 0, "ready structural diagnostic missed Chinese assistant markers");
         require(info.value("chars_count", 0) >= 80 && info.value("blocks_count", 0) >= 1 && !info.value("minimized", true), "structural diagnostic missing capture counts or window state");
         require(info.dump().find("The implementation") == std::string::npos && info.dump().find("SUMMARY") == std::string::npos, "diagnostic leaked source content");
         report["checks"].push_back("structural diagnostic exposes only counts, roles and minimization state");
@@ -261,7 +316,7 @@ int wmain(int argc, wchar_t** argv) {
         report["checks"].push_back("synthetic minimized source retains readable body without activation");
         PostMessageW(article_hwnd, WM_CLOSE, 0, 0);
         WaitForSingleObject(article_window.process.hProcess, 2000);
-        std::wstring feed_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" --feed";
+        std::wstring feed_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" --feed --ready";
         Child feed_window;
         require(CreateProcessW(fixture.c_str(), feed_command.data(), nullptr, nullptr, FALSE, 0, nullptr, fixture.parent_path().c_str(), &startup, &feed_window.process), "feed fixture could not start");
         HWND feed_hwnd = nullptr;
@@ -284,7 +339,7 @@ int wmain(int argc, wchar_t** argv) {
         WaitForSingleObject(feed_window.process.hProcess, 2000);
         for (const std::wstring mode : {L"--semantic-list", L"--stream-list"}) {
             write_source(input, "STREAMING");
-            std::wstring list_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" " + mode;
+            std::wstring list_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" " + mode + L" --ready";
             Child list_window;
             require(CreateProcessW(fixture.c_str(), list_command.data(), nullptr, nullptr, FALSE, 0, nullptr, fixture.parent_path().c_str(), &startup, &list_window.process), "list fixture could not start");
             HWND list_hwnd = nullptr;
@@ -442,7 +497,7 @@ int wmain(int argc, wchar_t** argv) {
         report["checks"].push_back("nested content Document can use its containing ancestor Document URL without peer identity fallback");
         PostMessageW(parent_hwnd, WM_CLOSE, 0, 0); WaitForSingleObject(parent_window.process.hProcess, 2000);
         for (const std::wstring mode : {L"--headings", L"--semantic-headings"}) {
-            std::wstring heading_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" " + mode;
+            std::wstring heading_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" " + mode + L" --ready";
             Child heading_window;
             require(CreateProcessW(fixture.c_str(), heading_command.data(), nullptr, nullptr, FALSE, 0, nullptr, fixture.parent_path().c_str(), &startup, &heading_window.process), "heading fixture could not start");
             HWND heading_hwnd = nullptr;
@@ -468,7 +523,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         for (const std::wstring mode : {L"--response-structure", L"--row-structure", L"--semantic-response-structure", L"--nested-response-structure"}) {
             Child structure_window;
-            auto structure_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" " + mode;
+            auto structure_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" " + mode + L" --ready";
             require(CreateProcessW(fixture.c_str(), structure_command.data(), nullptr, nullptr, FALSE, 0, nullptr, fixture.parent_path().c_str(), &startup, &structure_window.process), "response structure fixture could not start");
             HWND structure_hwnd = nullptr;
             for (int retry = 0; retry < 50 && !structure_hwnd; ++retry) { Sleep(50); structure_hwnd = find_window(structure_window.process.dwProcessId); }
