@@ -21,16 +21,19 @@ for %%A in (%*) do (
 )
 if not exist "build-cpp" mkdir "build-cpp"
 set "FLAGS=-std=c++17 -O2 -static -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00 -Iinclude -Ithird_party -Wall -Wextra -Wno-unknown-pragmas"
-set "LIBS=-luiautomationcore -lole32 -loleaut32 -luuid -lwinhttp -lcomctl32 -lcomdlg32 -lshell32 -lshlwapi -lgdi32 -luser32 -ladvapi32 -lws2_32"
+set "LIBS=-luiautomationcore -lole32 -loleaut32 -luuid -lwinhttp -lcomctl32 -lcomdlg32 -lshell32 -lshlwapi -lgdi32 -luser32 -ladvapi32 -lws2_32 -lcrypt32"
 echo Building embedded application icon...
 "%WINDRES%" -Iresources -Iinclude -O coff -i resources\app.rc -o build-cpp\app-resource.o
 if errorlevel 1 exit /b 1
 echo Building native C++ desktop application...
-"%CXX%" %FLAGS% -municode -mwindows src\main.cpp src\reader.cpp src\core.cpp src\task_cache.cpp src\text_layout.cpp build-cpp\app-resource.o -o build-cpp\ClaudeTranslator.exe %LIBS%
+"%CXX%" %FLAGS% -municode -mwindows src\main.cpp src\reader.cpp src\core.cpp src\chatgpt.cpp src\task_cache.cpp src\text_layout.cpp build-cpp\app-resource.o -o build-cpp\ClaudeTranslator.exe %LIBS%
 if errorlevel 1 exit /b 1
 if "%RUN_TESTS%"=="0" goto package
 echo Building core regression tests...
-"%CXX%" %FLAGS% tests\core_tests.cpp src\core.cpp -o build-cpp\core_tests.exe %LIBS%
+"%CXX%" %FLAGS% tests\core_tests.cpp src\core.cpp src\chatgpt.cpp -o build-cpp\core_tests.exe %LIBS%
+if errorlevel 1 exit /b 1
+echo Building ChatGPT account and protocol regression tests...
+"%CXX%" %FLAGS% -DCCLIVE_CHATGPT_TESTING tests\chatgpt_tests.cpp src\chatgpt.cpp src\core.cpp -o build-cpp\chatgpt_tests.exe %LIBS%
 if errorlevel 1 exit /b 1
 echo Building task cache regression tests...
 "%CXX%" %FLAGS% tests\task_cache_tests.cpp src\task_cache.cpp -o build-cpp\task_cache_tests.exe %LIBS%
@@ -44,10 +47,12 @@ echo Building read-only accessibility fixture...
 if errorlevel 1 exit /b 1
 if not exist tests\reader_smoke.cpp goto run_tests
 echo Building accessibility smoke test...
-"%CXX%" %FLAGS% -municode tests\reader_smoke.cpp src\core.cpp -o build-cpp\reader_smoke.exe %LIBS%
+"%CXX%" %FLAGS% -municode tests\reader_smoke.cpp src\core.cpp src\chatgpt.cpp -o build-cpp\reader_smoke.exe %LIBS%
 if errorlevel 1 exit /b 1
 :run_tests
 build-cpp\core_tests.exe
+if errorlevel 1 exit /b 1
+build-cpp\chatgpt_tests.exe
 if errorlevel 1 exit /b 1
 build-cpp\task_cache_tests.exe
 if errorlevel 1 exit /b 1
@@ -73,6 +78,7 @@ if errorlevel 1 (
 )
 copy /y LICENSE dist\ClaudeTranslator\LICENSE >nul
 if exist README.md copy /y README.md dist\ClaudeTranslator\README.md >nul
+if exist CHANGELOG.md copy /y CHANGELOG.md dist\ClaudeTranslator\CHANGELOG.md >nul
 if not exist "dist\ClaudeTranslator\licenses" mkdir "dist\ClaudeTranslator\licenses"
 copy /y third_party\nlohmann\LICENSE dist\ClaudeTranslator\licenses\nlohmann-json-LICENSE >nul
 if exist third_party\llvm-LICENSE copy /y third_party\llvm-LICENSE dist\ClaudeTranslator\licenses\llvm-LICENSE >nul

@@ -2,7 +2,9 @@
 #define NOMINMAX
 #include <windows.h>
 #include <winhttp.h>
+#include <wincrypt.h>
 #include "core.hpp"
+#include "chatgpt.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -78,6 +80,57 @@ std::vector<std::pair<bool,std::string>> code_pieces(const std::string& text) {
     }
     if(plain<text.size())out.push_back({false,text.substr(plain)});
     return out;
+}
+std::string baidu_target(std::string target) {
+    target=trim(std::move(target));
+    std::transform(target.begin(),target.end(),target.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
+    static const std::map<std::string,std::string> aliases={
+        {"zh-cn","zh"},{"zh-sg","zh"},{"zh-hans","zh"},{"zh-tw","cht"},{"zh-hk","cht"},{"zh-mo","cht"},{"zh-hant","cht"},
+        {"ja","jp"},{"ja-jp","jp"},{"ko","kor"},{"ko-kr","kor"},{"fr","fra"},{"fr-fr","fra"},{"fr-ca","fra"},
+        {"es","spa"},{"es-es","spa"},{"ar","ara"},{"bg","bul"},{"et","est"},{"da","dan"},{"fi","fin"},
+        {"ro","rom"},{"sl","slo"},{"sv","swe"},{"vi","vie"},{"vi-vn","vie"},{"en-us","en"},{"en-gb","en"},
+        {"de-de","de"},{"it-it","it"},{"ru-ru","ru"},{"pt-br","pt"},{"pt-pt","pt"},{"th-th","th"},
+        {"nl-nl","nl"},{"pl-pl","pl"},{"cs-cz","cs"},{"hu-hu","hu"},{"el-gr","el"}
+    };
+    const auto found=aliases.find(target);if(found!=aliases.end())target=found->second;
+    static const std::string supported=" zh cht en yue wyw jp kor fra spa th ara ru pt de it el nl pl bul est dan fin cs rom slo swe hu vie ";
+    if(target.empty()||target.find_first_not_of("abcdefghijklmnopqrstuvwxyz")!=std::string::npos||supported.find(" "+target+" ")==std::string::npos)
+        throw TranslationError("百度翻译暂不支持该目标语言，请使用常见语言代码，如 zh、cht、en、jp。目标语言不能为 auto。");
+    return target;
+}
+struct CryptoContext {
+    HCRYPTPROV handle=0;
+    CryptoContext(){if(!CryptAcquireContextW(&handle,nullptr,nullptr,PROV_RSA_AES,CRYPT_VERIFYCONTEXT|CRYPT_SILENT))throw TranslationError("无法初始化百度翻译签名，请检查 Windows 加密服务。");}
+    ~CryptoContext(){if(handle)CryptReleaseContext(handle,0);}
+    CryptoContext(const CryptoContext&)=delete;CryptoContext& operator=(const CryptoContext&)=delete;
+};
+std::string hex_lower(const BYTE* bytes,std::size_t size) {
+    static const char* hex="0123456789abcdef";std::string out;out.reserve(size*2);
+    for(std::size_t i=0;i<size;++i){out.push_back(hex[bytes[i]>>4]);out.push_back(hex[bytes[i]&15]);}return out;
+}
+std::string baidu_signature(const std::string& appid,const std::string& query,const std::string& salt,const std::string& secret) {
+    CryptoContext context;
+    struct Hash {HCRYPTHASH handle=0;~Hash(){if(handle)CryptDestroyHash(handle);}} hash;
+    if(!CryptCreateHash(context.handle,CALG_MD5,0,0,&hash.handle))throw TranslationError("无法生成百度翻译签名，请检查 Windows 加密服务。");
+    // Hash the original UTF-8 fields in order, before form encoding; never build a credential-bearing concatenation.
+    for(const auto* field:{&appid,&query,&salt,&secret})
+        if(!CryptHashData(hash.handle,reinterpret_cast<const BYTE*>(field->data()),static_cast<DWORD>(field->size()),0))throw TranslationError("无法生成百度翻译签名，请检查 Windows 加密服务。");
+    BYTE digest[16]{};DWORD size=sizeof(digest);
+    if(!CryptGetHashParam(hash.handle,HP_HASHVAL,digest,&size,0)||size!=sizeof(digest))throw TranslationError("无法生成百度翻译签名，请检查 Windows 加密服务。");
+    return hex_lower(digest,sizeof(digest));
+}
+std::string baidu_salt() {
+    CryptoContext context;BYTE bytes[16]{};
+    if(!CryptGenRandom(context.handle,sizeof(bytes),bytes))throw TranslationError("无法生成百度翻译随机码，请检查 Windows 加密服务。");
+    return hex_lower(bytes,sizeof(bytes));
+}
+std::string baidu_secret(const Settings& settings) {
+    if(settings.baidu_key_env.empty())throw TranslationError("请先填写百度翻译密钥的环境变量名称。");
+    const auto name=to_wide(settings.baidu_key_env);const DWORD size=GetEnvironmentVariableW(name.c_str(),nullptr,0);
+    if(!size)throw TranslationError("百度翻译密钥环境变量未设置，请先填写密钥。");
+    std::wstring value(size,L'\0');const DWORD length=GetEnvironmentVariableW(name.c_str(),value.data(),size);
+    if(!length||length>=size)throw TranslationError("百度翻译密钥环境变量读取失败，请重新设置密钥。");
+    value.resize(length);auto result=to_utf8(value);SecureZeroMemory(value.data(),value.size()*sizeof(wchar_t));return result;
 }
 std::string demo(std::string input) {
     static const std::vector<std::pair<std::string,std::string>> pairs={
@@ -171,27 +224,31 @@ std::int64_t retry_after_ms(std::wstring value) {
     const auto milliseconds=difference/10000+(difference%10000!=0);
     return (std::max)(std::int64_t(1000),static_cast<std::int64_t>((std::min)(milliseconds,static_cast<ULONGLONG>(max_retry_after_ms))));
 }
-void wait_for_google_request(const std::atomic_bool& cancel,std::int64_t deadline) {
-    static std::mutex mutex;
-    static std::int64_t next_request=0;
+struct RequestPace {std::mutex mutex;std::int64_t next_request=0;};
+void wait_for_request(RequestPace& pace,std::int64_t interval,const std::atomic_bool& cancel,std::int64_t deadline) {
     for(;;) {
-        check_cancel(cancel);
-        std::int64_t wait=0;
+        check_cancel(cancel);std::int64_t wait=0;
         {
-            std::lock_guard<std::mutex> guard(mutex);
-            const auto now=ticks();
+            std::lock_guard<std::mutex> guard(pace.mutex);const auto now=ticks();
             if(now>=deadline)throw TranslationError("翻译服务响应超时，请稍后重试。");
-            if(now>=next_request){next_request=now+1500;return;}
-            wait=(std::min)(std::int64_t(50),(std::min)(next_request-now,deadline-now));
+            if(now>=pace.next_request){pace.next_request=now+interval;return;}
+            wait=(std::min)(std::int64_t(50),(std::min)(pace.next_request-now,deadline-now));
         }
-        // No lock is held during waits, and cancelled callers do not reserve a slot.
+        // Waiting does not hold the lock or reserve a future slot; cancellation is checked every 50 ms.
         std::this_thread::sleep_for(std::chrono::milliseconds(wait));
     }
+}
+void wait_for_google_request(const std::atomic_bool& cancel,std::int64_t deadline) {
+    static RequestPace pace;wait_for_request(pace,1500,cancel,deadline);
+}
+void wait_for_baidu_request(const std::atomic_bool& cancel,std::int64_t deadline) {
+    static RequestPace pace;wait_for_request(pace,1100,cancel,deadline);
 }
 // The function owns its WinHTTP handles and never touches UI or Claude state.
 // Redirects are disabled before sending credentials or text.
 void request(const std::string& url,const std::string& body,const std::wstring& auth,const std::atomic_bool& cancel,std::int64_t deadline,
-             const std::function<void(const std::string&,bool)>& consume,const std::function<void(const std::string&)>& content_type) {
+             const std::function<void(const std::string&,bool)>& consume,const std::function<void(const std::string&)>& content_type,
+             const std::wstring& request_content_type=L"application/json; charset=utf-8") {
     check_cancel(cancel); auto u=crack(url);
     HttpHandle session(WinHttpOpen(L"ClaudeLiveTranslator/2.0",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0));
     if(!session.h)network_failure();
@@ -204,7 +261,7 @@ void request(const std::string& url,const std::string& body,const std::wstring& 
     DWORD redirect=WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
     if(!WinHttpSetOption(req.h,WINHTTP_OPTION_REDIRECT_POLICY,&redirect,sizeof(redirect)))network_failure();
     std::wstring heads=L"Accept: application/json, text/event-stream\r\n";
-    if(!body.empty())heads+=L"Content-Type: application/json; charset=utf-8\r\n";
+    if(!body.empty())heads+=L"Content-Type: "+request_content_type+L"\r\n";
     if(!auth.empty())heads+=L"Authorization: Bearer "+auth+L"\r\n";
     if(!WinHttpSendRequest(req.h,heads.c_str(),static_cast<DWORD>(heads.size()),body.empty()?WINHTTP_NO_REQUEST_DATA:const_cast<char*>(body.data()),static_cast<DWORD>(body.size()),static_cast<DWORD>(body.size()),0))network_failure();
     if(!WinHttpReceiveResponse(req.h,nullptr))network_failure(); check_cancel(cancel);
@@ -227,7 +284,9 @@ void request(const std::string& url,const std::string& body,const std::wstring& 
 }
 
 TranslationRateLimited::TranslationRateLimited(std::int64_t delay_ms)
-    : TranslationError("翻译服务请求过于频繁（HTTP 429），请稍后重试。"),
+    : TranslationRateLimited(delay_ms,"翻译服务请求过于频繁（HTTP 429），请稍后重试。") {}
+TranslationRateLimited::TranslationRateLimited(std::int64_t delay_ms,const std::string& safe_message)
+    : TranslationError(safe_message),
       retry_after_ms((std::max)(std::int64_t(1000),(std::min)(delay_ms,max_retry_after_ms))) {}
 std::wstring to_wide(const std::string& s) {
     if(s.empty())return {};
@@ -242,20 +301,23 @@ std::string to_utf8(const std::wstring& s) {
     std::string out(n,'\0'); WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,s.data(),static_cast<int>(s.size()),out.data(),n,nullptr,nullptr);return out;
 }
 std::string translation_service_key(const Settings& settings) {
-    if(settings.provider=="google"||settings.provider=="demo")return settings.provider;
-    if(settings.provider!="openai"&&settings.provider!="ollama")throw TranslationError("翻译服务须为 google、openai、ollama 或 demo。");
+    if(settings.provider=="google"||settings.provider=="demo"||settings.provider=="baidu"||settings.provider=="chatgpt")return settings.provider;
+    if(settings.provider!="openai"&&settings.provider!="ollama")throw TranslationError("翻译服务须为 google、openai、ollama、baidu、chatgpt 或 demo。");
     auto destination=crack(endpoint(settings));
     std::transform(destination.host.begin(),destination.host.end(),destination.host.begin(),[](wchar_t c){return static_cast<wchar_t>(towlower(c));});
     return settings.provider+"|"+(destination.secure?"https://":"http://")+to_utf8(destination.host)+":"+
            std::to_string(destination.port)+to_utf8(destination.path);
 }
 void Settings::validate() const {
-    if(provider!="google"&&provider!="openai"&&provider!="ollama"&&provider!="demo")throw TranslationError("翻译服务须为 google、openai、ollama 或 demo。");
+    if(provider!="google"&&provider!="openai"&&provider!="ollama"&&provider!="baidu"&&provider!="chatgpt"&&provider!="demo")throw TranslationError("翻译服务须为 google、openai、ollama、baidu、chatgpt 或 demo。");
     if(settle_ms<100||settle_ms>10000)throw TranslationError("翻译等待时间须在 100 到 10000 毫秒之间。");
     if(font_size<8||font_size>40)throw TranslationError("字号须在 8 到 40 之间。");
     if(trim(target).empty()||to_wide(target).size()>80)throw TranslationError("请填写有效的目标语言。");
     if(!api_key_env.empty()&&!std::regex_match(api_key_env,std::regex("[A-Za-z_][A-Za-z0-9_]*")))throw TranslationError("API 密钥设置只接受环境变量名称，例如 TRANSLATOR_API_KEY。");
-    if(base_url.size()>2048||model.size()>256)throw TranslationError("翻译服务地址或模型名称过长。");
+    if(!baidu_key_env.empty()&&!std::regex_match(baidu_key_env,std::regex("[A-Za-z_][A-Za-z0-9_]*")))throw TranslationError("百度翻译密钥设置只接受环境变量名称，例如 BAIDU_TRANSLATE_KEY。");
+    if(!baidu_app_id.empty()&&(baidu_app_id.size()>64||!std::all_of(baidu_app_id.begin(),baidu_app_id.end(),[](unsigned char c){return c>='0'&&c<='9';})))throw TranslationError("百度翻译 APP ID 须为开放平台提供的数字标识。");
+    if(provider=="baidu")baidu_target(target);
+    if(base_url.size()>2048||model.size()>256||chatgpt_model.size()>256)throw TranslationError("翻译服务地址或模型名称过长。");
 }
 Settings load_settings(const std::filesystem::path& path) {
     if(!std::filesystem::exists(path))return {};
@@ -267,13 +329,13 @@ Settings load_settings(const std::filesystem::path& path) {
     auto str=[&](const char* k,std::string& v){if(j.contains(k)){if(!j[k].is_string())throw TranslationError(std::string("配置项 ")+k+" 的类型不正确。");v=j[k].get<std::string>();}};
     auto number=[&](const char* k,int& v){if(j.contains(k)){if(!j[k].is_number_integer()||j[k].get<std::int64_t>()<std::numeric_limits<int>::min()||j[k].get<std::int64_t>()>std::numeric_limits<int>::max())throw TranslationError(std::string("配置项 ")+k+" 的类型不正确。");v=j[k].get<int>();}};
     auto boolean=[&](const char* k,bool& v){if(j.contains(k)){if(!j[k].is_boolean())throw TranslationError(std::string("配置项 ")+k+" 的类型不正确。");v=j[k].get<bool>();}};
-    str("provider",s.provider);str("base_url",s.base_url);str("model",s.model);str("api_key_env",s.api_key_env);str("target",s.target);
+    str("provider",s.provider);str("base_url",s.base_url);str("model",s.model);str("api_key_env",s.api_key_env);str("baidu_app_id",s.baidu_app_id);str("baidu_key_env",s.baidu_key_env);str("chatgpt_model",s.chatgpt_model);str("target",s.target);
     number("settle_ms",s.settle_ms);number("font_size",s.font_size);boolean("show_original",s.show_original);boolean("always_on_top",s.always_on_top);
     s.validate();return s;
 }
 void save_settings(const std::filesystem::path& path,const Settings& s) {
     s.validate();if(!path.parent_path().empty())std::filesystem::create_directories(path.parent_path());
-    json j={{"provider",s.provider},{"base_url",s.base_url},{"model",s.model},{"api_key_env",s.api_key_env},{"target",s.target},{"settle_ms",s.settle_ms},{"font_size",s.font_size},{"show_original",s.show_original},{"always_on_top",s.always_on_top}};
+    json j={{"provider",s.provider},{"base_url",s.base_url},{"model",s.model},{"api_key_env",s.api_key_env},{"baidu_app_id",s.baidu_app_id},{"baidu_key_env",s.baidu_key_env},{"chatgpt_model",s.chatgpt_model},{"target",s.target},{"settle_ms",s.settle_ms},{"font_size",s.font_size},{"show_original",s.show_original},{"always_on_top",s.always_on_top}};
     static std::atomic<unsigned> counter{0}; auto temporary=path;
     temporary+=L"."+std::to_wstring(GetCurrentProcessId())+L"."+std::to_wstring(++counter)+L".tmp";
     try{
@@ -293,11 +355,91 @@ std::string parse_openai_content(const json& d,bool stream) {
     const auto& item=choices[0][key];if(!item.contains("content")||item["content"].is_null())return "";
     if(!item["content"].is_string())throw TranslationError("翻译服务未返回纯文本译文。");return item["content"].get<std::string>();
 }
+std::vector<BaiduTextPart> split_baidu_text(const std::string& text) {
+    to_wide(text);std::vector<BaiduTextPart> result;
+    for(const auto& piece:code_pieces(text)) {
+        if(piece.first){result.push_back({true,piece.second});continue;}
+        // 1,000 UTF-8 bytes also stays within the standard tier's 1,000-character
+        // allowance, and below the protocol's 6,000-byte ceiling after decoding.
+        for(std::size_t start=0;start<piece.second.size();) {
+            auto end=(std::min)(start+1000,piece.second.size());
+            while(end<piece.second.size()&&end>start&&(static_cast<unsigned char>(piece.second[end])&0xc0)==0x80)--end;
+            result.push_back({false,piece.second.substr(start,end-start)});start=end;
+        }
+    }
+    return result;
+}
+std::string build_baidu_form(const Settings& settings,const std::string& query,const std::string& salt,const std::string& secret) {
+    if(settings.baidu_app_id.empty()||settings.baidu_app_id.size()>64||!std::all_of(settings.baidu_app_id.begin(),settings.baidu_app_id.end(),[](unsigned char c){return c>='0'&&c<='9';}))
+        throw TranslationError("请填写百度翻译开放平台提供的数字 APP ID。");
+    if(query.empty()||query.size()>6000)throw TranslationError("百度翻译单次原文须为 1 到 6000 个 UTF-8 字节。");
+    if(salt.empty()||salt.size()>64||!std::all_of(salt.begin(),salt.end(),[](unsigned char c){return (c>='0'&&c<='9')||(c>='a'&&c<='z')||(c>='A'&&c<='Z');}))
+        throw TranslationError("百度翻译随机码无效，请重试。");
+    if(secret.empty()||secret.size()>4096)throw TranslationError("百度翻译密钥未设置或长度无效，请检查密钥环境变量。");
+    to_wide(query);to_wide(secret);const auto target=baidu_target(settings.target);
+    const auto sign=baidu_signature(settings.baidu_app_id,query,salt,secret);
+    return "q="+percent(query)+"&from=auto&to="+percent(target)+"&appid="+percent(settings.baidu_app_id)+"&salt="+percent(salt)+"&sign="+sign;
+}
+std::string parse_baidu_content(const json& data) {
+    if(!data.is_object())throw TranslationError("百度翻译返回了不支持的响应格式。");
+    if(data.contains("error_code")) {
+        std::string code;
+        if(data["error_code"].is_string())code=data["error_code"].get<std::string>();
+        else if(data["error_code"].is_number_integer())code=data["error_code"].dump();
+        if(code=="54003")throw TranslationRateLimited(3000,"百度翻译请求过于频繁（54003），请稍后重试。");
+        if(code=="54005")throw TranslationRateLimited(3000,"百度翻译长文本请求过于频繁（54005），请等待至少 3 秒后重试。");
+        if(code=="52003")throw TranslationError("百度翻译未授权（52003），请检查 APP ID 并确认已开通通用翻译服务。");
+        if(code=="54001")throw TranslationError("百度翻译签名验证失败（54001），请检查 APP ID 和密钥是否匹配。");
+        if(code=="54004")throw TranslationError("百度翻译账户余额不足（54004），请前往开放平台检查余额。");
+        if(code=="54000")throw TranslationError("百度翻译请求参数不完整（54000），请检查 APP ID、密钥及目标语言。");
+        if(code=="58000")throw TranslationError("百度翻译拒绝当前客户端 IP（58000），请检查开放平台的 IP 设置。");
+        if(code=="58001")throw TranslationError("百度翻译不支持当前语言方向（58001），请检查目标语言及账户服务权限。");
+        if(code=="58002")throw TranslationError("百度翻译服务已关闭（58002），请前往开放平台开启服务。");
+        if(code=="90107")throw TranslationError("百度翻译认证尚未通过或生效（90107），请前往开放平台检查认证状态。");
+        if(code=="52001")throw TranslationError("百度翻译请求超时（52001），请稍后重试。");
+        if(code=="52002")throw TranslationError("百度翻译服务暂时异常（52002），请稍后重试。");
+        if(code!="52000")throw TranslationError("百度翻译返回错误，请在百度翻译开放平台检查服务状态。");
+    }
+    if(!data.contains("trans_result")||!data["trans_result"].is_array()||data["trans_result"].empty())throw TranslationError("百度翻译未返回有效译文。");
+    std::string result;bool first=true;
+    for(const auto& row:data["trans_result"]) {
+        if(!row.is_object()||!row.contains("dst")||!row["dst"].is_string())throw TranslationError("百度翻译返回了不支持的译文格式。");
+        const auto value=row["dst"].get<std::string>();
+        if(value.size()>max_response||result.size()+value.size()+(first?0:1)>max_response)throw TranslationError("百度翻译返回的译文过长，已停止读取。");
+        if(!first)result+='\n';result+=value;first=false;
+    }
+    if(trim(result).empty())throw TranslationError("百度翻译未返回有效译文。");to_wide(result);return result;
+}
 std::string translate(const Settings& s,const std::string& text,const Delta& delta,const std::atomic_bool& cancel) {
     check_cancel(cancel);if(trim(text).empty())return "";if(to_wide(text).size()>50000)throw TranslationError("单次待翻译内容过长，请分段后重试。");s.validate();
     std::string result;auto emit=[&](const std::string& value){check_cancel(cancel);if(!value.empty()){if(result.size()+value.size()>max_response)throw TranslationError("译文过长，已停止读取。");result+=value;if(delta)delta(value);check_cancel(cancel);}};
     auto deadline=ticks()+90000;
     if(s.provider=="demo")emit(demo(text));
+    else if(s.provider=="chatgpt") {
+        if(trim(s.chatgpt_model).empty())throw TranslationError("请先在设置中选择 ChatGPT 翻译模型。");
+        const auto completed=chatgpt::translate(chatgpt::default_account_path(),s.chatgpt_model,s.target,text,emit,cancel);
+        // Stream callbacks already flow through emit. A nonstreaming response is
+        // emitted once only when the module did not provide any deltas.
+        if(result.empty())emit(completed);
+        else if(completed!=result)throw TranslationError("ChatGPT 翻译流与最终结果不一致，请重试。");
+    }
+    else if(s.provider=="baidu") {
+        const auto parts=split_baidu_text(text);
+        const bool has_query=std::any_of(parts.begin(),parts.end(),[](const BaiduTextPart& part){return !part.literal&&!trim(part.text).empty();});
+        if(!has_query){for(const auto& part:parts)emit(part.text);}
+        else {
+            if(s.baidu_app_id.empty())throw TranslationError("请先在设置中填写百度翻译 APP ID。");
+            struct Secret {std::string value;~Secret(){if(!value.empty())SecureZeroMemory(value.data(),value.size());}} secret{baidu_secret(s)};
+            for(const auto& part:parts) {
+                if(part.literal||trim(part.text).empty()){emit(part.text);continue;}
+                check_cancel(cancel);const auto form=build_baidu_form(s,part.text,baidu_salt(),secret.value);std::string body;
+                wait_for_baidu_request(cancel,deadline);
+                request("https://fanyi-api.baidu.com/api/trans/vip/translate",form,L"",cancel,deadline,
+                        [&](const std::string& chunk,bool){body+=chunk;},[](const std::string&){},L"application/x-www-form-urlencoded");
+                emit(parse_baidu_content(parse_json(body)));
+            }
+        }
+    }
     else if(s.provider=="google"){
         for(const auto& piece:code_pieces(text)){
             if(piece.first||trim(piece.second).empty()){emit(piece.second);continue;}

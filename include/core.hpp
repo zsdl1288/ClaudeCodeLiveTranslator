@@ -14,6 +14,9 @@ struct Settings {
     std::string base_url;
     std::string model;
     std::string api_key_env;
+    std::string baidu_app_id;
+    std::string baidu_key_env = "BAIDU_TRANSLATE_KEY";
+    std::string chatgpt_model;
     std::string target = "zh-CN";
     int settle_ms = 900;
     bool show_original = false;
@@ -33,6 +36,7 @@ class TranslationCancelled : public TranslationError { public: using Translation
 class TranslationRateLimited : public TranslationError {
 public:
     explicit TranslationRateLimited(std::int64_t delay_ms);
+    TranslationRateLimited(std::int64_t delay_ms, const std::string& safe_message);
     const std::int64_t retry_after_ms;
 };
 using Delta = std::function<void(const std::string&)>;
@@ -40,6 +44,11 @@ std::string translate(const Settings&, const std::string& utf8, const Delta&, co
 // Parsing helpers are also used by the native regression checks.
 std::vector<std::string> split_sentences(const std::string& utf8);
 std::string parse_openai_content(const nlohmann::json& data, bool streaming);
+// Baidu protocol helpers perform no network calls and never include credentials in errors.
+struct BaiduTextPart { bool literal = false; std::string text; };
+std::vector<BaiduTextPart> split_baidu_text(const std::string& utf8);
+std::string build_baidu_form(const Settings&, const std::string& query, const std::string& salt, const std::string& secret);
+std::string parse_baidu_content(const nlohmann::json& data);
 
 // Call observe/flush on one reader thread. Each sentence retains an independent
 // stability timer, epoch and revision so obsolete asynchronous results can be dropped.

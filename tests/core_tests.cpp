@@ -80,6 +80,23 @@ int main(){
             std::ifstream before(config);std::string actual((std::istreambuf_iterator<char>(before)),{});check(actual==bad,"Bad config not overwritten");
         }
         std::filesystem::remove(config,ignored);
+        {
+            Settings baidu;baidu.provider="baidu";baidu.baidu_app_id="2015063000000001";baidu.baidu_key_env="CCLIVE_TEST_BAIDU_KEY";baidu.target="zh-TW";baidu.chatgpt_model="test-chatgpt-model";
+            SetEnvironmentVariableW(L"CCLIVE_TEST_BAIDU_KEY",L"NEVER_SAVE_BAIDU_KEY");save_settings(config,baidu);const auto restored=load_settings(config);
+            check(restored.provider=="baidu"&&restored.baidu_app_id==baidu.baidu_app_id&&restored.baidu_key_env==baidu.baidu_key_env&&restored.chatgpt_model==baidu.chatgpt_model,"Baidu account fields and reserved ChatGPT model roundtrip");
+            std::ifstream input(config);const auto serialized=json::parse(input);input.close();
+            check(serialized["baidu_app_id"]==baidu.baidu_app_id&&serialized["baidu_key_env"]==baidu.baidu_key_env&&serialized.dump().find("NEVER_SAVE_BAIDU_KEY")==std::string::npos,"Baidu settings save app ID and environment name without secret value");
+            {std::ofstream output(config);output<<R"({"provider":"baidu","baidu_app_id":"2015063000000001","baidu_key_env":"CCLIVE_TEST_BAIDU_KEY","baidu_key":"DISCARD_BAIDU_SECRET","secret":"DISCARD_BAIDU_SECRET"})";}
+            save_settings(config,load_settings(config));std::ifstream cleaned(config);const auto clean=json::parse(cleaned);cleaned.close();
+            check(!clean.contains("baidu_key")&&!clean.contains("secret")&&clean.dump().find("DISCARD_BAIDU_SECRET")==std::string::npos,"Pasted Baidu secrets are discarded instead of persisted");
+            check(Settings{}.baidu_key_env=="BAIDU_TRANSLATE_KEY"&&Settings{}.chatgpt_model.empty(),"Baidu environment name and ChatGPT model have safe defaults");
+            Settings chatgpt;chatgpt.provider="chatgpt";chatgpt.chatgpt_model="fixture-chatgpt-model";save_settings(config,chatgpt);const auto chatgpt_saved=load_settings(config);
+            check(chatgpt_saved.provider=="chatgpt"&&chatgpt_saved.chatgpt_model==chatgpt.chatgpt_model,"ChatGPT provider and selected model persist without account access");
+            {std::ofstream legacy(config);legacy<<R"({"provider":"demo"})";}
+            const auto legacy=load_settings(config);
+            check(legacy.chatgpt_model.empty()&&legacy.baidu_app_id.empty()&&legacy.baidu_key_env=="BAIDU_TRANSLATE_KEY","Older configurations load with empty ChatGPT model and safe Baidu defaults");
+            SetEnvironmentVariableW(L"CCLIVE_TEST_BAIDU_KEY",nullptr);std::filesystem::remove(config,ignored);
+        }
         check(split_sentences("- First item\n- Second item")==std::vector<std::string>({"- First item","- Second item"}),"Bullet lines without punctuation remain separate");
         check(split_sentences("* First item\n+ Second item\n- Third item")==std::vector<std::string>({"* First item","+ Second item","- Third item"}),"Explicit bullet marker variants remain intact");
         check(split_sentences("## Overview\nThis paragraph wraps\nonto the next line.")==std::vector<std::string>({"## Overview","This paragraph wraps onto the next line."}),"Heading and wrapped body retain separate layout units");
@@ -164,6 +181,70 @@ int main(){
             check(translation_service_key(fixed)==google_key,"Google always uses its fixed service destination key");
             fixed.provider="demo";const auto demo_key=translation_service_key(fixed);fixed.base_url.clear();
             check(translation_service_key(fixed)==demo_key&&demo_key!=google_key,"Demo has a fixed service key distinct from Google");
+        }
+        {
+            Settings baidu;baidu.provider="baidu";baidu.baidu_app_id="2015063000000001";
+            const auto form=build_baidu_form(baidu,"apple","1435660288","12345678");
+            check(form=="q=apple&from=auto&to=zh&appid=2015063000000001&salt=1435660288&sign=f89f9594663708c1605f3d736d01d2d4","Baidu signature matches official raw UTF-8 MD5 vector");
+            const auto unicode=build_baidu_form(baidu,"中文 &+=?","1435660288","12345678");
+            check(unicode=="q=%E4%B8%AD%E6%96%87%20%26%2B%3D%3F&from=auto&to=zh&appid=2015063000000001&salt=1435660288&sign=2652507fe67250ddc62bceb174c2279b","Baidu signs original UTF-8 before encoding every form field exactly once");
+            check(form.find("12345678")==std::string::npos&&unicode.find("12345678")==std::string::npos,"Baidu POST body includes signature without secret");
+            for(const auto& language:std::vector<std::pair<std::string,std::string>>{{"zh-CN","zh"},{"zh-TW","cht"},{"ja","jp"},{"ko","kor"},{"fr","fra"},{"es","spa"},{"ro","rom"},{"rom","rom"},{"en-US","en"},{"yue","yue"}}) {
+                baidu.target=language.first;
+                check(build_baidu_form(baidu,"apple","1435660288","12345678").find("&to="+language.second+"&")!=std::string::npos,"Baidu maps common locale and ISO language codes explicitly");
+            }
+            baidu.target="auto";rejects([&]{baidu.validate();},"Baidu disallows automatic target language");
+            baidu.target="unknown";rejects([&]{build_baidu_form(baidu,"apple","salt","PRIVATE_TEST_SECRET");},"Baidu rejects unknown targets before network");baidu.target="zh-CN";
+            rejects([&]{build_baidu_form(baidu,std::string(6001,'a'),"salt","PRIVATE_TEST_SECRET");},"Baidu enforces UTF-8 byte ceiling before network");
+            check(!build_baidu_form(baidu,std::string(6000,'a'),"salt","PRIVATE_TEST_SECRET").empty(),"Baidu protocol permits exactly 6000 original UTF-8 bytes");
+            rejects([&]{build_baidu_form(baidu,"apple","salt&injection=1","PRIVATE_TEST_SECRET");},"Baidu salt is bounded alphanumeric text");
+            rejects([&]{build_baidu_form(baidu,"apple","salt","");},"Baidu missing secret fails before network");
+            auto changed=baidu;changed.baidu_app_id="123";changed.base_url="http://untrusted.example/";changed.target="en";
+            check(translation_service_key(baidu)=="baidu"&&translation_service_key(changed)=="baidu","Baidu fixed destination cooldown survives app ID and unused base URL changes");
+            baidu.baidu_app_id="invalid&appid";rejects([&]{baidu.validate();},"Baidu app ID must be a bounded numeric identifier");baidu.baidu_app_id="2015063000000001";
+            baidu.baidu_key_env="bad-env";rejects([&]{baidu.validate();},"Baidu credential setting accepts only environment variable names");
+            std::string prose(999,'a');for(int n=0;n<2100;++n)prose+="中😀";
+            const auto original=prose+" before `x += y` after\n```cpp\nconst secret = 1;\n```\nFinal prose.";
+            const auto parts=split_baidu_text(original);std::string reconstructed,queries,literals;bool bounded=true,valid=true;std::size_t query_count=0;
+            for(const auto& part:parts) {
+                reconstructed+=part.text;
+                if(part.literal)literals+=part.text;
+                else{queries+=part.text;++query_count;bounded=bounded&&!part.text.empty()&&part.text.size()<=1000;try{to_wide(part.text);}catch(const TranslationError&){valid=false;}}
+            }
+            check(query_count>2&&bounded&&valid&&reconstructed==original,"Baidu splitting preserves UTF-8 code points and reassembles every original byte within conservative query limits");
+            check(literals.find("`x += y`")!=std::string::npos&&literals.find("const secret = 1;")!=std::string::npos&&queries.find("const secret")==std::string::npos,"Baidu requests exclude inline and fenced code verbatim");
+            const auto unfinished=split_baidu_text("Prose.\n~~~cpp\nUnfinished code");
+            check(unfinished.size()==2&&!unfinished.front().literal&&unfinished.back().literal&&unfinished.back().text=="~~~cpp\nUnfinished code","Baidu unfinished code fences remain literal");
+            check(parse_baidu_content(json::parse(R"({"from":"en","to":"zh","trans_result":[{"src":"Hello","dst":"你好"},{"src":"World","dst":"世界"}]})"))=="你好\n世界","Baidu response combines all translated rows in order");
+            check(parse_baidu_content(json::parse(R"({"error_code":52000,"trans_result":[{"dst":"完成"}]})"))=="完成","Baidu explicit success code remains compatible");
+            check(parse_baidu_content(json::parse(R"({"trans_result":[{"dst":""},{"dst":"你好"},{"dst":""}]})"))=="\n你好\n","Baidu preserves empty translated rows as paragraph boundaries");
+            for(const auto& code:std::vector<json>{54003,"54003",54005,"54005"}) {
+                bool limited=false;std::string message;std::int64_t delay=0;
+                try{parse_baidu_content({{"error_code",code},{"error_msg","SUPER_SECRET_SERVER_BODY"}});}catch(const TranslationRateLimited& e){limited=true;delay=e.retry_after_ms;message=e.what();}
+                check(limited&&delay>=3000&&message.find("SUPER_SECRET_SERVER_BODY")==std::string::npos&&message.find("429")==std::string::npos,"Baidu numeric and string quota errors expose safe typed cooldown of at least three seconds");
+            }
+            for(const auto& code:std::vector<json>{52003,"54001",54004,"58000",58001,"58002",90107,"52001",52002,"SUPER_SECRET_SERVER_BODY",true}) {
+                bool failed=false,limited=false;std::string message;
+                try{parse_baidu_content({{"error_code",code},{"error_msg","SUPER_SECRET_SERVER_BODY"}});}catch(const TranslationRateLimited&){limited=true;}catch(const TranslationError& e){failed=true;message=e.what();}
+                check(failed&&!limited&&!message.empty()&&message.find("SUPER_SECRET_SERVER_BODY")==std::string::npos,"Baidu authentication, balance and malformed failures are safe errors rather than automatic cooldown retries");
+            }
+            for(const auto& response:std::vector<json>{json::array(),json::object(),{{"trans_result",json::array()}},{{"trans_result",json::array({{{"dst",42}}})}},{{"trans_result",json::array({{{"dst",""}}})}}})
+                rejects([&]{parse_baidu_content(response);},"Baidu malformed or empty translations fail safely");
+            std::atomic_bool cancelled{false};Settings literal;literal.provider="baidu";
+            check(translate(literal,"```cpp\nUnsent code\n```",{},cancelled)=="```cpp\nUnsent code\n```","Baidu code-only text remains offline without credentials");
+            literal.baidu_app_id="2015063000000001";literal.baidu_key_env="CCLIVE_BAIDU_NOT_SET";SetEnvironmentVariableW(L"CCLIVE_BAIDU_NOT_SET",nullptr);
+            rejects([&]{translate(literal,"Hello",{},cancelled);},"Baidu missing environment secret fails before any request");
+            cancelled=true;rejects([&]{translate(literal,"Hello",{},cancelled);},"Baidu cancellation precedes credential access and network");
+        }
+        {
+            Settings chatgpt;chatgpt.provider="chatgpt";const auto key=translation_service_key(chatgpt);
+            chatgpt.chatgpt_model="fixture-model";chatgpt.model="unused-api-model";chatgpt.base_url="http://untrusted.example/";chatgpt.api_key_env="UNUSED_API_KEY";chatgpt.target="fr";
+            check(key=="chatgpt"&&translation_service_key(chatgpt)==key,"ChatGPT fixed service cooldown key ignores model and unused API settings");
+            std::atomic_bool cancelled{false};chatgpt.chatgpt_model.clear();std::string message;
+            try{translate(chatgpt,"Hello",{},cancelled);}catch(const TranslationError& e){message=e.what();}
+            check(message.find("ChatGPT")!=std::string::npos&&message.find("模型")!=std::string::npos,"ChatGPT empty model fails clearly before resolving or reading account file");
+            chatgpt.chatgpt_model=" \t";rejects([&]{translate(chatgpt,"Hello",{},cancelled);},"ChatGPT whitespace-only model is rejected before account access");
+            chatgpt.chatgpt_model=std::string(257,'x');rejects([&]{chatgpt.validate();},"ChatGPT model length is bounded independently of API model");
         }
         std::atomic_bool cancel{false};Settings offline;offline.provider="demo";
         check(translate(offline,"All tests passed.",{},cancel)=="所有测试均已通过。","Offline demo translates fixed example");

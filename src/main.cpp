@@ -13,6 +13,7 @@
 #include <ole2.h>
 // clang-format on
 #include "core.hpp"
+#include "chatgpt.hpp"
 #include "reader.hpp"
 #include "resource.h"
 #include "task_cache.hpp"
@@ -494,7 +495,7 @@ struct Worker {
               announced = until;
               lock.unlock();
               publish("rate_limited",
-                      "翻译服务限流（HTTP 429），等待约 " +
+                      "翻译服务限流，等待约 " +
                           std::to_string((std::max)(int64_t(1), seconds)) +
                           " 秒后自动重试；可暂停或停止");
               lock.lock();
@@ -548,7 +549,7 @@ struct Worker {
             break;
           if (retries++ < 3)
             continue;
-          publish("error", "翻译服务持续限流（HTTP 429），已停止本段自动重试。"
+          publish("error", "翻译服务持续限流，已停止本段自动重试。"
                            "请稍后点击重试失败，或在设置中选择其他翻译服务");
           break;
         } catch (const std::exception &e) {
@@ -745,7 +746,7 @@ json workerRateLimitChecks() {
   }
   return checks;
 }
-std::vector<wchar_t> readerEnvironment(const std::string &secret) {
+std::vector<wchar_t> readerEnvironment(const std::vector<std::string> &secrets) {
   std::set<std::wstring> allowed = {L"SYSTEMROOT",   L"WINDIR",
                                     L"PATH",         L"TEMP",
                                     L"TMP",          L"USERPROFILE",
@@ -753,11 +754,16 @@ std::vector<wchar_t> readerEnvironment(const std::string &secret) {
                                     L"HOMEDRIVE",    L"HOMEPATH",
                                     L"COMSPEC",      L"PROCESSOR_ARCHITECTURE",
                                     L"PROGRAMFILES", L"PROGRAMFILES(X86)"};
-  auto excluded = wide(secret);
-  std::transform(excluded.begin(), excluded.end(), excluded.begin(), towupper);
+  std::set<std::wstring> excluded;
+  for (const auto &secret : secrets) {
+    auto name = wide(secret);
+    std::transform(name.begin(), name.end(), name.begin(), towupper);
+    if (!name.empty())
+      excluded.insert(std::move(name));
+  }
   std::vector<wchar_t> env;
   for (auto &name : allowed) {
-    if (name == excluded)
+    if (excluded.count(name))
       continue;
     DWORD n = GetEnvironmentVariableW(name.c_str(), nullptr, 0);
     if (!n)
@@ -788,14 +794,15 @@ struct Watcher {
   std::size_t minimumSourceIndex = 0;
   json currentTask;
   int settle;
-  std::string secret;
+  std::vector<std::string> secretEnvs;
   std::atomic_bool stopped{false};
   std::mutex mutex;
   HANDLE process = nullptr;
   std::shared_ptr<Bus> bus;
   std::string lastStatus;
-  Watcher(uint64_t h, uint64_t g, int s, std::string k, std::shared_ptr<Bus> b)
-      : hwnd(h), generation(g), settle(s), secret(std::move(k)),
+  Watcher(uint64_t h, uint64_t g, int s, std::vector<std::string> keys,
+          std::shared_ptr<Bus> b)
+      : hwnd(h), generation(g), settle(s), secretEnvs(std::move(keys)),
         bus(std::move(b)) {}
   void emit(json v) {
     if (!stopped.load()) {
@@ -1034,7 +1041,7 @@ struct Watcher {
     auto executable = exePath();
     std::wstring command =
         L"\"" + executable.wstring() + L"\" --reader " + std::to_wstring(hwnd);
-    auto env = readerEnvironment(secret);
+    auto env = readerEnvironment(secretEnvs);
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(
             executable.c_str(), command.data(), nullptr, nullptr, TRUE,
@@ -1148,9 +1155,193 @@ class App;
 struct Config {
   App *app = nullptr;
   HWND hwnd = nullptr, previousFocus = nullptr;
-  std::vector<HWND> edits;
-  HWND error = nullptr;
+  // Keep edits[0..7] stable for the native GUI regressions. Baidu uses
+  // independent controls [8..10], so changing services never reuses a secret.
+  std::vector<HWND> edits, labels;
+  HWND error = nullptr, keyHint = nullptr, serviceHint = nullptr;
+  HWND chatgptLogin = nullptr, chatgptSignout = nullptr,
+       chatgptStatus = nullptr, chatgptModels = nullptr,
+       chatgptAccounts = nullptr, chatgptAdd = nullptr,
+       chatgptRefresh = nullptr, chatgptAccountLabel = nullptr,
+       chatgptModelLabel = nullptr, chatgptStatusLabel = nullptr;
+  std::shared_ptr<std::atomic_bool> authCancel =
+      std::make_shared<std::atomic_bool>(false);
+  uint64_t authTicket = 0;
+  bool authBusy = false, authLoaded = false;
+  fs::path accountPath;
+  cclive::chatgpt::AccountStatus account;
+  std::vector<cclive::chatgpt::AccountStatus> accountList;
+  std::vector<cclive::chatgpt::Model> catalog;
+  std::string selectedChatgptModel;
 };
+std::atomic_uint64_t chatgptSettingsSequence{0};
+std::atomic_uint64_t chatgptIdentitySequence{0};
+std::mutex chatgptSettingsActionsMutex;
+void cancelConfigAuthorization(Config &config) {
+  config.authCancel->store(true);
+  config.authTicket = ++chatgptSettingsSequence;
+  config.authBusy = false;
+  config.authLoaded = false;
+}
+struct ConfigProvider {
+  const char *id;
+  const wchar_t *label;
+};
+constexpr ConfigProvider configProviders[] = {
+    {"google", L"Google公共翻译"}, {"baidu", L"百度翻译API"},
+    {"openai", L"兼容API"}, {"ollama", L"Ollama本地"},
+    {"chatgpt", L"ChatGPT账号"}};
+int configProviderIndex(const std::string &provider) {
+  for (int i = 0; i < static_cast<int>(std::size(configProviders)); ++i)
+    if (provider == configProviders[i].id)
+      return i;
+  return 0;
+}
+const char *selectedConfigProvider(const Config &config) {
+  const auto index = SendMessageW(config.edits[0], CB_GETCURSEL, 0, 0);
+  return index >= 0 && index < static_cast<LRESULT>(std::size(configProviders))
+             ? configProviders[index].id
+             : "google";
+}
+void updateConfigProviderFields(Config &config) {
+  const std::string provider = selectedConfigProvider(config);
+  const bool baidu = provider == "baidu", api = provider == "openai",
+             ollama = provider == "ollama", chatgpt = provider == "chatgpt";
+  auto field = [&](int index, bool visible, bool enabled) {
+    for (auto control : {config.edits[index], config.labels[index]}) {
+      EnableWindow(control, enabled);
+      ShowWindow(control, visible ? SW_SHOW : SW_HIDE);
+    }
+  };
+  field(1, !baidu && !chatgpt, api || ollama);
+  field(2, !baidu && !chatgpt, api || ollama);
+  field(3, !baidu && !chatgpt, api);
+  field(7, !baidu && !chatgpt, api);
+  for (int index : {8, 9, 10})
+    field(index, baidu, baidu);
+  SetWindowTextW(config.keyHint,
+                 chatgpt ? L"Continue with ChatGPT 会打开系统浏览器完成授权；无需填写 API 密钥。"
+                 : baidu ? L"百度密钥只在本次运行使用，不写入配置。留空则读取指定环境变量。"
+                       : L"密钥只在本次运行使用，不写入配置。留空则读取指定环境变量。");
+  const wchar_t *hint =
+      baidu ? L"待译文字通过 HTTPS 发送至百度翻译 API。\r\n请先开通百度通用翻译 API，填写 APPID 和对应密钥。\r\n环境变量名默认 BAIDU_TRANSLATE_KEY，与兼容 API 分开。"
+      : api ? L"待译文字发送至你填写的 API 地址。\r\n填写兼容 Chat Completions 的地址、模型与密钥。\r\n环境变量名与本次密钥均仅用于兼容 API。"
+      : ollama ? L"待译文字发送至你填写的 Ollama 地址。\r\n本机通常为 http://127.0.0.1:11434；填写已安装的模型名。\r\n使用远程地址时，文字会发送至该远程服务。"
+      : chatgpt ? L"使用 ChatGPT 账号授权；待译文字发送至账号授权的服务。\r\n登录后从账号读取可用模型。"
+                : L"待译文字通过 HTTPS 发送至 Google 公共翻译接口。\r\n无需密钥；接口可能限流或暂时不可用。\r\n此服务不使用 API 地址、模型或密钥设置。";
+  SetWindowTextW(config.serviceHint, hint);
+  for (auto control : {config.chatgptLogin, config.chatgptSignout,
+                       config.chatgptStatus, config.chatgptModels,
+                       config.chatgptAccounts, config.chatgptAdd,
+                       config.chatgptRefresh, config.chatgptAccountLabel,
+                       config.chatgptModelLabel, config.chatgptStatusLabel})
+    if (control)
+      ShowWindow(control, chatgpt ? SW_SHOW : SW_HIDE);
+  if (config.chatgptLogin) {
+    EnableWindow(config.chatgptLogin, chatgpt && !config.authBusy);
+    EnableWindow(config.chatgptAdd, chatgpt && !config.authBusy);
+    // Local cleanup must remain available if an owned credential file is corrupt.
+    EnableWindow(config.chatgptSignout,
+                 chatgpt && !config.authBusy && config.authLoaded);
+    EnableWindow(config.chatgptRefresh,
+                 chatgpt && !config.authBusy && config.account.signed_in &&
+                     config.account.plan_enabled);
+    EnableWindow(config.chatgptAccounts,
+                 chatgpt && !config.authBusy && !config.accountList.empty());
+    EnableWindow(config.chatgptModels,
+                 chatgpt && !config.authBusy && config.account.signed_in &&
+                     config.account.plan_enabled && !config.catalog.empty());
+    std::wstring status =
+        config.authBusy ? L"正在读取账号或可用模型…"
+        : !config.authLoaded ? L"尚未读取账号"
+        : !config.account.signed_in ? L"未登录，请继续完成 ChatGPT 授权"
+        : !config.account.plan_enabled ? L"账号未开放本服务所需权限"
+        : config.catalog.empty() ? L"账号暂未返回可用模型"
+                                : L"已授权，可选择账号提供的模型";
+    SetWindowTextW(config.chatgptStatus, status.c_str());
+  }
+}
+void launchChatgptSettingsAction(Config &config, std::shared_ptr<Bus> bus,
+                                bool offline, std::string action,
+                                std::string clientId = {}) {
+  config.authCancel->store(true);
+  config.authCancel = std::make_shared<std::atomic_bool>(false);
+  config.authTicket = ++chatgptSettingsSequence;
+  config.authBusy = true;
+  config.authLoaded = false;
+  config.catalog.clear();
+  SendMessageW(config.chatgptModels, CB_RESETCONTENT, 0, 0);
+  SetWindowTextW(config.error, L"");
+  updateConfigProviderFields(config);
+  if (offline)
+    return; // Self-tests supply safe synthetic events and never read login files.
+  const auto path = config.accountPath;
+  const auto cancel = config.authCancel;
+  const auto ticket = config.authTicket;
+  std::thread([bus, path, cancel, ticket, action, clientId] {
+    // Serialize auth-file mutations. A superseded action checks cancellation
+    // after obtaining this lock, before it can select or replace an account.
+    std::unique_lock<std::mutex> actionLock(chatgptSettingsActionsMutex);
+    if (cancel->load())
+      return;
+    json event = {{"type", "chatgpt_settings"}, {"ticket", ticket},
+                  {"account", json::object()}, {"accounts", json::array()},
+                  {"models", json::array()}, {"error", ""}};
+    auto accountJson = [](const cclive::chatgpt::AccountStatus &account) {
+      return json{{"signed_in", account.signed_in},
+                  {"plan_enabled", account.plan_enabled},
+                  {"email", account.email}, {"name", account.name},
+                  {"client_id", account.client_id},
+                  {"expires_at", account.expires_at}};
+    };
+    auto publishIdentity = [&] {
+      cclive::chatgpt::AccountStatus account;
+      bool readable = true;
+      try {
+        account = cclive::chatgpt::status(path);
+      } catch (...) {
+        readable = false;
+      }
+      // Disk mutations may already have committed even when models/OAuth was
+      // cancelled. Identity delivery must not depend on this settings ticket.
+      bus->emit({{"type", "chatgpt_identity"},
+                 {"revision", ++chatgptIdentitySequence}, {"readable", readable},
+                 {"signed_in", account.signed_in},
+                 {"plan_enabled", account.plan_enabled},
+                 {"client_id", account.client_id}});
+      return account;
+    };
+    try {
+      if (cancel->load())
+        return;
+      if (action == "signin" || action == "add")
+        cclive::chatgpt::sign_in(path, *cancel, {}, action == "add");
+      else if (action == "switch")
+        cclive::chatgpt::select_account(path, clientId);
+      else if (action == "signout" &&
+               !cclive::chatgpt::sign_out(path, *cancel))
+        event["error"] = "已清除本机授权；未能确认服务端撤销，请在账号中检查授权。";
+      const auto account = publishIdentity();
+      if (cancel->load())
+        return;
+      event["account"] = accountJson(account);
+      for (const auto &saved : cclive::chatgpt::accounts(path))
+        event["accounts"].push_back(accountJson(saved));
+      if (account.signed_in && account.plan_enabled)
+        for (const auto &model : cclive::chatgpt::models(path, *cancel))
+          event["models"].push_back({{"id", model.id}, {"name", model.name}});
+    } catch (const cclive::TranslationError &error) {
+      publishIdentity();
+      // Public auth errors are sanitized by the module, with no server bodies or tokens.
+      event["error"] = error.what();
+    } catch (...) {
+      publishIdentity();
+      event["error"] = "ChatGPT 操作未完成，请检查网络、账号权限或重新授权。";
+    }
+    if (!cancel->load())
+      bus->emit(std::move(event));
+  }).detach();
+}
 enum {
   IDC_WINDOW = 100,
   IDC_REFRESH,
@@ -1206,7 +1397,11 @@ public:
   std::unique_ptr<cclive::Ledger> demoLedger;
   Config *config = nullptr;
   std::unique_ptr<cclive::TaskCache> taskCache;
-  std::string activeTaskId, activeTaskTitle, activeIdentityQuality;
+  std::string activeTaskId, activeTaskTitle, activeIdentityQuality, chatgptAccountHash;
+  uint64_t chatgptIdentityRevision = 0;
+  std::function<cclive::chatgpt::AccountStatus()> chatgptIdentityReader = [] {
+    return cclive::chatgpt::status(); // Only this application's own DPAPI file.
+  };
   struct SourceAlias {
     std::string record, block;
   };
@@ -1229,8 +1424,22 @@ public:
       } catch (...) {
         settings = cclive::Settings();
       }
-    if (demo || selfTest)
+    if (demo || selfTest) {
       settings.provider = "demo";
+      chatgptIdentityReader = [] { return cclive::chatgpt::AccountStatus{}; };
+    }
+    // Bind the saved local identity before collecting any task, so merely
+    // opening Settings later does not invalidate already translated records.
+    // This reads only our DPAPI record before creating the UI; no network.
+    if (!demo && !selfTest && settings.provider == "chatgpt") {
+      try {
+        const auto account = cclive::chatgpt::status();
+        if (account.signed_in)
+          chatgptAccountHash = contentSignature(account.client_id);
+      } catch (const std::exception &) {
+        // Settings keeps local cleanup and reconnect available for damaged files.
+      }
+    }
   }
   ~App() {
     shutdown();
@@ -1345,6 +1554,10 @@ public:
   void provider() {
     auto name = settings.provider == "google"
                     ? std::string("Google 公共翻译 · 待译文字发送至 Google")
+                : settings.provider == "baidu"
+                    ? std::string("百度翻译 API · 待译文字发送至百度")
+                : settings.provider == "chatgpt"
+                    ? "ChatGPT · " + settings.chatgpt_model + " · 待译文字发送至 OpenAI"
                 : settings.provider == "ollama" ? "Ollama · " + settings.model
                 : settings.provider == "openai"
                     ? "API · " + settings.model
@@ -1532,10 +1745,19 @@ public:
     DeleteObject(pen);
   }
   json translationProfile() const {
+    const bool api = settings.provider == "openai" ||
+                     settings.provider == "ollama";
+    const bool baidu = settings.provider == "baidu",
+               chatgpt = settings.provider == "chatgpt";
     return {{"provider", settings.provider},
-            {"model", settings.model},
+            {"model", api ? settings.model : std::string()},
             {"target", settings.target},
-            {"endpoint_hash", contentSignature(settings.base_url)}};
+            {"baidu_account_hash", baidu ? contentSignature(settings.baidu_app_id)
+                                         : std::string()},
+            {"chatgpt_model", chatgpt ? settings.chatgpt_model : std::string()},
+            {"chatgpt_account_hash", chatgpt ? chatgptAccountHash : std::string()},
+            {"endpoint_hash", api ? contentSignature(settings.base_url)
+                                   : std::string()}};
   }
   void updateTaskTitle() {
     std::string titleText =
@@ -1850,8 +2072,165 @@ public:
     }
     dirty = true;
   }
+  void applyChatgptIdentity(bool readable,
+                           const cclive::chatgpt::AccountStatus &account,
+                           uint64_t revision) {
+    if (revision <= chatgptIdentityRevision)
+      return;
+    chatgptIdentityRevision = revision;
+    const auto nextHash = readable && account.signed_in
+                              ? contentSignature(account.client_id) : "";
+    const bool changed = nextHash != chatgptAccountHash;
+    const bool usable = readable && account.signed_in && account.plan_enabled;
+    if (changed || !usable) {
+      // Keep completed text under its original activeProfile. Never relabel A's
+      // cached translations as B merely because B's account file was committed.
+      if (settings.provider == "chatgpt") {
+        if (running)
+          stop();
+        else {
+          saveActiveTask();
+          ++generation;
+          cancelAll();
+        }
+      }
+      chatgptAccountHash = nextHash;
+      settings.chatgpt_model.clear();
+      saveOptions();
+      provider();
+      if (settings.provider == "chatgpt")
+        status(usable ? "ChatGPT 账号已变化，请在设置中重新选择并保存模型。"
+                      : "无法确认可用的 ChatGPT 授权，请在设置中重新授权并选择模型。");
+    }
+  }
+  bool confirmChatgptIdentity() {
+    if (settings.provider != "chatgpt")
+      return true;
+    // Auth actions can be awaiting a browser or model request. Never block the
+    // UI on that mutex, and never send a request using an unconfirmed identity.
+    std::unique_lock<std::mutex> lock(chatgptSettingsActionsMutex,
+                                      std::try_to_lock);
+    if (!lock.owns_lock()) {
+      status("ChatGPT 账号操作尚未结束，请稍后开始或重试。");
+      return false;
+    }
+    cclive::chatgpt::AccountStatus account;
+    bool readable = true;
+    try {
+      account = chatgptIdentityReader();
+    } catch (...) {
+      readable = false;
+    }
+    applyChatgptIdentity(readable, account, ++chatgptIdentitySequence);
+    if (!readable || !account.signed_in || !account.plan_enabled)
+      return false;
+    if (settings.chatgpt_model.empty()) {
+      status("请在设置中为当前 ChatGPT 账号选择并保存可用模型。");
+      return false;
+    }
+    return true;
+  }
+  void chatgptSettingsAction(const std::string &action,
+                            const std::string &clientId = {}) {
+    if (!config)
+      return;
+    if (action == "switch" || action == "signin" || action == "add" ||
+        action == "signout") {
+      // Invalidate the previous account's model before the commit, including
+      // the case where the app exits before its identity notification arrives.
+      settings.chatgpt_model.clear();
+      saveOptions();
+      provider();
+      if (settings.provider == "chatgpt") {
+        if (running)
+          stop();
+        else {
+          ++generation;
+          cancelAll();
+        }
+      }
+    }
+    launchChatgptSettingsAction(*config, bus, selfTest, action, clientId);
+  }
+  void acceptChatgptSettings(const json &event) {
+    if (!config || config->authTicket != event.value("ticket", 0ULL) ||
+        config->authCancel->load() ||
+        std::string(selectedConfigProvider(*config)) != "chatgpt")
+      return;
+    auto &dialog = *config;
+    auto readAccount = [](const json &value) {
+      cclive::chatgpt::AccountStatus account;
+      if (value.is_object()) {
+        account.signed_in = value.value("signed_in", false);
+        account.plan_enabled = value.value("plan_enabled", false);
+        account.email = value.value("email", "");
+        account.name = value.value("name", "");
+        account.client_id = value.value("client_id", "");
+        account.expires_at = value.value("expires_at", int64_t(0));
+      }
+      return account;
+    };
+    dialog.authBusy = false;
+    dialog.authLoaded = true;
+    dialog.account = readAccount(event.value("account", json::object()));
+    dialog.accountList.clear();
+    dialog.catalog.clear();
+    SendMessageW(dialog.chatgptAccounts, CB_RESETCONTENT, 0, 0);
+    int accountIndex = -1;
+    for (const auto &value : event.value("accounts", json::array())) {
+      auto account = readAccount(value);
+      if (account.client_id.empty())
+        continue;
+      if (account.client_id == dialog.account.client_id)
+        accountIndex = static_cast<int>(dialog.accountList.size());
+      auto caption = !account.email.empty() ? account.email
+                     : !account.name.empty() ? account.name : "已保存的账号";
+      SendMessageW(dialog.chatgptAccounts, CB_ADDSTRING, 0,
+                   reinterpret_cast<LPARAM>(wide(caption).c_str()));
+      dialog.accountList.push_back(std::move(account));
+    }
+    SendMessageW(dialog.chatgptAccounts, CB_SETCURSEL, accountIndex, 0);
+    SendMessageW(dialog.chatgptModels, CB_RESETCONTENT, 0, 0);
+    const std::string wanted = dialog.selectedChatgptModel.empty()
+                                   ? settings.chatgpt_model
+                                   : dialog.selectedChatgptModel;
+    int modelIndex = -1;
+    for (const auto &value : event.value("models", json::array())) {
+      const auto id = value.value("id", "");
+      if (id.empty())
+        continue;
+      auto name = value.value("name", id);
+      if (id == wanted)
+        modelIndex = static_cast<int>(dialog.catalog.size());
+      const auto caption = name == id ? name : name + " (" + id + ")";
+      SendMessageW(dialog.chatgptModels, CB_ADDSTRING, 0,
+                   reinterpret_cast<LPARAM>(wide(caption).c_str()));
+      dialog.catalog.push_back({id, name});
+    }
+    if (modelIndex < 0 && !dialog.catalog.empty())
+      modelIndex = 0;
+    SendMessageW(dialog.chatgptModels, CB_SETCURSEL, modelIndex, 0);
+    dialog.selectedChatgptModel = modelIndex >= 0
+        ? dialog.catalog[static_cast<std::size_t>(modelIndex)].id : "";
+
+    updateConfigProviderFields(dialog);
+    SetWindowTextW(dialog.error, wide(event.value("error", "")).c_str());
+  }
   void accept(json v) {
     auto type = v.value("type", "");
+    if (type == "chatgpt_identity") {
+      cclive::chatgpt::AccountStatus account;
+      account.signed_in = v.value("signed_in", false);
+      account.plan_enabled = v.value("plan_enabled", false);
+      account.client_id = v.value("client_id", "");
+      applyChatgptIdentity(v.value("readable", false), account,
+                          v.value("revision", 0ULL));
+      return;
+    }
+    if (type == "chatgpt_settings") {
+      acceptChatgptSettings(v);
+      return;
+    }
     if (type == "windows") {
       if (v.value("_refresh_ticket", 0ULL) != refreshGeneration)
         return;
@@ -2049,6 +2428,8 @@ public:
   void start() {
     if (running || closed)
       return;
+    if (!confirmChatgptIdentity())
+      return;
     if (!demo && !selfTest) {
       int index = (int)SendMessageW(combo, CB_GETCURSEL, 0, 0);
       if (index < 0 || index >= (int)windows.size()) {
@@ -2068,7 +2449,9 @@ public:
       lastReadMs = 0;
       watcher = std::make_shared<Watcher>(selectedSourceHwnd, sourceGeneration,
                                           settings.settle_ms,
-                                          settings.api_key_env, bus);
+                                          std::vector<std::string>{
+                                              settings.api_key_env,
+                                              settings.baidu_key_env}, bus);
       std::thread([w = watcher] { w->run(); }).detach();
     } else {
       ++sourceGeneration;
@@ -2132,6 +2515,13 @@ public:
   void retry() {
     if (paused) {
       status("请先点击继续");
+      return;
+    }
+    if (!confirmChatgptIdentity())
+      return;
+    if (settings.provider == "chatgpt" && !records.empty() &&
+        activeProfile != translationProfile()) {
+      status("ChatGPT 账号或模型已变化，请点击开始重新读取后再重试。");
       return;
     }
     for (auto &r : records)
@@ -2314,6 +2704,9 @@ public:
                          settings.base_url != updated.base_url ||
                          settings.model != updated.model ||
                          settings.api_key_env != updated.api_key_env ||
+                         settings.baidu_app_id != updated.baidu_app_id ||
+                         settings.baidu_key_env != updated.baidu_key_env ||
+                         settings.chatgpt_model != updated.chatgpt_model ||
                          settings.target != updated.target ||
                          settings.settle_ms != updated.settle_ms;
     const bool wasRunning = running, wasPaused = paused;
@@ -2768,6 +3161,403 @@ public:
       check("settings_invalid_save_keeps_dialog_and_owner_modal", false);
     check("settings_self_test_keeps_main_hidden_and_offline",
           !IsWindowVisible(hwnd) && !watcher && settings.provider == "demo");
+
+    // Real settings handlers with synthetic credentials only. The app remains
+    // a hidden demo, so applying a provider never starts a reader or network.
+    const auto providerFixtureSettings = settings;
+    const bool providerFixtureRunning = running;
+    running = false;
+    struct TestEnvironment {
+      std::wstring name;
+      std::optional<std::wstring> previous;
+      explicit TestEnvironment(std::wstring n) : name(std::move(n)) {
+        const DWORD size = GetEnvironmentVariableW(name.c_str(), nullptr, 0);
+        if (size) {
+          std::wstring value(size, L'\0');
+          GetEnvironmentVariableW(name.c_str(), value.data(), size);
+          if (!value.empty() && value.back() == L'\0')
+            value.pop_back();
+          previous = std::move(value);
+        }
+      }
+      std::wstring value() const {
+        const DWORD size = GetEnvironmentVariableW(name.c_str(), nullptr, 0);
+        if (!size)
+          return {};
+        std::wstring value(size, L'\0');
+        GetEnvironmentVariableW(name.c_str(), value.data(), size);
+        if (!value.empty() && value.back() == L'\0')
+          value.pop_back();
+        return value;
+      }
+      ~TestEnvironment() {
+        SetEnvironmentVariableW(name.c_str(),
+                                previous ? previous->c_str() : nullptr);
+      }
+    };
+    TestEnvironment apiEnvironment(L"CCLIVE_GUI_API_TEST_KEY_" +
+                                   std::to_wstring(GetCurrentProcessId()));
+    TestEnvironment baiduEnvironment(L"CCLIVE_GUI_BAIDU_TEST_KEY_" +
+                                     std::to_wstring(GetCurrentProcessId()));
+    SetEnvironmentVariableW(apiEnvironment.name.c_str(),
+                            L"CCLIVE_EXISTING_API_TEST_VALUE");
+    openConfig();
+    if (config) {
+      auto select = [&](const char *provider) {
+        SendMessageW(config->edits[0], CB_SETCURSEL,
+                     configProviderIndex(provider), 0);
+        SendMessageW(config->hwnd, WM_COMMAND,
+                     MAKEWPARAM(200, CBN_SELCHANGE),
+                     reinterpret_cast<LPARAM>(config->edits[0]));
+      };
+      auto shown = [](HWND control) {
+        return (GetWindowLongPtrW(control, GWL_STYLE) & WS_VISIBLE) != 0;
+      };
+      check("provider_choices_display_friendly_names",
+            SendMessageW(config->edits[0], CB_GETCOUNT, 0, 0) ==
+                static_cast<LRESULT>(std::size(configProviders)) &&
+                textOf(config->edits[0]) == L"Google公共翻译");
+      check("google_disables_unneeded_credentials",
+            !IsWindowEnabled(config->edits[1]) &&
+                !IsWindowEnabled(config->edits[3]) &&
+                !IsWindowEnabled(config->edits[7]) &&
+                !shown(config->edits[8]));
+      select("openai");
+      SetWindowTextW(config->edits[1], L"https://api.example.invalid/v1");
+      SetWindowTextW(config->edits[2], L"fixture-model");
+      SetWindowTextW(config->edits[3], apiEnvironment.name.c_str());
+      SetWindowTextW(config->edits[7], L"CCLIVE_HIDDEN_API_FAKE_KEY");
+      check("compatible_api_enables_its_own_fields",
+            IsWindowEnabled(config->edits[1]) &&
+                IsWindowEnabled(config->edits[2]) &&
+                IsWindowEnabled(config->edits[3]) &&
+                IsWindowEnabled(config->edits[7]));
+      select("ollama");
+      check("ollama_enables_address_and_model_without_api_credentials",
+            IsWindowEnabled(config->edits[1]) &&
+                IsWindowEnabled(config->edits[2]) &&
+                !IsWindowEnabled(config->edits[3]) &&
+                !IsWindowEnabled(config->edits[7]));
+      select("baidu");
+      check("baidu_uses_independent_fields_and_preserves_api_values",
+            selectedConfigProvider(*config) == std::string("baidu") &&
+                shown(config->edits[8]) && shown(config->edits[9]) &&
+                shown(config->edits[10]) &&
+                IsWindowEnabled(config->edits[8]) &&
+                IsWindowEnabled(config->edits[9]) &&
+                IsWindowEnabled(config->edits[10]) &&
+                !shown(config->edits[1]) &&
+                !IsWindowEnabled(config->edits[7]) &&
+                textOf(config->edits[1]) == L"https://api.example.invalid/v1" &&
+                textOf(config->edits[2]) == L"fixture-model" &&
+                textOf(config->edits[7]) == L"CCLIVE_HIDDEN_API_FAKE_KEY" &&
+                textOf(config->edits[10]).empty() &&
+                textOf(config->serviceHint).find(L"百度") != std::wstring::npos);
+      SetWindowTextW(config->edits[8], L"2026102300000001");
+      SetWindowTextW(config->edits[9], baiduEnvironment.name.c_str());
+      SetWindowTextW(config->edits[10], L"CCLIVE_BAIDU_FAKE_KEY");
+      const HWND dialog = config->hwnd;
+      SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+      check("baidu_appid_and_environment_name_apply_through_save_handler",
+            !config && settings.baidu_app_id == "2026102300000001" &&
+                settings.baidu_key_env == utf8(baiduEnvironment.name) &&
+                settings.base_url == "https://api.example.invalid/v1" &&
+                settings.model == "fixture-model" &&
+                settings.provider == "demo" && !watcher);
+      check("baidu_key_does_not_overwrite_hidden_api_key_environment",
+            baiduEnvironment.value() == L"CCLIVE_BAIDU_FAKE_KEY" &&
+                apiEnvironment.value() == L"CCLIVE_EXISTING_API_TEST_VALUE");
+      if (config)
+        closeConfig(false);
+      auto fixturePath = reportPath;
+      fixturePath += L".baidu-settings-test.json";
+      bool persistedSafely = false;
+      try {
+        cclive::save_settings(fixturePath, settings);
+        const auto restored = cclive::load_settings(fixturePath);
+        std::ifstream input(fixturePath, std::ios::binary);
+        const std::string saved((std::istreambuf_iterator<char>(input)), {});
+        persistedSafely = restored.baidu_app_id == "2026102300000001" &&
+            restored.baidu_key_env == utf8(baiduEnvironment.name) &&
+            saved.find("CCLIVE_BAIDU_FAKE_KEY") == std::string::npos &&
+            saved.find("CCLIVE_HIDDEN_API_FAKE_KEY") == std::string::npos &&
+            saved.find("CCLIVE_EXISTING_API_TEST_VALUE") == std::string::npos;
+      } catch (...) {
+      }
+      std::error_code ignored;
+      fs::remove(fixturePath, ignored);
+      check("baidu_settings_persist_appid_and_env_name_without_secret_values",
+            persistedSafely);
+      const auto diagnostic = diagnosticMetadata().dump();
+      const auto cached = taskPayload().dump();
+      check("baidu_secrets_never_enter_diagnostics_or_task_cache",
+            diagnostic.find("CCLIVE_BAIDU_FAKE_KEY") == std::string::npos &&
+                diagnostic.find("2026102300000001") == std::string::npos &&
+                cached.find("CCLIVE_BAIDU_FAKE_KEY") == std::string::npos &&
+                cached.find(utf8(baiduEnvironment.name)) == std::string::npos);
+      openConfig();
+      if (config) {
+        select("baidu");
+        SetWindowTextW(config->edits[9], apiEnvironment.name.c_str());
+        SendMessageW(config->hwnd, WM_COMMAND,
+                     MAKEWPARAM(IDOK, BN_CLICKED), 0);
+        check("baidu_rejects_shared_api_key_environment_name",
+              config && !textOf(config->error).empty());
+        closeConfig(false);
+      } else
+        check("baidu_rejects_shared_api_key_environment_name", false);
+    } else
+      check("baidu_settings_fixture_created", false);
+    const auto isolatedEnvironment = readerEnvironment({"pAtH", "tEmP"});
+    bool excludedBoth = true, validEnvironment = isolatedEnvironment.size() > 1 &&
+        isolatedEnvironment[isolatedEnvironment.size() - 1] == L'\0' &&
+        isolatedEnvironment[isolatedEnvironment.size() - 2] == L'\0';
+    for (const wchar_t *entry = isolatedEnvironment.data(); *entry;
+         entry += wcslen(entry) + 1) {
+      const std::wstring value(entry);
+      const auto name = value.substr(0, value.find(L'='));
+      excludedBoth = excludedBoth && name != L"PATH" && name != L"TEMP";
+    }
+    check("reader_environment_excludes_both_configured_secret_names",
+          validEnvironment && excludedBoth);
+    settings = providerFixtureSettings;
+    running = providerFixtureRunning;
+    provider();
+    check("provider_settings_self_test_remains_hidden_and_offline",
+          settings.provider == "demo" && !watcher && !IsWindowVisible(hwnd));
+
+    // ChatGPT UI uses only constructed account/catalog events here. No auth
+    // file, browser, OAuth flow or model service is accessed by this fixture.
+    const auto chatgptFixtureSettings = settings;
+    const auto chatgptFixtureHash = chatgptAccountHash;
+    const auto unrelatedProviderProfile = translationProfile();
+    auto chatgptProfileForTest = [&] {
+      const auto provider = settings.provider;
+      settings.provider = "chatgpt";
+      const auto profile = translationProfile();
+      settings.provider = provider;
+      return profile;
+    };
+    const bool chatgptFixtureRunning = running;
+    running = false;
+    openConfig();
+    if (config) {
+      auto selectProvider = [&](const char *provider) {
+        SendMessageW(config->edits[0], CB_SETCURSEL,
+                     configProviderIndex(provider), 0);
+        SendMessageW(config->hwnd, WM_COMMAND,
+                     MAKEWPARAM(200, CBN_SELCHANGE), 0);
+      };
+      selectProvider("chatgpt");
+      const auto ticket = config->authTicket;
+      auto safeEvent = [&](bool signedIn, bool enabled, json models) {
+        json account = {{"signed_in", signedIn}, {"plan_enabled", enabled},
+                        {"email", "fixture@example.invalid"},
+                        {"name", "Offline account fixture"},
+                        {"client_id", "offline-client-id"}};
+        return json{{"type", "chatgpt_settings"}, {"ticket", ticket},
+                    {"account", account}, {"accounts", json::array({account})},
+                    {"models", std::move(models)}, {"error", ""}};
+      };
+      accept(safeEvent(false, false, json::array()));
+      SendMessageW(config->hwnd, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+      check("chatgpt_settings_requires_account_authorization",
+            config && !config->account.signed_in &&
+                !IsWindowEnabled(config->chatgptModels) &&
+                !textOf(config->error).empty());
+      accept(safeEvent(true, false,
+                       json::array({{{"id", "fixture-model-a"},
+                                      {"name", "Offline Model A"}}})));
+      SendMessageW(config->hwnd, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+      check("chatgpt_settings_rejects_account_without_plan_permission",
+            config && !config->account.plan_enabled &&
+                !IsWindowEnabled(config->chatgptModels) &&
+                !textOf(config->error).empty());
+      accept(safeEvent(true, true, json::array()));
+      SendMessageW(config->hwnd, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+      check("chatgpt_settings_rejects_empty_server_model_catalog",
+            config && config->catalog.empty() &&
+                !IsWindowEnabled(config->chatgptModels) &&
+                !textOf(config->error).empty());
+      auto obsolete = safeEvent(true, true,
+          json::array({{{"id", "obsolete-model"}, {"name", "Obsolete"}}}));
+      obsolete["ticket"] = ticket - 1;
+      accept(obsolete);
+      check("chatgpt_settings_discards_obsolete_result_ticket",
+            config && config->catalog.empty());
+      accept(safeEvent(true, true,
+          json::array({{{"id", "fixture-model-a"}, {"name", "Offline Model A"}},
+                       {{"id", "fixture-model-b"}, {"name", "Offline Model B"}}})));
+      check("chatgpt_models_are_supplied_by_account_catalog",
+            config->catalog.size() == 2 &&
+                IsWindowEnabled(config->chatgptModels) &&
+                config->catalog[0].id == "fixture-model-a" &&
+                SendMessageW(config->chatgptModels, CB_GETCOUNT, 0, 0) == 2);
+      const auto beforeModelProfile = chatgptProfileForTest();
+      SendMessageW(config->chatgptModels, CB_SETCURSEL, 1, 0);
+      const auto cancelOnClose = config->authCancel;
+      SendMessageW(config->hwnd, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+      check("chatgpt_selected_catalog_model_is_saved_and_changes_cache_profile",
+            !config && settings.chatgpt_model == "fixture-model-b" &&
+                chatgptProfileForTest() != beforeModelProfile &&
+                settings.provider == "demo");
+      check("viewing_chatgpt_account_does_not_change_other_provider_cache_profile",
+            translationProfile() == unrelatedProviderProfile);
+      check("chatgpt_close_cancels_outstanding_authorization",
+            !config && cancelOnClose->load());
+      if (config)
+        closeConfig(false);
+      openConfig();
+      if (config) {
+        selectProvider("chatgpt");
+        const auto newTicket = config->authTicket;
+        accept(safeEvent(true, true,
+            json::array({{{"id", "obsolete-model"}, {"name", "Obsolete"}}})));
+        check("chatgpt_reopened_settings_ignores_previous_dialog_results",
+              newTicket != ticket && config->authBusy &&
+                  !config->authLoaded && config->catalog.empty());
+        const auto cancelOnSwitch = config->authCancel;
+        selectProvider("google");
+        check("chatgpt_switching_provider_cancels_account_loading",
+              cancelOnSwitch->load() && !config->authLoaded);
+        selectProvider("chatgpt");
+        settings.provider = "chatgpt";
+        const auto beforeAccountChange = generation;
+        chatgptSettingsAction("switch", "offline-other-client");
+        check("chatgpt_account_change_cancels_previous_translation_generation",
+              generation > beforeAccountChange && !running);
+        closeConfig(false);
+      } else
+        check("chatgpt_reopened_settings_ignores_previous_dialog_results", false);
+    } else
+      check("chatgpt_settings_fixture_created", false);
+    if (config)
+      closeConfig(false);
+    settings = chatgptFixtureSettings;
+    chatgptAccountHash = chatgptFixtureHash;
+    running = chatgptFixtureRunning;
+    provider();
+    check("chatgpt_ui_selftest_never_reads_accounts_or_uses_network",
+          settings.provider == "demo" && !watcher && !IsWindowVisible(hwnd));
+
+    // A committed account change outlives the settings dialog and its model
+    // lookup. Inject only this app's safe local-status reader, never OAuth/files.
+    const auto identityFixtureSettings = settings;
+    const auto identityFixtureHash = chatgptAccountHash;
+    const auto identityFixtureReader = chatgptIdentityReader;
+    const auto identityFixtureRecords = records;
+    const auto identityFixtureProfile = activeProfile;
+    const auto identityFixtureTask = activeTaskId;
+    const bool identityFixtureRunning = running, identityFixturePaused = paused;
+    running = paused = false;
+    settings.provider = "chatgpt";
+    settings.chatgpt_model = "offline-model-a";
+    chatgptAccountHash = contentSignature("offline-account-a");
+    activeTaskId = "offline-identity-regression";
+    activeProfile = translationProfile();
+    const auto profileA = activeProfile;
+    Record identityRecord;
+    identityRecord.key = "offline-identity-record";
+    identityRecord.source = "Synthetic account-bound source.";
+    identityRecord.translation = "Synthetic account A translation.";
+    identityRecord.state = "done";
+    records = {identityRecord};
+    auto identityEvent = [](const char *clientId, bool signedIn = true,
+                            bool readable = true, bool enabled = true) {
+      return json{{"type", "chatgpt_identity"},
+                  {"revision", ++chatgptIdentitySequence},
+                  {"readable", readable}, {"signed_in", signedIn},
+                  {"plan_enabled", enabled}, {"client_id", clientId}};
+    };
+    openConfig();
+    if (config) {
+      const auto closedCancel = config->authCancel;
+      closeConfig(false);
+      accept(identityEvent("offline-account-b"));
+      auto cachedA = taskCache->get(activeTaskId);
+      check("committed_chatgpt_identity_updates_after_settings_was_closed",
+            !config && closedCancel->load() &&
+                chatgptAccountHash == contentSignature("offline-account-b") &&
+                settings.chatgpt_model.empty());
+      check("chatgpt_identity_change_keeps_old_translations_under_old_profile",
+            activeProfile == profileA && cachedA &&
+                cachedA->value("translation_profile", json::object()) == profileA &&
+                records[0].translation == "Synthetic account A translation.");
+    } else
+      check("committed_chatgpt_identity_updates_after_settings_was_closed", false);
+    std::atomic_uint localStatusReads{0};
+    chatgptIdentityReader = [&] {
+      ++localStatusReads;
+      cclive::chatgpt::AccountStatus account;
+      account.signed_in = account.plan_enabled = true;
+      account.client_id = "offline-account-b";
+      return account;
+    };
+    chatgptAccountHash = contentSignature("offline-account-a");
+    settings.chatgpt_model = "offline-model-a";
+    const auto submittedBeforeIdentityCheck = worker->submitted.load();
+    start();
+    check("chatgpt_start_rechecks_local_identity_and_blocks_previous_model",
+          !running && localStatusReads.load() == 1 &&
+              chatgptAccountHash == contentSignature("offline-account-b") &&
+              settings.chatgpt_model.empty() &&
+              worker->submitted.load() == submittedBeforeIdentityCheck);
+    chatgptAccountHash = contentSignature("offline-account-a");
+    settings.chatgpt_model = "offline-model-a";
+    records[0].state = "error";
+    retry();
+    check("chatgpt_retry_rechecks_local_identity_and_blocks_previous_model",
+          localStatusReads.load() == 2 && settings.chatgpt_model.empty() &&
+              worker->submitted.load() == submittedBeforeIdentityCheck);
+    settings.chatgpt_model = "offline-model-b";
+    auto staleIdentity = identityEvent("offline-account-a");
+    staleIdentity["revision"] = chatgptIdentityRevision - 1;
+    accept(staleIdentity);
+    check("chatgpt_old_identity_event_cannot_undo_local_status_confirmation",
+          chatgptAccountHash == contentSignature("offline-account-b") &&
+              settings.chatgpt_model == "offline-model-b");
+    retry();
+    check("chatgpt_retry_cannot_write_new_account_results_under_old_profile",
+          chatgptAccountHash == contentSignature("offline-account-b") &&
+              settings.chatgpt_model == "offline-model-b" &&
+              activeProfile == profileA &&
+              worker->submitted.load() == submittedBeforeIdentityCheck);
+    chatgptIdentityReader = []() -> cclive::chatgpt::AccountStatus {
+      throw std::runtime_error("offline unreadable account fixture");
+    };
+    retry();
+    check("chatgpt_unreadable_authorization_clears_old_hash_and_model",
+          chatgptAccountHash.empty() && settings.chatgpt_model.empty() &&
+              worker->submitted.load() == submittedBeforeIdentityCheck);
+    chatgptAccountHash = contentSignature("offline-account-b");
+    settings.chatgpt_model = "offline-model-b";
+    accept(identityEvent("", false));
+    check("chatgpt_signout_notification_clears_old_hash_and_model",
+          chatgptAccountHash.empty() && settings.chatgpt_model.empty());
+    settings.provider = "google";
+    running = true;
+    records[0].state = "queued";
+    const auto googleGeneration = generation;
+    const auto googleProfile = activeProfile;
+    accept(identityEvent("offline-account-b"));
+    accept(identityEvent("", false, false));
+    check("chatgpt_identity_notifications_do_not_interrupt_other_services",
+          running && generation == googleGeneration &&
+              records[0].state == "queued" && activeProfile == googleProfile &&
+              worker->submitted.load() == submittedBeforeIdentityCheck);
+    taskCache->erase(activeTaskId);
+    settings = identityFixtureSettings;
+    chatgptAccountHash = identityFixtureHash;
+    chatgptIdentityReader = identityFixtureReader;
+    chatgptIdentityRevision = ++chatgptIdentitySequence;
+    records = identityFixtureRecords;
+    activeProfile = identityFixtureProfile;
+    activeTaskId = identityFixtureTask;
+    running = identityFixtureRunning;
+    paused = identityFixturePaused;
+    provider();
+    check("chatgpt_identity_regressions_remain_hidden_and_offline",
+          settings.provider == "demo" && !watcher && !IsWindowVisible(hwnd));
 
     // Exercise long incremental output in the actual RichEdit control.
     // Synthetic text only: follow the end until a deliberate user scroll moves
@@ -3322,7 +4112,7 @@ public:
     paused = true;
     running = true;
     auto replayBus = std::make_shared<Bus>();
-    Watcher supplied(0, sourceGeneration, 0, "", replayBus);
+    Watcher supplied(0, sourceGeneration, 0, {}, replayBus);
     cclive::Ledger suppliedLedger(0);
     auto drainSupplied = [&] {
       std::deque<json> events;
@@ -3572,6 +4362,8 @@ public:
   void shutdown() {
     if (closed)
       return;
+    if (config)
+      cancelConfigAuthorization(*config);
     stop();
     closed = true;
     if (hwnd)
@@ -3767,7 +4559,8 @@ LRESULT CALLBACK configProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                                         std::to_wstring(a.settings.font_size),
                                         L""};
     for (int i = 0; i < 8; ++i) {
-      make(L"STATIC", labels[i], 0, 24, 24 + i * 37, 158, 25, 0);
+      c->labels.push_back(
+          make(L"STATIC", labels[i], 0, 24, 24 + i * 37, 158, 25, 0));
       HWND edit = make(i ? L"EDIT" : L"COMBOBOX", i ? values[i].c_str() : L"",
                        i ? (WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP |
                             (i == 7 ? ES_PASSWORD : 0))
@@ -3775,31 +4568,92 @@ LRESULT CALLBACK configProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                        190, 20 + i * 37, 382, i ? 28 : 220, 200 + i);
       c->edits.push_back(edit);
       if (!i) {
-        for (const auto *v : {L"google", L"openai", L"ollama"})
-          SendMessageW(edit, CB_ADDSTRING, 0, (LPARAM)v);
+        for (const auto &provider : configProviders)
+          SendMessageW(edit, CB_ADDSTRING, 0,
+                       reinterpret_cast<LPARAM>(provider.label));
         SendMessageW(edit, CB_SETCURSEL,
-                     a.settings.provider == "openai"   ? 1
-                     : a.settings.provider == "ollama" ? 2
-                                                       : 0,
-                     0);
+                     configProviderIndex(a.settings.provider), 0);
       }
     }
-    make(L"STATIC",
-         L"Key 只在本次运行中使用，不写入配置。可留空使用已有环境变量。", 0, 24,
-         326, 552, 42, 0);
-    make(L"STATIC",
-         L"Google：免 Key 公共接口，待译文字会发送至 Google。\r\nAPI：兼容 "
-         L"Chat Completions，需填写地址及模型。\r\nOllama：通常为 "
-         L"http://127.0.0.1:11434，填写本地模型。",
-         0, 24, 370, 552, 74, 0);
+    const wchar_t *baiduLabels[] = {L"百度 APPID", L"百度密钥环境变量",
+                                    L"本次百度密钥"};
+    const std::wstring baiduValues[] = {wide(a.settings.baidu_app_id),
+                                        wide(a.settings.baidu_key_env), L""};
+    for (int i = 0; i < 3; ++i) {
+      const int row = i + 1;
+      c->labels.push_back(make(L"STATIC", baiduLabels[i], 0, 24,
+                               24 + row * 37, 158, 25, 0));
+      c->edits.push_back(make(L"EDIT", baiduValues[i].c_str(),
+                              WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP |
+                                  (i == 2 ? ES_PASSWORD : 0),
+                              190, 20 + row * 37, 382, 28, 208 + i));
+    }
+    c->keyHint = make(L"STATIC", L"", 0, 24, 326, 552, 42, 0);
+    c->serviceHint = make(L"STATIC", L"", 0, 24, 370, 552, 74, 0);
+    c->accountPath = a.selfTest ? fs::path{} : cclive::chatgpt::default_account_path();
+    c->selectedChatgptModel = a.settings.chatgpt_model;
+    c->chatgptAccountLabel = make(L"STATIC", L"ChatGPT 账号", 0,
+                                 24, 61, 158, 25, 0);
+    c->chatgptAccounts = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP,
+                              190, 57, 278, 220, 220);
+    c->chatgptAdd = make(L"BUTTON", L"添加账号", BS_PUSHBUTTON | WS_TABSTOP,
+                         478, 57, 94, 28, 221);
+    c->chatgptModelLabel = make(L"STATIC", L"可用模型", 0,
+                               24, 98, 158, 25, 0);
+    c->chatgptModels = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP,
+                            190, 94, 382, 220, 211);
+    c->edits.push_back(c->chatgptModels); // edits[11]: server-provided models.
+    c->labels.push_back(c->chatgptModelLabel);
+    c->chatgptStatusLabel = make(L"STATIC", L"授权状态", 0,
+                                24, 135, 158, 25, 0);
+    c->chatgptStatus = make(L"STATIC", L"", 0, 190, 131, 382, 28, 0);
+    c->chatgptLogin = make(L"BUTTON", L"Continue with ChatGPT",
+                           BS_PUSHBUTTON | WS_TABSTOP, 190, 279, 190, 28, 222);
+    c->chatgptSignout = make(L"BUTTON", L"退出账号", BS_PUSHBUTTON | WS_TABSTOP,
+                             388, 279, 88, 28, 223);
+    c->chatgptRefresh = make(L"BUTTON", L"刷新模型", BS_PUSHBUTTON | WS_TABSTOP,
+                             484, 279, 88, 28, 224);
+    updateConfigProviderFields(*c);
     c->error = make(L"STATIC", L"", 0, 24, 450, 552, 48, 0);
     make(L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP, 380, 510, 88, 32,
          IDCANCEL);
     make(L"BUTTON", L"保存", BS_DEFPUSHBUTTON | WS_TABSTOP, 484, 510, 88, 32,
          IDOK);
+    if (std::string(selectedConfigProvider(*c)) == "chatgpt")
+      a.chatgptSettingsAction("status");
+    return 0;
+  }
+  if (msg == WM_COMMAND && LOWORD(wp) == 200 &&
+      HIWORD(wp) == CBN_SELCHANGE) {
+    if (std::string(selectedConfigProvider(*c)) == "chatgpt")
+      a.chatgptSettingsAction("status");
+    else
+      cancelConfigAuthorization(*c);
+    updateConfigProviderFields(*c);
+    SetWindowTextW(c->error, L"");
+    return 0;
+  }
+  if (msg == WM_COMMAND && LOWORD(wp) == 220 &&
+      HIWORD(wp) == CBN_SELCHANGE) {
+    const auto index = SendMessageW(c->chatgptAccounts, CB_GETCURSEL, 0, 0);
+    if (index >= 0 && static_cast<std::size_t>(index) < c->accountList.size())
+      a.chatgptSettingsAction("switch", c->accountList[index].client_id);
+    return 0;
+  }
+  if (msg == WM_COMMAND && LOWORD(wp) == 211 &&
+      HIWORD(wp) == CBN_SELCHANGE) {
+    const auto index = SendMessageW(c->chatgptModels, CB_GETCURSEL, 0, 0);
+    c->selectedChatgptModel = index >= 0 &&
+            static_cast<std::size_t>(index) < c->catalog.size()
+        ? c->catalog[index].id : "";
     return 0;
   }
   if (msg == WM_COMMAND && HIWORD(wp) == BN_CLICKED) {
+    if (LOWORD(wp) >= 221 && LOWORD(wp) <= 224) {
+      const char *actions[] = {"add", "signin", "signout", "models"};
+      a.chatgptSettingsAction(actions[LOWORD(wp) - 221]);
+      return 0;
+    }
     if (LOWORD(wp) == IDCANCEL) {
       a.closeConfig();
       return 0;
@@ -3807,13 +4661,24 @@ LRESULT CALLBACK configProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (LOWORD(wp) == IDOK) {
       try {
         auto updated = a.settings;
-        int index = (int)SendMessageW(c->edits[0], CB_GETCURSEL, 0, 0);
-        updated.provider = index == 1   ? "openai"
-                           : index == 2 ? "ollama"
-                                        : "google";
+        updated.provider = selectedConfigProvider(*c);
+        if (updated.provider == "chatgpt") {
+          if (c->authBusy || !c->authLoaded)
+            throw std::runtime_error("请等待账号与模型列表加载完成。");
+          if (!c->account.signed_in)
+            throw std::runtime_error("请先完成 ChatGPT 账号授权。");
+          if (!c->account.plan_enabled)
+            throw std::runtime_error("该账号尚未开放本服务所需权限。");
+          const auto index = SendMessageW(c->chatgptModels, CB_GETCURSEL, 0, 0);
+          if (index < 0 || static_cast<std::size_t>(index) >= c->catalog.size())
+            throw std::runtime_error("请从账号返回的可用模型中选择一项。");
+          updated.chatgpt_model = c->catalog[index].id;
+        }
         updated.base_url = utf8(textOf(c->edits[1]));
         updated.model = utf8(textOf(c->edits[2]));
         updated.api_key_env = utf8(textOf(c->edits[3]));
+        updated.baidu_app_id = utf8(textOf(c->edits[8]));
+        updated.baidu_key_env = utf8(textOf(c->edits[9]));
         updated.target = utf8(textOf(c->edits[4]));
         auto number = [](const std::wstring &value) {
           size_t n = 0;
@@ -3824,15 +4689,30 @@ LRESULT CALLBACK configProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         };
         updated.settle_ms = number(textOf(c->edits[5]));
         updated.font_size = number(textOf(c->edits[6]));
-        auto key = textOf(c->edits[7]);
-        if (!key.empty() && updated.api_key_env.empty())
+        // Read only the selected service's independent password control.
+        const auto key = updated.provider == "baidu" ? textOf(c->edits[10])
+                       : updated.provider == "openai" ? textOf(c->edits[7])
+                                                      : std::wstring();
+        if (updated.provider == "baidu" && updated.baidu_key_env.empty())
+          updated.baidu_key_env = "BAIDU_TRANSLATE_KEY";
+        if (updated.provider == "openai" && !key.empty() &&
+            updated.api_key_env.empty())
           updated.api_key_env = "CCLIVE_TRANSLATION_API_KEY";
+        if (!updated.api_key_env.empty() && !updated.baidu_key_env.empty() &&
+            _wcsicmp(wide(updated.api_key_env).c_str(),
+                     wide(updated.baidu_key_env).c_str()) == 0)
+          throw std::runtime_error("百度与兼容 API 请使用不同的密钥环境变量名。");
+        if (updated.provider == "baidu" && updated.baidu_app_id.empty())
+          throw std::runtime_error("请填写百度翻译 APPID。");
         updated.validate();
         if (key.find_first_of(L"\r\n") != std::wstring::npos)
-          throw std::runtime_error("Key 不能包含换行符");
+          throw std::runtime_error("密钥不能包含换行符");
+        const auto keyEnvironment = updated.provider == "baidu"
+                                        ? updated.baidu_key_env
+                                        : updated.api_key_env;
         if (!key.empty() && !SetEnvironmentVariableW(
-                                wide(updated.api_key_env).c_str(), key.c_str()))
-          throw std::runtime_error("无法设置本次 Key");
+                                wide(keyEnvironment).c_str(), key.c_str()))
+          throw std::runtime_error("无法设置本次密钥");
         if (!(a.demo || a.selfTest))
           cclive::save_settings(a.configPath, updated);
         a.applySettings(std::move(updated), !key.empty());
@@ -3873,6 +4753,7 @@ LRESULT CALLBACK configProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     return 0;
   }
   if (msg == WM_NCDESTROY) {
+    cancelConfigAuthorization(*c);
     if (a.config == c)
       a.config = nullptr;
     // Defensive cleanup for failed creation or owner-driven destruction.
@@ -3888,6 +4769,7 @@ LRESULT CALLBACK configProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 void App::closeConfig(bool restoreActivation) {
   if (!config)
     return;
+  cancelConfigAuthorization(*config);
   const HWND dialog = config->hwnd;
   const HWND previousFocus = config->previousFocus;
   const bool wasForeground = GetForegroundWindow() == dialog;

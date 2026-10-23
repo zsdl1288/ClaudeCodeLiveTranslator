@@ -1,4 +1,4 @@
-# Claude 桌面实时翻译 · C++ 版 v1.0.1
+# Claude 桌面实时翻译 · C++ 版 v1.1.0
 
 Windows 10/11 x64 的原生 C++ 独立翻译窗口，继续配合现有 Claude 桌面客户端使用。程序通过 Windows UI Automation 只读获取客户端公开的助手文字，按稳定句子增量翻译。
 
@@ -6,7 +6,7 @@ Windows 10/11 x64 的原生 C++ 独立翻译窗口，继续配合现有 Claude �
 
 ## 使用
 
-从 [v1.0.1 Release](https://github.com/zsdl1288/ClaudeCodeLiveTranslator/releases/tag/v1.0.1) 下载 `ClaudeTranslator-v1.0.1-windows-x64.zip`，完整解压后双击 `ClaudeTranslator.exe`。这是 Windows 10/11 x64 便携版，无需安装；请解压到有写入权限的文件夹，以便保存设置。
+从 [v1.1.0 Release](https://github.com/zsdl1288/ClaudeCodeLiveTranslator/releases/tag/v1.1.0) 下载 `ClaudeTranslator-v1.1.0-windows-x64.zip`，完整解压后双击 `ClaudeTranslator.exe`。本版本新增百度翻译 API 与 ChatGPT 账号授权，可在设置中选择翻译服务。这是 Windows 10/11 x64 便携版，无需安装；请解压到有写入权限的文件夹，以便保存设置。
 
 源码用户编译后可双击项目根目录的 `启动翻译.cmd`，或运行 `dist\ClaudeTranslator\ClaudeTranslator.exe`。离线演示可运行 `ClaudeTranslator.exe --demo`；源码目录也提供 `离线演示.cmd`。
 
@@ -62,12 +62,16 @@ build-cpp\ClaudeTranslator.exe --self-test --auto-start --status-file "%CD%\buil
 默认使用 Google 无 Key 网页翻译接口。选择它时，待译的助手文字会通过 HTTPS 发送给 Google。该接口不是稳定的官方 API，可能限流、不可用或改变行为。
 程序为 Google 的实际请求设置至少 1.5 秒间隔（长段落分片也受限制）。出现 HTTP 429 表示所选翻译服务正在限流：程序暂停该服务的请求队列，遵守 `Retry-After`，并至少等待 60 秒；连续限流时增加等待时间，每段最多自动重试 3 次。冷却期间界面仍可暂停、停止、切换任务或在设置中更换服务；点击「重试失败」也会遵守冷却。服务可能按 IP、账户或配额继续限流，等待时间不代表一定恢复；持续受限时可检查所选服务的额度，或选择本地 Ollama。
 
-设置还支持：
+在「设置 → 翻译服务」选择使用的服务，保存后应用。除 Google 外，还支持：
 
-- 兼容 Chat Completions 的服务：填写服务地址、模型名称和 API Key 环境变量名。待译文字会发送给该地址。
-- 本地 Ollama：通常填写 `http://127.0.0.1:11434` 和本机已安装的模型名；使用本地服务时，待译文字可留在本机。
+- **百度翻译 API**：开通百度通用文本翻译，填写 APPID，在「本次密钥」输入密钥，或填写已配置的密钥环境变量名（默认 `BAIDU_TRANSLATE_KEY`）。请求固定通过 HTTPS 发送给百度官方接口，使用官方 MD5 签名；密钥值不写入配置。`zh-CN`、`zh-TW` 等常见目标语言会转换为百度语言代码。请求按服务节流，百度限流错误会进入冷却队列。APPID、密钥与服务额度可在[百度翻译开放平台](https://fanyi-api.baidu.com/product/11)管理。
+- **ChatGPT 账号**：点击 **Continue with ChatGPT**，在系统浏览器中登录、选择账号和工作区并授权本程序使用 ChatGPT 套餐。登录后加载该账号可用的模型，选择模型后保存。切换账号后需重新选择并保存模型。适用性、额度及模型由 OpenAI 和账号/工作区策略决定；符合条件的 Plus/Pro 账号可使用已有套餐额度。此方式使用 OpenAI 官方账号授权接口，不依赖桌面聊天窗口，不读取桌面客户端现有登录文件。详见[官方账号接入说明](https://developers.openai.com/siwc/quickstart)。
+- **兼容 API**：填写 Chat Completions 服务地址、模型名称和 API Key 环境变量名。待译文字会发送给所填地址；也可连接自建的兼容服务。
+- **Ollama 本地模型**：通常填写 `http://127.0.0.1:11434` 和本机已安装的模型名；待译文字发送至该服务地址。
 
-API Key 值不写入配置文件，也不传给只读采集器。程序不会在失败时自动切换到别的服务。云端翻译的网络可用性和费用取决于所选服务。
+百度密钥与兼容 API 的 Key 只通过本次运行或环境变量使用，不保存密钥值到 `data/config.json`，也不传给只读采集器。ChatGPT 授权凭据由 Windows DPAPI 加密，单独保存在本程序的 `data/chatgpt-account.bin` 中，用于重启后的登录恢复和令牌续期；请勿分享 `data/` 文件夹。可在设置中退出本程序的账号连接，也可在 ChatGPT 账号设置中管理授权。
+
+ChatGPT 的推理请求固定发送到 OpenAI 官方 Responses API，设置 `store:false` 并使用流式响应。程序不会在失败时自动切换到其他服务。云端翻译的数据处理、额度与费用取决于所选服务。
 
 ## 能读取的内容
 
@@ -116,6 +120,7 @@ build.cmd --tests
 - `src/main.cpp`：原生窗口、后台任务、独立采集进程监督。
 - `src/reader.cpp`：只读辅助功能助手文字提取。
 - `src/core.cpp`：设置、稳定分句、去重和翻译服务。
+- `src/chatgpt.cpp`、`include/chatgpt.hpp`：本程序自己的 ChatGPT 授权、加密凭据、模型列表与翻译请求。
 - `src/task_cache.cpp`、`include/task_cache.hpp`：按任务区分的纯内存缓存与容量限制。
 - `src/text_layout.cpp`、`include/text_layout.hpp`：标题、粗体、列表及段落的原生富文本排版。
 - `assets/app-icon.svg`、`assets/app.ico`、`resources/app.rc`：应用矢量图标、多尺寸 Windows 图标与嵌入资源。
