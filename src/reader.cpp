@@ -149,6 +149,18 @@ struct Node {
 using N = std::shared_ptr<Node>;
 bool is_assistant_marker(const N& node) { return rx(node->name, assistant_marker); }
 bool is_user_marker(const N& node) { return rx(node->name, user_marker); }
+bool is_status(const N& node) { return node->type == UIA_StatusBarControlTypeId || lower(node->aria_role) == L"status"; }
+bool response_boundary(const N& node) {
+    return node->type != UIA_TextControlTypeId &&
+        (has_class(node->class_name, L"font-claude-response") || has_class(node->class_name, L"group/message-row"));
+}
+std::wstring summary_label(const std::wstring& value) {
+    static const std::wregex spaces(L"\\s+");
+    auto result = std::regex_replace(value, spaces, L" ");
+    const auto first = result.find_first_not_of(L' ');
+    if (first == std::wstring::npos) return {};
+    return result.substr(first, result.find_last_not_of(L' ') - first + 1);
+}
 bool is_message(const N& node) {
     // Article is exposed by Chromium as Group, Pane or Custom depending on version.
     // Its exact localized message number remains mandatory; never read arbitrary panes.
@@ -258,19 +270,29 @@ class Reader {
         return result;
     }
     std::string display_paragraph(const N& item, const N& boundary) {
-        // Inline Text/strong/link siblings share a semantic paragraph. A nearest
-        // arbitrary Text node alone is not evidence of a new paragraph.
-        N current = item, fallback = item;
+        // RawView can retain an unnamed P group omitted from ControlView. The
+        // response/message row is its boundary, never one global paragraph.
+        N current = item, child = item, fallback = item;
+        N response, response_child;
         for (int depth = 0; current && depth < 64; ++depth) {
             const auto role = lower(current->aria_role);
             const auto type_name = lower(current->localized_type);
             if (role == L"paragraph" || type_name == L"paragraph" || type_name == L"段落" ||
                 current->heading_level || current->type == UIA_ListItemControlTypeId ||
-                current->type == UIA_DataItemControlTypeId || current->type == UIA_HeaderItemControlTypeId ||
-                has_class(current->class_name, L"font-claude-response")) return current->id;
+                current->type == UIA_DataItemControlTypeId || current->type == UIA_HeaderItemControlTypeId) return current->id;
+            if (!response && response_boundary(current)) { response = current; response_child = child; }
             if (current->id == boundary->id) break;
-            fallback = current;
-            current = parent(current);
+            fallback = current; child = current; current = parent(current);
+        }
+        if (response) {
+            // Direct Text siblings may be fragments of one word or inline code.
+            // Preserve their observed whitespace; do not guess extra boundaries.
+            if (response_child && response_child->id != response->id &&
+                response_child->type != UIA_TextControlTypeId &&
+                response_child->type != UIA_HyperlinkControlTypeId &&
+                lower(response_child->localized_type) != L"code" &&
+                lower(response_child->aria_role) != L"code") return response_child->id;
+            return response->id;
         }
         return fallback->id;
     }
@@ -453,7 +475,40 @@ class Reader {
     std::unordered_set<std::string> auxiliary_regions(const N& message, const std::vector<N>& all) {
         std::unordered_set<std::string> result;
         std::vector<N> buttons;
-        for (const auto& item : all) if (item->type == UIA_ButtonControlTypeId) buttons.push_back(item);
+        std::unordered_set<std::wstring> status_labels;
+        for (const auto& item : all) {
+            if (item->type == UIA_ButtonControlTypeId) buttons.push_back(item);
+            if (!is_status(item)) continue;
+            result.insert(item->id);
+            const auto label = summary_label(item->name);
+            if (!label.empty()) status_labels.insert(label);
+            for (const auto& child : all) if (child->type == UIA_TextControlTypeId && inside(child, item)) {
+                const auto text = summary_label(child->name);
+                if (!text.empty()) status_labels.insert(text);
+            }
+        }
+        static const std::wregex tool_stat(LR"(^(?:(?:已)?运行\s*\d+\s*[个条]?\s*命令|(?:ran|running|executed)\s+\d+\s+commands?|新增\s*\d+\s*[,，]\s*删除\s*\d+|added\s+\d+\s*[,，]\s*(?:removed|deleted)\s+\d+)$)", flags);
+        for (const auto& button : buttons) {
+            const auto label = summary_label(button->name);
+            if (label.empty()) continue;
+            auto current = parent(button);
+            for (int depth = 0; current && current->id != message->id && depth < 8; ++depth, current = parent(current)) {
+                if (response_boundary(current)) break;
+                const auto role = lower(current->aria_role);
+                if (role == L"paragraph" || current->heading_level || current->type == UIA_ListItemControlTypeId) break;
+                if (current->type != UIA_GroupControlTypeId && current->type != UIA_PaneControlTypeId && current->type != UIA_CustomControlTypeId) continue;
+                bool duplicate = summary_label(current->name) == label, statistic = false;
+                for (const auto& child : all) if (child->type == UIA_TextControlTypeId && inside(child, current)) {
+                    const auto text = summary_label(child->name);
+                    duplicate = duplicate || text == label;
+                    statistic = statistic || std::regex_match(text, tool_stat);
+                }
+                // Tool controls expose the same task summary as a Button and
+                // a live Status, or as a summary Button with exact run counters.
+                // A prose sentence mentioning commands alone is never evidence.
+                if (duplicate && (statistic || status_labels.count(label))) { result.insert(current->id); break; }
+            }
+        }
         bool dismiss = false;
         for (const auto& button : buttons) {
             if (button->name != L"Dismiss") continue;
@@ -491,7 +546,7 @@ class Reader {
                 }
                 const auto semantic = child->class_name + L" " + child->automation_id;
                 if (child->type == UIA_ButtonControlTypeId || child->type == UIA_ToolBarControlTypeId || child->type == UIA_EditControlTypeId ||
-                    rx(semantic, auxiliary_class) || rx(semantic, excluded_semantic) || child->class_name.find(L"group/copy") != std::wstring::npos ||
+                    is_status(child) || rx(semantic, auxiliary_class) || rx(semantic, excluded_semantic) || child->class_name.find(L"group/copy") != std::wstring::npos ||
                     has_class(child->class_name, L"font-mono") || expansion(child) == ExpandCollapseState_Collapsed) unsafe = true;
             }
             // Rich list items can expose their whole sentence as Name while only
@@ -536,12 +591,12 @@ class Reader {
             const auto type = item->type;
             if (type != UIA_TextControlTypeId && !((item->heading_level || type == UIA_ListItemControlTypeId || type == UIA_DataItemControlTypeId || type == UIA_HeaderItemControlTypeId) && (!containers_with_text.count(item->id) || preferred_names.count(item->id)))) continue;
             if (covered_by_container_name(item, message, preferred_names)) continue;
-            if (item->class_name.find(L"sr-only") != std::wstring::npos || is_assistant_marker(item) || is_user_marker(item)) continue;
+            if (item->class_name.find(L"sr-only") != std::wstring::npos || is_status(item) || is_assistant_marker(item) || is_user_marker(item)) continue;
             auto current = parent(item); auto child = item;
             bool excluded = false, code_block = false;
             std::string kind, region, paragraph;
             for (int depth = 0; current && current->id != message->id && depth < 64; ++depth) {
-                if (current->type == UIA_ToolBarControlTypeId || current->type == UIA_ButtonControlTypeId || current->type == UIA_EditControlTypeId || rx(current->class_name + L" " + current->automation_id, excluded_semantic) || rx(current->class_name, auxiliary_class) || expansion(current) == ExpandCollapseState_Collapsed || auxiliary.count(current->id)) { excluded = true; break; }
+                if (is_status(current) || current->type == UIA_ToolBarControlTypeId || current->type == UIA_ButtonControlTypeId || current->type == UIA_EditControlTypeId || rx(current->class_name + L" " + current->automation_id, excluded_semantic) || rx(current->class_name, auxiliary_class) || expansion(current) == ExpandCollapseState_Collapsed || auxiliary.count(current->id)) { excluded = true; break; }
                 const auto semantic = current->class_name + L" " + current->automation_id;
                 if (regions.count(current->id) || rx(semantic, thinking_semantic)) { kind = "thinking"; region = current->id; }
                 else if (kind != "thinking" && rx(semantic, intermediate_semantic)) { kind = "intermediate"; region = current->id; }
@@ -672,6 +727,7 @@ class Reader {
         std::unordered_map<std::string, bool> user_messages;
         const auto semantic_nodes = descendants(window, 0, 10000);
         const auto preferred_names = preferred_container_names(semantic_nodes);
+        const auto auxiliary = auxiliary_regions(window, semantic_nodes);
         std::unordered_set<std::string> containers_with_text;
         for (const auto& leaf : semantic_nodes) if (leaf->type == UIA_TextControlTypeId) {
             auto ancestor = parent(leaf);
@@ -681,13 +737,13 @@ class Reader {
         for (const auto& item : semantic_nodes) {
             if (item->type != UIA_TextControlTypeId && !((item->heading_level || item->type == UIA_ListItemControlTypeId || item->type == UIA_DataItemControlTypeId || item->type == UIA_HeaderItemControlTypeId) && (!containers_with_text.count(item->id) || preferred_names.count(item->id)))) continue;
             if (covered_by_container_name(item, window, preferred_names)) continue;
-            if (blank(item->name) || item->name.size() > 64000 || item->class_name.find(L"sr-only") != std::wstring::npos || is_assistant_marker(item) || is_user_marker(item)) continue;
+            if (item->name.empty() || item->name.size() > 64000 || item->class_name.find(L"sr-only") != std::wstring::npos || is_status(item) || is_assistant_marker(item) || is_user_marker(item)) continue;
             try {
                 auto current = parent(item);
                 std::string key, strong_key, message_key; N owner, strong_owner, message_owner; bool skip = false;
                 for (int depth = 0; current && current->id != window->id && depth < 24; ++depth, current = parent(current)) {
                     const auto semantic = current->class_name + L" " + current->automation_id;
-                    if (current->type == UIA_EditControlTypeId || current->type == UIA_ButtonControlTypeId || current->type == UIA_ToolBarControlTypeId || rx(semantic, excluded_semantic)) { skip = true; break; }
+                    if (is_status(current) || auxiliary.count(current->id) || current->type == UIA_EditControlTypeId || current->type == UIA_ButtonControlTypeId || current->type == UIA_ToolBarControlTypeId || rx(semantic, excluded_semantic)) { skip = true; break; }
                     if (rx(semantic, assistant_semantic)) { key = std::to_string(pid) + "|semantic|" + current->id; owner = current; }
                     if (rx(semantic, strong_assistant_semantic)) { strong_key = std::to_string(pid) + "|semantic|" + current->id; strong_owner = current; }
                     if (is_message(current) || lower(current->aria_role) == L"article" || has_class(current->class_name, L"group/message-row")) {
@@ -709,7 +765,7 @@ class Reader {
                 if (!builders.count(key)) { builders.emplace(key, ResponseText{}); result.push_back({key, "answer", {}}); }
                 auto& builder = builders.at(key);
                 if (builder.text.size() + item->name.size() + 16 < 64000) {
-                    auto value = (item->heading_level ? std::wstring(item->heading_level, L'#') + L" " : item->type == UIA_ListItemControlTypeId ? L"- " : L"") + item->name + L"\n";
+                    auto value = (item->heading_level ? std::wstring(item->heading_level, L'#') + L" " : item->type == UIA_ListItemControlTypeId ? L"- " : L"") + item->name;
                     builder.add(value, false, display_paragraph(item, owner), item->heading_level != 0);
                 }
             } catch (const UiaError&) {}

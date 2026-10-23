@@ -1674,7 +1674,7 @@ public:
                         smallFont);
     subtitle = control(L"STATIC", L"保留 Claude 原窗口，在这里看中文", 0, 0,
                        smallFont);
-    providerLabel = control(L"STATIC", L"", SS_RIGHT, 0, smallFont);
+    providerLabel = control(L"STATIC", L"", SS_RIGHT | SS_ENDELLIPSIS, 0, smallFont);
     provider();
     sourceLabel = control(L"STATIC", L"来源  Claude 桌面客户端 · 辅助功能文字",
                           0, 0, smallFont);
@@ -1737,7 +1737,7 @@ public:
     countLabel = control(L"STATIC", L"0 段", SS_RIGHT | SS_ENDELLIPSIS, 0, smallFont);
     foot = control(L"STATIC", L"后台只读 · 不截图、不点击、不修改客户端", 0, 0,
                    smallFont);
-    EnableWindow(refreshButton, !(demo || selfTest));
+    EnableWindow(refreshButton, TRUE);
     EnableWindow(combo, !(demo || selfTest));
     std::thread([work = worker] { work->run(); }).detach();
     SetTimer(w, 1, 50, nullptr);
@@ -1756,15 +1756,51 @@ public:
     }
     publishDiagnostic(true);
   }
+  struct ReadingGeometry {
+    RECT source{}, translated{};
+    int separator = 0;
+  };
+  ReadingGeometry readingGeometry(int width, int height, bool dual) const {
+    const int margin = s(16), gap = s(10);
+    const int available = std::max(1, width - 2 * margin);
+    const int top = s(125), bottom = std::max(top + 1, height - s(36));
+    auto column = [&](int left, int regionWidth) {
+      const int region = std::max(1, regionWidth);
+      const int readingWidth = std::min(s(760), region);
+      const int x = left + (region - readingWidth) / 2;
+      return RECT{x, top, x + readingWidth, bottom};
+    };
+    ReadingGeometry geometry;
+    if (dual) {
+      const int leftWidth = std::max(1, (available - gap) / 2);
+      geometry.source = column(margin, leftWidth);
+      geometry.translated = column(margin + leftWidth + gap,
+                                   available - leftWidth - gap);
+      geometry.separator = margin + leftWidth + gap / 2;
+    } else {
+      geometry.translated = column(margin, available);
+    }
+    return geometry;
+  }
   void layout() {
     if (!hwnd)
       return;
-    RECT r{};
-    GetClientRect(hwnd, &r);
-    int width = r.right, height = r.bottom, m = s(16), gap = s(10);
-    int bodyW = std::max(s(600), width - 2 * m);
-    auto move = [](HWND w, int x, int y, int a, int b) {
-      MoveWindow(w, x, y, std::max(1, a), std::max(1, b), TRUE);
+    ScrollGuard guard(internalScroll);
+    struct View { HWND window; POINT scroll{}; };
+    View views[] = {{sourceEdit}, {translationEdit}};
+    for (auto &view : views)
+      if (view.window)
+        SendMessageW(view.window, EM_GETSCROLLPOS, 0,
+                     reinterpret_cast<LPARAM>(&view.scroll));
+    RECT area{};
+    GetClientRect(hwnd, &area);
+    const int width = area.right, height = area.bottom, m = s(16), gap = s(10);
+    const int bodyW = std::max(1, width - 2 * m);
+    auto move = [](HWND window, int x, int y, int w, int h) {
+      MoveWindow(window, x, y, std::max(1, w), std::max(1, h), TRUE);
+    };
+    auto moveRect = [&](HWND window, const RECT &rect) {
+      move(window, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
     };
     ShowWindow(eyebrow, SW_HIDE);
     ShowWindow(subtitle, SW_HIDE);
@@ -1772,8 +1808,11 @@ public:
     ShowWindow(foot, SW_HIDE);
     move(iconLabel, m, s(8), s(28), s(28));
     move(title, m + s(38), s(9), s(114), s(27));
-    move(taskLabel, m + s(162), s(13), std::max(s(180), bodyW - s(528)), s(21));
-    move(providerLabel, width - m - s(350), s(13), s(350), s(21));
+    const int providerW = std::min(s(350),
+        std::max(s(180), (bodyW - s(162)) * 2 / 5));
+    const int taskW = std::max(1, bodyW - s(162) - providerW - s(12));
+    move(taskLabel, m + s(162), s(13), taskW, s(21));
+    move(providerLabel, width - m - providerW, s(13), providerW, s(21));
     int y = s(43), bh = s(29), bw = s(66);
     move(combo, m, y, bodyW - 3 * (bw + gap), s(280));
     int x = width - m - 3 * bw - 2 * gap;
@@ -1793,26 +1832,36 @@ public:
       move(item.first, x, y, s(item.second), s(27));
       x -= s(6);
     }
-    int top = s(117), bottom = height - s(36);
-    int paneH = std::max(s(180), bottom - top - s(8));
-    int paneW = settings.show_original ? (bodyW - gap) / 2 : bodyW;
+    const auto geometry = readingGeometry(width, height, settings.show_original);
     ShowWindow(sourceEdit, settings.show_original ? SW_SHOW : SW_HIDE);
     if (settings.show_original)
-      move(sourceEdit, m, top + s(8), paneW, paneH);
-    int tx = settings.show_original ? m + paneW + gap : m;
-    move(translationEdit, tx, top + s(8), paneW, paneH);
+      moveRect(sourceEdit, geometry.source);
+    moveRect(translationEdit, geometry.translated);
     move(statusLabel, m, height - s(26), bodyW - s(366), s(20));
     move(countLabel, width - m - s(360), height - s(26), s(360), s(20));
+    // Resizing changes the wrap width without changing source records. Preserve
+    // manual reading, or explicitly remain at the new end for a following pane.
+    for (const auto &view : views) {
+      if (!view.window)
+        continue;
+      SendMessageW(view.window, EM_SETTARGETDEVICE, 0, 0);
+      SendMessageW(view.window, EM_SETRECT, 0, 0);
+      SendMessageW(view.window, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                   MAKELPARAM(s(14), s(14)));
+      SendMessageW(view.window, EM_GETLINECOUNT, 0, 0);
+      if (follows(view.window))
+        SendMessageW(view.window, WM_VSCROLL, SB_BOTTOM, 0);
+      else
+        SendMessageW(view.window, EM_SETSCROLLPOS, 0,
+                     reinterpret_cast<LPARAM>(&view.scroll));
+    }
     InvalidateRect(hwnd, nullptr, FALSE);
   }
   void paintDividers(HDC dc) const {
     RECT area{};
     GetClientRect(hwnd, &area);
-    const int width = area.right, height = area.bottom;
-    const int margin = s(16), gap = s(10);
-    const int bodyWidth = std::max(s(600), width - 2 * margin);
-    const int paneWidth = settings.show_original ? (bodyWidth - gap) / 2
-                                                 : bodyWidth;
+    const int width = area.right, height = area.bottom, margin = s(16);
+    const auto geometry = readingGeometry(width, height, settings.show_original);
     const int top = s(117), bottom = height - s(36);
     const auto pen = CreatePen(PS_SOLID, 1, RGB(72, 70, 64));
     const auto previous = SelectObject(dc, pen);
@@ -1821,14 +1870,11 @@ public:
       LineTo(dc, x2, y2);
     };
     line(margin, s(39), width - margin, s(39));
-    int translationLeft = margin;
     if (settings.show_original) {
-      line(margin, top, margin + paneWidth, top);
-      const int middle = margin + paneWidth + gap / 2;
-      line(middle, top, middle, bottom);
-      translationLeft = margin + paneWidth + gap;
+      line(geometry.source.left, top, geometry.source.right, top);
+      line(geometry.separator, top, geometry.separator, bottom);
     }
-    line(translationLeft, top, translationLeft + paneWidth, top);
+    line(geometry.translated.left, top, geometry.translated.right, top);
     line(margin, height - s(31), width - margin, height - s(31));
     SelectObject(dc, previous);
     DeleteObject(pen);
@@ -2540,8 +2586,38 @@ public:
     dirty = cacheDirty = true;
     trimRecords();
   }
+  void reflowBodies() {
+    ScrollGuard guard(internalScroll);
+    struct View { HWND window; POINT scroll{}; CHARRANGE selected{}; };
+    View views[] = {{sourceEdit}, {translationEdit}};
+    for (auto &view : views) {
+      SendMessageW(view.window, EM_GETSCROLLPOS, 0,
+                   reinterpret_cast<LPARAM>(&view.scroll));
+      SendMessageW(view.window, EM_EXGETSEL, 0,
+                   reinterpret_cast<LPARAM>(&view.selected));
+      // Use this control's current client width, including after a manual refresh.
+      SendMessageW(view.window, EM_SETTARGETDEVICE, 0, 0);
+      SendMessageW(view.window, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                   MAKELPARAM(s(14), s(14)));
+    }
+    ++bodyStyleRevision;
+    layout();
+    render();
+    for (const auto &view : views) {
+      SendMessageW(view.window, EM_EXSETSEL, 0,
+                   reinterpret_cast<LPARAM>(&view.selected));
+      if (!follows(view.window))
+        SendMessageW(view.window, EM_SETSCROLLPOS, 0,
+                     reinterpret_cast<LPARAM>(&view.scroll));
+    }
+  }
   void refresh() {
-    if (demo || selfTest || refreshing)
+    reflowBodies();
+    if (demo || selfTest) {
+      status("已重新排版当前内容 · 离线演示，不读取 Claude");
+      return;
+    }
+    if (refreshing)
       return;
     refreshing = true;
     EnableWindow(refreshButton, FALSE);
@@ -2694,6 +2770,25 @@ public:
            (value >= 0xf900 && value <= 0xfaff) ||
            (value >= 0xff00 && value <= 0xffef);
   }
+  static std::pair<wchar_t, wchar_t> displayEdges(const std::wstring &content) {
+    const auto visible = cclive::make_text_layout(content).text;
+    const auto first = visible.find_first_not_of(L" \t\r\n\"'\u2018\u201c([{");
+    const auto last = visible.find_last_not_of(L" \t\r\n\"'\u2019\u201d)]}");
+    return {first == std::wstring::npos ? 0 : visible[first],
+            last == std::wstring::npos ? 0 : visible[last]};
+  }
+  static bool displaySeamNeedsSpace(wchar_t left, wchar_t right) {
+    auto asciiWord = [](wchar_t value) {
+      return (value >= L'A' && value <= L'Z') ||
+             (value >= L'a' && value <= L'z') ||
+             (value >= L'0' && value <= L'9');
+    };
+    const bool leftCjk = cjkBoundary(left), rightCjk = cjkBoundary(right);
+    return (!leftCjk && !rightCjk) ||
+           (leftCjk && asciiWord(right)) ||
+           (asciiWord(left) && rightCjk) ||
+           ((left == L'.' || left == L'!' || left == L'?') && rightCjk);
+  }
   std::wstring output(bool original) const {
     if (records.empty())
       return original ? L"英文原文将在这里显示"
@@ -2712,6 +2807,7 @@ public:
     if (begin)
       value = L"仅显示最近保留的字幕内容。";
     const Record *previous = nullptr;
+    wchar_t previousEdge = 0;
     for (size_t index = begin; index < records.size(); ++index) {
       const auto &record = records[index];
       auto content = displayContent(original ? record.source : record.translation);
@@ -2720,6 +2816,7 @@ public:
         previous = nullptr;
         continue;
       }
+      const auto edges = displayEdges(content);
       if (!value.empty()) {
         const bool sameParagraph = previous && previous->hasLayout &&
             record.hasLayout && previous->layoutBlock == record.layoutBlock &&
@@ -2727,11 +2824,12 @@ public:
         if (!sameParagraph)
           value += L"\r\n";
         else if (!iswspace(value.back()) && !iswspace(content.front()) &&
-                 !cjkBoundary(value.back()) && !cjkBoundary(content.front()))
+                 displaySeamNeedsSpace(previousEdge, edges.first))
           value += L' ';
       }
       value += content;
       previous = &record;
+      previousEdge = edges.second;
     }
     return value;
   }
@@ -4383,6 +4481,51 @@ public:
           output(false) == L"第一句。第二句。\r\n新的段落。\r\n另一个块。\r\n历史独立段。");
     check("same_paragraph_English_sentences_keep_one_space",
           output(true) == L"First sentence. Second sentence.\r\nNew paragraph.\r\nOther block.\r\nLegacy source.");
+    const auto paragraphFixtureRecords = records;
+    struct SeamCase { const char *left, *right; const wchar_t *expected; };
+    const SeamCase seamCases[] = {
+        {"构建已完成。", "Run smoke tests next.", L"构建已完成。 Run smoke tests next."},
+        {"Ready.", "下一句。", L"Ready. 下一句。"},
+        {"中文", "ASCII123", L"中文 ASCII123"},
+        {"v2", "中文", L"v2 中文"},
+        {"第一句。", "第二句。", L"第一句。第二句。"},
+        {"**Ready.**", "下一句。", L"**Ready.** 下一句。"},
+        {"构建完成。", "`Run` smoke tests.", L"构建完成。 `Run` smoke tests."}};
+    bool allSeams = true, immutableSeams = true;
+    const auto beforeSeamSubmit = worker->submitted.load();
+    const auto beforeSeamGeneration = generation;
+    for (const auto &test : seamCases) {
+      records = {layoutRecord("Stable source A.", test.left, "seam-fixture", 0),
+                 layoutRecord("Stable source B.", test.right, "seam-fixture", 0)};
+      records[0].pendingReplacement = true;
+      records[0].state = "translating";
+      const auto beforeSeamRecords = taskPayload()["records"];
+      const auto firstVersion = records[0].version, secondVersion = records[1].version;
+      allSeams = allSeams && output(false) == test.expected;
+      immutableSeams = immutableSeams && taskPayload()["records"] == beforeSeamRecords &&
+          records[0].version == firstVersion && records[1].version == secondVersion &&
+          records[0].pendingReplacement;
+    }
+    check("cross_record_CJK_ASCII_and_sentence_seams_are_readable_without_spacing_CJK_prose",
+          allSeams);
+    check("display_seam_repair_keeps_raw_records_versions_pending_state_and_queue_unchanged",
+          immutableSeams && worker->submitted.load() == beforeSeamSubmit &&
+              generation == beforeSeamGeneration);
+    const std::string gluedFixture = "Rerunning.Run build.cmd --tests.No output. "
+        "https://Example.com/Run.Build?v=1.2.3 C:\\Work\\App.exe src/main.cpp "
+        "v1.2.3 3.14 Dr.Smith e.g.Tools U.S.A.Paths `build.cmd --tests`";
+    records = {layoutRecord(gluedFixture, gluedFixture, "raw-token-fixture", 0)};
+    const auto rawTokenRecords = taskPayload()["records"];
+    const auto rawTokenVersion = records[0].version;
+    refresh();
+    check("refresh_does_not_guess_internal_sentence_boundaries_or_rewrite_protected_tokens",
+          output(true) == wide(gluedFixture) && output(false) == wide(gluedFixture) &&
+              records[0].source == gluedFixture && records[0].translation == gluedFixture &&
+              records[0].version == rawTokenVersion &&
+              taskPayload()["records"] == rawTokenRecords &&
+              generation == beforeSeamGeneration &&
+              worker->submitted.load() == beforeSeamSubmit);
+    records = paragraphFixtureRecords;
     records[0].translation = "\r\n\n第一句。\r\n";
     records[1].translation = "\n第二句。\n\n";
     check("display_removes_empty_edge_lines_without_changing_cached_translation",
@@ -4443,6 +4586,191 @@ public:
               renderedBodies[translationEdit].replacements == beforeFontReplace &&
               updatedStyle.yHeight == settings.font_size * 20);
     settings.font_size = layoutFont;
+    auto rectWidth = [](const RECT &rect) { return rect.right - rect.left; };
+    const auto wideGeometry = readingGeometry(s(2400), s(800), false);
+    const auto normalGeometry = readingGeometry(s(1040), s(800), false);
+    const auto narrowGeometry = readingGeometry(s(680), s(800), false);
+    check("wide_single_reading_column_is_capped_at_760_DIP_and_centered",
+          rectWidth(wideGeometry.translated) == s(760) &&
+              abs(wideGeometry.translated.left + wideGeometry.translated.right - s(2400)) <= 1);
+    check("normal_single_reading_column_stays_centered_with_same_cap",
+          rectWidth(normalGeometry.translated) == s(760) &&
+              abs(normalGeometry.translated.left + normalGeometry.translated.right - s(1040)) <= 1);
+    check("narrow_single_column_shrinks_with_client_area",
+          narrowGeometry.translated.left == s(16) &&
+              narrowGeometry.translated.right == s(680) - s(16));
+    const auto wideDual = readingGeometry(s(2400), s(800), true);
+    const auto narrowDual = readingGeometry(s(680), s(800), true);
+    const auto leftRegion = (s(2400) - 2 * s(16) - s(10)) / 2;
+    check("wide_dual_columns_are_capped_and_centered_in_each_half",
+          rectWidth(wideDual.source) == s(760) &&
+              rectWidth(wideDual.translated) == s(760) &&
+              abs(wideDual.source.left + wideDual.source.right -
+                  (2 * s(16) + leftRegion)) <= 1 &&
+              wideDual.source.right < wideDual.separator &&
+              wideDual.translated.left > wideDual.separator);
+    check("narrow_dual_columns_fit_without_crossing_the_separator",
+          narrowDual.source.left == s(16) &&
+              narrowDual.translated.right == s(680) - s(16) &&
+              narrowDual.source.right < narrowDual.separator &&
+              narrowDual.translated.left > narrowDual.separator);
+    RECT outerBefore{};
+    GetWindowRect(hwnd, &outerBefore);
+    const bool translatedFollowBefore = followingTranslation;
+    std::string wrapFixture;
+    for (int line = 0; line < 20; ++line) {
+      for (int word = 0; word < 24; ++word)
+        wrapFixture += "Readable paragraph content stays within a comfortable column. ";
+      wrapFixture += "\n";
+    }
+    records = {layoutRecord(wrapFixture, wrapFixture, "reading-width-fixture", 0)};
+    followingSource = followingTranslation = true;
+    settings.show_original = false;
+    SetWindowPos(hwnd, nullptr, 0, 0, s(1800), s(760),
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    render();
+    const auto beforeViewportPayload = taskPayload()["records"];
+    const auto beforeViewportGeneration = generation;
+    const auto beforeViewportSource = sourceGeneration;
+    const auto beforeViewportSubmit = worker->submitted.load();
+    const auto wideLines = SendMessageW(translationEdit, EM_GETLINECOUNT, 0, 0);
+    SetWindowPos(hwnd, nullptr, 0, 0, s(720), s(760),
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    const auto narrowLines = SendMessageW(translationEdit, EM_GETLINECOUNT, 0, 0);
+    auto childRect = [&](HWND child) {
+      RECT rect{};
+      GetWindowRect(child, &rect);
+      MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT *>(&rect), 2);
+      return rect;
+    };
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    const auto narrowPane = childRect(translationEdit);
+    check("720_DIP_window_wraps_body_inside_client_and_keeps_following_bottom",
+          narrowPane.left >= 0 && narrowPane.right <= client.right &&
+              rectWidth(narrowPane) < s(760) && narrowLines > wideLines &&
+              followingTranslation && atBottom(translationEdit));
+    check("720_DIP_header_and_toolbar_controls_do_not_overlap_or_overflow",
+          childRect(taskLabel).right < childRect(providerLabel).left &&
+              childRect(topCheck).right < childRect(settingsButton).left &&
+              childRect(combo).right < childRect(refreshButton).left &&
+              childRect(pauseButton).right <= client.right &&
+              childRect(countLabel).right <= client.right);
+    settings.show_original = true;
+    layout();
+    check("720_DIP_dual_RichEdit_columns_stay_inside_separate_halves",
+          childRect(sourceEdit).left >= 0 &&
+              childRect(sourceEdit).right < childRect(translationEdit).left &&
+              childRect(translationEdit).right <= client.right);
+    settings.show_original = false;
+    layout();
+    followingTranslation = false;
+    SendMessageW(translationEdit, WM_VSCROLL, SB_TOP, 0);
+    SendMessageW(translationEdit, EM_LINESCROLL, 0, 6);
+    CHARRANGE refreshSelection{3, 10};
+    SendMessageW(translationEdit, EM_EXSETSEL, 0,
+                 reinterpret_cast<LPARAM>(&refreshSelection));
+    POINT beforeRefreshScroll{};
+    SendMessageW(translationEdit, EM_GETSCROLLPOS, 0,
+                 reinterpret_cast<LPARAM>(&beforeRefreshScroll));
+    const auto beforeRefreshText = textOf(translationEdit);
+    const auto beforeRefreshReplacements = renderedBodies[translationEdit].replacements;
+    const auto beforeRefreshFormats = renderedBodies[translationEdit].formats;
+    RECT expectedFormatRect{};
+    SendMessageW(translationEdit, EM_GETRECT, 0,
+                 reinterpret_cast<LPARAM>(&expectedFormatRect));
+    CHARFORMAT2W staleText{};
+    staleText.cbSize = sizeof(staleText);
+    staleText.dwMask = CFM_COLOR;
+    staleText.crTextColor = RGB(0, 0, 0);
+    SendMessageW(translationEdit, EM_SETCHARFORMAT, SCF_ALL,
+                 reinterpret_cast<LPARAM>(&staleText));
+    CHARRANGE allBody{0, -1};
+    SendMessageW(translationEdit, EM_EXSETSEL, 0,
+                 reinterpret_cast<LPARAM>(&allBody));
+    PARAFORMAT2 staleParagraph{};
+    staleParagraph.cbSize = sizeof(staleParagraph);
+    staleParagraph.dwMask = PFM_ALIGNMENT;
+    staleParagraph.wAlignment = PFA_CENTER;
+    SendMessageW(translationEdit, EM_SETPARAFORMAT, 0,
+                 reinterpret_cast<LPARAM>(&staleParagraph));
+    SendMessageW(translationEdit, EM_SETZOOM, 3, 2);
+    SendMessageW(translationEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                 MAKELPARAM(s(40), s(40)));
+    RECT staleFormatRect{0, 0, s(180), s(400)};
+    SendMessageW(translationEdit, EM_SETRECT, 0,
+                 reinterpret_cast<LPARAM>(&staleFormatRect));
+    SendMessageW(translationEdit, EM_EXSETSEL, 0,
+                 reinterpret_cast<LPARAM>(&refreshSelection));
+    // Preserve the caller's selected viewport even while an enumeration is in flight.
+    SendMessageW(translationEdit, EM_SETSCROLLPOS, 0,
+                 reinterpret_cast<LPARAM>(&beforeRefreshScroll));
+    const bool wasRefreshing = refreshing;
+    const auto beforeLocalRefreshTicket = refreshGeneration;
+    refreshing = true;
+    SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(IDC_REFRESH, BN_CLICKED),
+                 reinterpret_cast<LPARAM>(refreshButton));
+    CHARRANGE afterRefreshSelection{};
+    POINT afterRefreshScroll{};
+    SendMessageW(translationEdit, EM_EXGETSEL, 0,
+                 reinterpret_cast<LPARAM>(&afterRefreshSelection));
+    SendMessageW(translationEdit, EM_GETSCROLLPOS, 0,
+                 reinterpret_cast<LPARAM>(&afterRefreshScroll));
+    CHARFORMAT2W restoredText{};
+    restoredText.cbSize = sizeof(restoredText);
+    SendMessageW(translationEdit, EM_GETCHARFORMAT, SCF_SELECTION,
+                 reinterpret_cast<LPARAM>(&restoredText));
+    PARAFORMAT2 restoredParagraph{};
+    restoredParagraph.cbSize = sizeof(restoredParagraph);
+    SendMessageW(translationEdit, EM_GETPARAFORMAT, 0,
+                 reinterpret_cast<LPARAM>(&restoredParagraph));
+    RECT restoredFormatRect{};
+    SendMessageW(translationEdit, EM_GETRECT, 0,
+                 reinterpret_cast<LPARAM>(&restoredFormatRect));
+    int zoomNumerator = 0, zoomDenominator = 0;
+    SendMessageW(translationEdit, EM_GETZOOM,
+                 reinterpret_cast<WPARAM>(&zoomNumerator),
+                 reinterpret_cast<LPARAM>(&zoomDenominator));
+    check("refresh_restores_char_paragraph_zoom_and_current_reading_margins",
+          restoredText.crTextColor == cclive::text_layout_palette.body &&
+              restoredText.yHeight == settings.font_size * 20 &&
+              restoredParagraph.wAlignment == PFA_LEFT &&
+              zoomNumerator == 1 && zoomDenominator == 1 &&
+              abs(restoredFormatRect.left - expectedFormatRect.left) <= 1 &&
+              abs(restoredFormatRect.right - expectedFormatRect.right) <= 1);
+    check("refresh_reformats_same_text_without_replacement_translation_or_enumeration",
+          IsWindowEnabled(refreshButton) &&
+              renderedBodies[translationEdit].formats == beforeRefreshFormats + 1 &&
+              renderedBodies[translationEdit].replacements == beforeRefreshReplacements &&
+              textOf(translationEdit) == beforeRefreshText &&
+              taskPayload()["records"] == beforeViewportPayload &&
+              generation == beforeViewportGeneration && sourceGeneration == beforeViewportSource &&
+              worker->submitted.load() == beforeViewportSubmit &&
+              refreshGeneration == beforeLocalRefreshTicket && refreshing);
+    check("refresh_preserves_manual_scroll_selection_and_follow_choice",
+          !followingTranslation &&
+              afterRefreshSelection.cpMin == refreshSelection.cpMin &&
+              afterRefreshSelection.cpMax == refreshSelection.cpMax &&
+              abs(afterRefreshScroll.y - beforeRefreshScroll.y) <= 2);
+    refreshing = wasRefreshing;
+    SetWindowPos(hwnd, nullptr, 0, 0, s(1800), s(760),
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    check("resize_after_manual_reading_keeps_selection_and_follow_disabled",
+          !followingTranslation && textOf(translationEdit) == beforeRefreshText);
+    followingTranslation = true;
+    SetWindowPos(hwnd, nullptr, 0, 0, s(720), s(760),
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    check("resize_rewrap_keeps_explicit_follow_at_the_new_bottom",
+          followingTranslation && atBottom(translationEdit) &&
+              taskPayload()["records"] == beforeViewportPayload &&
+              generation == beforeViewportGeneration &&
+              worker->submitted.load() == beforeViewportSubmit);
+    settings.show_original = layoutOriginal;
+    followingSource = layoutFollowing;
+    followingTranslation = translatedFollowBefore;
+    SetWindowPos(hwnd, nullptr, outerBefore.left, outerBefore.top,
+                 outerBefore.right - outerBefore.left, outerBefore.bottom - outerBefore.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
     settings.show_original = layoutOriginal;
     followingSource = layoutFollowing;
     clear();
@@ -4581,6 +4909,63 @@ public:
               records[0].layoutBlock == "layout-cache-block" &&
               records[0].layoutParagraph == 3 && records[1].layoutParagraph == 0 &&
               output(false) == L"第一句缓存译文。\r\n第二句缓存译文。");
+    // Use the real Ledger path: the reader restores paragraph boundaries while
+    // the existing sentence strings and subtitle slots remain unchanged.
+    const std::string repairTask = "reader-layout-repair-task";
+    const std::vector<std::string> repairSources = {
+        "Rerunning.", "Run build.cmd --tests.", "No output."};
+    accept(taskMeta(repairTask, repairSources));
+    cclive::Ledger repairLedger(0);
+    json repairSnapshot = {{"context", repairTask},
+        {"blocks", json::array({{{"key", "reader-shaped-answer"},
+                                  {"kind", "answer"},
+                                  {"text", "Rerunning.\nRun build.cmd --tests.\nNo output."}}})}};
+    auto acceptRepairEvents = [&](const std::vector<json> &events) {
+      for (auto event : events) {
+        event["task_id"] = repairTask;
+        event["_generation"] = sourceGeneration;
+        accept(std::move(event));
+      }
+    };
+    acceptRepairEvents(repairLedger.observe(repairSnapshot));
+    complete(0, "正在重新运行。");
+    complete(1, "Run build.cmd --tests.");
+    complete(2, "没有输出。");
+    check("reader_shaped_single_LF_fixture_has_three_existing_sentences_in_one_paragraph",
+          records.size() == 3 &&
+              std::all_of(records.begin(), records.end(), [](const Record &record) {
+                return record.hasLayout && record.layoutParagraph == 0;
+              }) &&
+              output(false) == L"正在重新运行。 Run build.cmd --tests. 没有输出。");
+    auto immutableTranslationState = [&] {
+      json state = json::array();
+      for (const auto &record : records)
+        state.push_back({{"key", record.key}, {"source", record.source},
+                         {"translation", record.translation},
+                         {"source_signature", record.sourceSignature},
+                         {"version", record.version}, {"state", record.state},
+                         {"pending", record.pendingReplacement}});
+      return state;
+    };
+    const auto beforeRepairState = immutableTranslationState();
+    const auto beforeRepairSubmit = worker->submitted.load();
+    const auto beforeRepairGeneration = generation;
+    const auto beforeRepairSourceGeneration = sourceGeneration;
+    repairSnapshot["blocks"][0]["text"] =
+        "Rerunning.\n\nRun build.cmd --tests.\n\nNo output.";
+    const auto paragraphOnlyEvents = repairLedger.observe(repairSnapshot);
+    acceptRepairEvents(paragraphOnlyEvents);
+    refresh();
+    check("reader_paragraph_only_events_and_refresh_restore_three_visible_paragraphs",
+          paragraphOnlyEvents.size() == 2 && records.size() == 3 &&
+              records[0].layoutParagraph == 0 && records[1].layoutParagraph == 1 &&
+              records[2].layoutParagraph == 2 &&
+              output(false) == L"正在重新运行。\r\nRun build.cmd --tests.\r\n没有输出。");
+    check("reader_layout_repair_preserves_existing_translation_keys_versions_and_queue",
+          immutableTranslationState() == beforeRepairState &&
+              generation == beforeRepairGeneration &&
+              sourceGeneration == beforeRepairSourceGeneration &&
+              worker->submitted.load() == beforeRepairSubmit);
     const std::string taskA = "test-task-A", taskB = "test-task-B";
     const std::string sourceA = "First source for task A.",
                       sourceA2 = "Second source for task A.";
@@ -5117,7 +5502,7 @@ public:
       return 0;
     case WM_GETMINMAXINFO: {
       auto *p = (MINMAXINFO *)lp;
-      p->ptMinTrackSize = {a->s(920), a->s(640)};
+      p->ptMinTrackSize = {a->s(720), a->s(640)};
       return 0;
     }
     case WM_DPICHANGED: {

@@ -66,7 +66,15 @@ int main(){
         rejects([]{to_wide(std::string("\xff"));},"Invalid UTF8 rejected");
         auto folder=std::filesystem::path(L"work")/L"cpp-core-tests";std::filesystem::create_directories(folder);auto config=folder/L"settings.json";
         std::error_code ignored;std::filesystem::remove(config,ignored);
-        check(load_settings(config).provider=="google","Missing config defaults");
+        check(Settings{}.font_size==12,"Fresh settings default to 12 point text");
+        const auto missing=load_settings(config);
+        check(missing.provider=="google"&&missing.font_size==12,"Missing configuration uses default 12 point text");
+        {std::ofstream out(config);out<<R"({"provider":"google","show_original":true})";}
+        const auto missing_font=load_settings(config);
+        check(missing_font.font_size==12&&missing_font.show_original,"Existing configuration without font field receives 12 point default");
+        {std::ofstream out(config);out<<R"({"font_size":10})";}
+        const auto explicit_ten=load_settings(config);save_settings(config,explicit_ten);
+        check(explicit_ten.font_size==10&&load_settings(config).font_size==10,"Explicit existing 10 point text is preserved through load and save");
         Settings s;s.provider="openai";s.model="翻译模型";s.api_key_env="CCLIVE_TEST_KEY";s.show_original=false;s.always_on_top=true;s.font_size=16;
         SetEnvironmentVariableW(L"CCLIVE_TEST_KEY",L"NEVER_SAVE_THIS_KEY");save_settings(config,s);auto loaded=load_settings(config);
         check(loaded.provider==s.provider&&loaded.model==s.model&&loaded.api_key_env==s.api_key_env&&loaded.font_size==16&&!loaded.show_original&&loaded.always_on_top,"Atomic config roundtrip");

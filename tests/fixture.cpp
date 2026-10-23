@@ -29,6 +29,7 @@ std::atomic<int> identity_reads{0};
 std::mutex identity_mutex;
 std::wstring identity_url;
 bool stream_list_mode = false, semantic_list_mode = false;
+bool response_structure_mode = false, row_structure_mode = false, semantic_structure_mode = false, nested_structure_mode = false;
 HWND stream_article = nullptr, stream_heading = nullptr;
 std::wstring decode_utf8(const std::string& value) {
     const int size = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
@@ -63,11 +64,14 @@ void reload() {
 class FeedProvider final : public IRawElementProviderSimple, public IValueProvider {
     std::atomic<ULONG> refs_{1};
     HWND hwnd_;
-    bool article_, list_item_, document_;
+    bool article_, list_item_, document_, status_, tool_, paragraph_;
     int heading_level_ = -1;
 public:
     explicit FeedProvider(HWND hwnd) : hwnd_(hwnd) {
         wchar_t name[64]{}; GetClassNameW(hwnd, name, 64); article_ = std::wstring(name) == L"CCLiveFixtureArticle"; list_item_ = std::wstring(name) == L"CCLiveFixtureRichItem"; document_ = std::wstring(name) == L"CCLiveFixtureDocument";
+        status_ = std::wstring(name) == L"CCLiveFixtureStatus";
+        tool_ = std::wstring(name) == L"CCLiveFixtureTool";
+        paragraph_ = std::wstring(name) == L"CCLiveFixtureParagraph";
         const std::wstring class_name(name);
         const std::wstring heading_prefix = L"CCLiveFixtureHeading";
         if (class_name.find(heading_prefix) == 0 && class_name.size() == heading_prefix.size() + 1) heading_level_ = class_name.back() - L'0';
@@ -102,9 +106,9 @@ public:
     HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID property, VARIANT* result) override {
         if (!result) return E_POINTER;
         VariantInit(result);
-        if (property == UIA_AriaRolePropertyId) { result->vt = VT_BSTR; result->bstrVal = SysAllocString(heading_level_ >= 0 ? L"heading" : document_ ? L"document" : list_item_ ? L"listitem" : article_ ? L"article" : L"feed"); }
-        else if (property == UIA_ControlTypePropertyId) { result->vt = VT_I4; result->lVal = heading_level_ >= 0 ? UIA_TextControlTypeId : document_ ? UIA_DocumentControlTypeId : list_item_ ? UIA_ListItemControlTypeId : UIA_GroupControlTypeId; }
-        else if (property == UIA_NamePropertyId && (list_item_ || document_ || heading_level_ >= 0)) { wchar_t text[1024]{}; GetWindowTextW(hwnd_, text, 1024); result->vt = VT_BSTR; result->bstrVal = SysAllocString(text); }
+        if (property == UIA_AriaRolePropertyId) { result->vt = VT_BSTR; result->bstrVal = SysAllocString(heading_level_ >= 0 ? L"heading" : document_ ? L"document" : status_ ? L"status" : paragraph_ ? L"paragraph" : tool_ ? L"group" : list_item_ ? L"listitem" : article_ ? L"article" : L"feed"); }
+        else if (property == UIA_ControlTypePropertyId) { result->vt = VT_I4; result->lVal = heading_level_ >= 0 ? UIA_TextControlTypeId : document_ ? UIA_DocumentControlTypeId : status_ ? UIA_StatusBarControlTypeId : list_item_ ? UIA_ListItemControlTypeId : UIA_GroupControlTypeId; }
+        else if (property == UIA_NamePropertyId && (list_item_ || document_ || status_ || tool_ || heading_level_ >= 0)) { wchar_t text[1024]{}; GetWindowTextW(hwnd_, text, 1024); result->vt = VT_BSTR; result->bstrVal = SysAllocString(text); }
         else if (property == UIA_HeadingLevelPropertyId && heading_level_ >= 0) { result->vt = VT_I4; result->lVal = 80050 + heading_level_; }
         else if (property == UIA_IsControlElementPropertyId || property == UIA_IsContentElementPropertyId) { result->vt = VT_BOOL; result->boolVal = VARIANT_TRUE; }
         return S_OK;
@@ -122,6 +126,55 @@ LRESULT CALLBACK feed_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam
 }
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == WM_CREATE) {
+        if (response_structure_mode) {
+            HWND response = nullptr;
+            if (row_structure_mode) {
+                const HWND feed = CreateWindowExW(0, L"CCLiveFixtureFeed", L"Conversation", WS_CHILD | WS_VISIBLE, 0, 0, 630, 1000, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                const HWND article = CreateWindowExW(0, L"article", L"消息 2", WS_CHILD | WS_VISIBLE, 0, 0, 620, 40, feed, nullptr, GetModuleHandleW(nullptr), nullptr);
+                CreateWindowExW(0, L"STATIC", L"Claude responded:", WS_CHILD | WS_VISIBLE, 0, 0, 600, 30, article, nullptr, GetModuleHandleW(nullptr), nullptr);
+                response = CreateWindowExW(0, L"CCLiveFixtureBlock", L"", WS_CHILD | WS_VISIBLE, 0, 45, 620, 920, feed, nullptr, GetModuleHandleW(nullptr), nullptr);
+            } else {
+                const HWND assistant = CreateWindowExW(0, semantic_structure_mode ? L"assistant-message" : L"BUTTON", semantic_structure_mode ? L"" : L"Assistant message", WS_CHILD | WS_VISIBLE | (semantic_structure_mode ? 0 : BS_GROUPBOX), 0, 0, 630, 1000, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                if (!semantic_structure_mode) CreateWindowExW(0, L"STATIC", L"Claude responded:", WS_CHILD | WS_VISIBLE, 0, 0, 600, 30, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+                response = CreateWindowExW(0, L"font-claude-response", L"", WS_CHILD | WS_VISIBLE, 0, 32, 620, 940, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            }
+            if (nested_structure_mode) response = CreateWindowExW(0, L"CCLiveFixtureBlock", L"", WS_CHILD | WS_VISIBLE, 0, 0, 610, 930, response, nullptr, GetModuleHandleW(nullptr), nullptr);
+            auto paragraph = [&](int y) {
+                const HWND row = row_structure_mode ? CreateWindowExW(0, L"group/message-row", L"", WS_CHILD | WS_VISIBLE, 0, y, 610, 120, response, nullptr, GetModuleHandleW(nullptr), nullptr) : response;
+                // Generic raw groups stand in for P nodes flattened by ControlView.
+                return CreateWindowExW(0, nested_structure_mode ? L"CCLiveFixtureParagraph" : L"CCLiveFixtureBlock", L"", WS_CHILD | WS_VISIBLE, 0, row_structure_mode ? 0 : y, 600, 110, row, nullptr, GetModuleHandleW(nullptr), nullptr);
+            };
+            auto text = [&](HWND parent, const wchar_t* value, int x = 0, int y = 0) {
+                return CreateWindowExW(0, L"STATIC", value, WS_CHILD | WS_VISIBLE | SS_NOPREFIX, x, y, 590, 24, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+            };
+            text(paragraph(0), L"First paragraph has no sentence-ending punctuation");
+            const HWND inline_p = paragraph(125);
+            text(inline_p, L"An ");
+            const HWND strong = CreateWindowExW(0, L"CCLiveFixtureInline", L"", WS_CHILD | WS_VISIBLE, 0, 25, 590, 24, inline_p, nullptr, GetModuleHandleW(nullptr), nullptr);
+            text(strong, L"im"); text(inline_p, L"plementation", 0, 50); text(inline_p, L" ", 0, 75);
+            const HWND code = CreateWindowExW(0, L"CCLiveFixtureInline", L"", WS_CHILD | WS_VISIBLE, 0, 76, 590, 24, inline_p, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND code_text = text(code, L"path");
+            const HFONT mono = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, L"Consolas");
+            SendMessageW(code_text, WM_SETFONT, reinterpret_cast<WPARAM>(mono), FALSE);
+            text(inline_p, L" remains intact.", 0, 100);
+            const HWND chinese = paragraph(250);
+            text(chinese, L"中文"); text(chinese, L"行内", 0, 25); text(chinese, L"文字", 0, 50);
+            text(paragraph(375), L"I ran 3 commands to verify the project. 正文解释：已运行 3 个命令来验证项目。");
+            const HWND tool = CreateWindowExW(0, L"CCLiveFixtureTool", L"已运行 2 个命令, 已创建 fixture.txt", WS_CHILD | WS_VISIBLE, 0, 500, 600, 100, response, nullptr, GetModuleHandleW(nullptr), nullptr);
+            text(tool, L"已运行 2 个命令"); text(tool, L", 已创建", 0, 25);
+            CreateWindowExW(0, L"BUTTON", L"fixture.txt", WS_CHILD | WS_VISIBLE, 0, 50, 200, 24, tool, nullptr, GetModuleHandleW(nullptr), nullptr);
+            text(tool, L"新增 30，删除 0", 220, 50);
+            CreateWindowExW(0, L"BUTTON", L"已运行 2 个命令, 已创建 fixture.txt", WS_CHILD | WS_VISIBLE, 0, 75, 580, 24, tool, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND status = CreateWindowExW(0, L"CCLiveFixtureStatus", L"", WS_CHILD | WS_VISIBLE, 0, 605, 600, 24, response, nullptr, GetModuleHandleW(nullptr), nullptr);
+            text(status, L"已运行 2 个命令, 已创建 fixture.txt");
+            const HWND action = CreateWindowExW(0, L"CCLiveFixtureTool", L"Inspecting project files", WS_CHILD | WS_VISIBLE, 0, 635, 600, 60, response, nullptr, GetModuleHandleW(nullptr), nullptr);
+            text(action, L"Inspecting project files");
+            CreateWindowExW(0, L"BUTTON", L"Inspecting project files", WS_CHILD | WS_VISIBLE, 0, 28, 580, 24, action, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND action_status = CreateWindowExW(0, L"CCLiveFixtureStatus", L"", WS_CHILD | WS_VISIBLE, 0, 700, 600, 24, response, nullptr, GetModuleHandleW(nullptr), nullptr);
+            text(action_status, L"Inspecting project files");
+            text(paragraph(730), L"Final paragraph without punctuation");
+            return 0;
+        }
         if (heading_mode) {
             const HWND assistant = CreateWindowExW(0, heading_semantic_mode ? L"assistant-message" : L"BUTTON", heading_semantic_mode ? L"" : L"Assistant message",
                 WS_CHILD | WS_VISIBLE | (heading_semantic_mode ? 0 : BS_GROUPBOX), 8, 8, 620, 600, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -310,7 +363,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
                 8, 230, 600, 70, container, nullptr, GetModuleHandleW(nullptr), nullptr);
             CreateWindowExW(0, L"STATIC", L"Second semantic paragraph.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
                 0, 0, 590, 25, next_semantic_paragraph, nullptr, GetModuleHandleW(nullptr), nullptr);
-            CreateWindowExW(0, L"STATIC", L"Inline continuation in that paragraph.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+            CreateWindowExW(0, L"STATIC", L" Inline continuation in that paragraph.", WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
                 0, 30, 590, 25, next_semantic_paragraph, nullptr, GetModuleHandleW(nullptr), nullptr);
             const HWND user_container = CreateWindowExW(0, L"user-message", L"User content", WS_CHILD | WS_VISIBLE,
                 8, 420, 620, 50, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -349,6 +402,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     int count = 0;
     LPWSTR* args = CommandLineToArgvW(GetCommandLineW(), &count);
     if (args && count > 1) source_file = args[1];
+    if (args && count > 2) row_structure_mode = std::wstring(args[2]) == L"--row-structure";
+    if (args && count > 2) semantic_structure_mode = std::wstring(args[2]) == L"--semantic-response-structure";
+    if (args && count > 2) nested_structure_mode = std::wstring(args[2]) == L"--nested-response-structure";
+    if (args && count > 2) response_structure_mode = std::wstring(args[2]) == L"--response-structure" || row_structure_mode || semantic_structure_mode || nested_structure_mode;
     if (args && count > 2) semantic_mode = std::wstring(args[2]) == L"--semantic";
     if (args && count > 2) article_mode = std::wstring(args[2]) == L"--article";
     if (args && count > 2) feed_mode = std::wstring(args[2]) == L"--feed";
@@ -390,6 +447,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     semantic_class.lpszClassName = L"group/copy";
     semantic_class.lpfnWndProc = DefWindowProcW;
     if (!RegisterClassW(&semantic_class)) return 11;
+    semantic_class.lpszClassName = L"CCLiveFixtureBlock";
+    if (!RegisterClassW(&semantic_class)) return 14;
+    semantic_class.lpszClassName = L"CCLiveFixtureInline";
+    if (!RegisterClassW(&semantic_class)) return 15;
+    semantic_class.lpszClassName = L"CCLiveFixtureStatus";
+    semantic_class.lpfnWndProc = feed_proc;
+    if (!RegisterClassW(&semantic_class)) return 16;
+    semantic_class.lpszClassName = L"CCLiveFixtureTool";
+    if (!RegisterClassW(&semantic_class)) return 17;
+    semantic_class.lpszClassName = L"CCLiveFixtureParagraph";
+    if (!RegisterClassW(&semantic_class)) return 18;
     semantic_class.lpszClassName = L"CCLiveFixtureDocument";
     semantic_class.lpfnWndProc = feed_proc;
     if (!RegisterClassW(&semantic_class)) return 12;

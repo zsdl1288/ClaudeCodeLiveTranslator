@@ -23,7 +23,7 @@ struct Settings {
     int settle_ms = 900;
     bool show_original = false;
     bool always_on_top = false;
-    int font_size = 10;
+    int font_size = 12;
     void validate() const;
 };
 Settings load_settings(const std::filesystem::path& path);

@@ -466,6 +466,30 @@ int wmain(int argc, wchar_t** argv) {
             report["checks"].push_back(mode == L"--headings" ? "named assistant preserves explicit UIA heading levels without guessing or duplicating rich list text" : "strict semantic fallback preserves explicit heading levels and complete list body");
             PostMessageW(heading_hwnd, WM_CLOSE, 0, 0); WaitForSingleObject(heading_window.process.hProcess, 2000);
         }
+        for (const std::wstring mode : {L"--response-structure", L"--row-structure", L"--semantic-response-structure", L"--nested-response-structure"}) {
+            Child structure_window;
+            auto structure_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" " + mode;
+            require(CreateProcessW(fixture.c_str(), structure_command.data(), nullptr, nullptr, FALSE, 0, nullptr, fixture.parent_path().c_str(), &startup, &structure_window.process), "response structure fixture could not start");
+            HWND structure_hwnd = nullptr;
+            for (int retry = 0; retry < 50 && !structure_hwnd; ++retry) { Sleep(50); structure_hwnd = find_window(structure_window.process.dwProcessId); }
+            require(structure_hwnd != nullptr, "response structure fixture did not appear");
+            const auto captured = read_once(app, structure_hwnd);
+            auto text = block_text(captured);
+            require(text.find("First paragraph has no sentence-ending punctuation\n\nAn ") != std::string::npos, "one response or sibling message rows flattened distinct punctuation-free paragraphs");
+            text.erase(std::remove(text.begin(), text.end(), '`'), text.end());
+            require(text.find("An implementation path remains intact.") != std::string::npos, "inline word pieces, code or observed whitespace were changed or split into paragraphs");
+            require(text.find("\n\n中文行内文字\n\nI ran 3 commands") != std::string::npos, "CJK inline fragments gained artificial spaces or paragraph boundaries");
+            require(text.find("正文解释：已运行 3 个命令来验证项目。") != std::string::npos, "tool-status filtering removed a genuine explanatory paragraph");
+            require(text.find("已运行 2 个命令") == std::string::npos && text.find("新增 30") == std::string::npos && text.find("fixture.txt") == std::string::npos && text.find("Inspecting project files") == std::string::npos, "tool or repeated live-status summary leaked into assistant prose");
+            require(text.find("Final paragraph without punctuation") != std::string::npos, "tool/status filtering lost the following assistant paragraph");
+            const auto segments = cclive::split_text_segments(text);
+            auto first = std::find_if(segments.begin(), segments.end(), [](const auto& value) { return value.text == "First paragraph has no sentence-ending punctuation"; });
+            auto next = std::find_if(segments.begin(), segments.end(), [](const auto& value) { return value.text == "An implementation path remains intact."; });
+            require(first != segments.end() && next != segments.end() && first->paragraph != next->paragraph, "capture-to-core grouping merged proven paragraph boundaries");
+            require(GetForegroundWindow() != structure_hwnd, "response structure capture activated fixture");
+            report["checks"].push_back(mode == L"--nested-response-structure" ? "confirmed tool region never excludes a shared wrapper containing assistant paragraphs" : mode == L"--row-structure" ? "shared Feed generic ancestors preserve distinct message-row paragraphs and reject tool/status summaries" : mode == L"--response-structure" ? "single font response preserves generic P boundaries, literal inline fragments and genuine command explanations" : "semantic response fallback preserves generic P and inline whitespace while excluding tool/status subtrees");
+            PostMessageW(structure_hwnd, WM_CLOSE, 0, 0); WaitForSingleObject(structure_window.process.hProcess, 2000);
+        }
         fs::remove(input);
         report["passed"] = true;
         std::cout << report.dump(2) << '\n';
