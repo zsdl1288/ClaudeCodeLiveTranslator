@@ -97,6 +97,19 @@ int main(){
             check(legacy.chatgpt_model.empty()&&legacy.baidu_app_id.empty()&&legacy.baidu_key_env=="BAIDU_TRANSLATE_KEY","Older configurations load with empty ChatGPT model and safe Baidu defaults");
             SetEnvironmentVariableW(L"CCLIVE_TEST_BAIDU_KEY",nullptr);std::filesystem::remove(config,ignored);
         }
+        {
+            Settings codex;codex.provider="codex";codex.codex_path="C:\\Synthetic CLI\\codex.exe";codex.codex_model="fixture-model";
+            save_settings(config,codex);const auto restored=load_settings(config);
+            check(restored.provider=="codex"&&restored.codex_path==codex.codex_path&&restored.codex_model==codex.codex_model,"Codex CLI settings roundtrip without touching installed CLI or authentication");
+            check(translation_service_key(codex)=="codex","Codex CLI has an isolated service key");
+            Settings automatic;automatic.provider="codex";automatic.validate();
+            check(automatic.codex_path.empty()&&automatic.codex_model.empty(),"Codex CLI defaults to automatic executable and CLI model");
+            for(const auto& invalid:std::vector<std::string>{"bad\nmodel",std::string("bad\0model",9),"--injected-option",std::string(257,'x')}){auto bad=codex;bad.codex_model=invalid;rejects([&]{bad.validate();},"Invalid Codex model is rejected before subprocess launch");}
+            auto bad=codex;bad.codex_path="C:\\bad\npath.exe";rejects([&]{bad.validate();},"Codex executable path rejects control characters");
+            {std::ofstream legacy(config);legacy<<R"({"provider":"google"})";}
+            const auto legacy=load_settings(config);check(legacy.codex_path.empty()&&legacy.codex_model.empty(),"Older configurations receive empty Codex CLI settings");
+            std::filesystem::remove(config,ignored);
+        }
         check(split_sentences("- First item\n- Second item")==std::vector<std::string>({"- First item","- Second item"}),"Bullet lines without punctuation remain separate");
         check(split_sentences("* First item\n+ Second item\n- Third item")==std::vector<std::string>({"* First item","+ Second item","- Third item"}),"Explicit bullet marker variants remain intact");
         check(split_sentences("## Overview\nThis paragraph wraps\nonto the next line.")==std::vector<std::string>({"## Overview","This paragraph wraps onto the next line."}),"Heading and wrapped body retain separate layout units");

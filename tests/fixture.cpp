@@ -21,7 +21,8 @@ std::string last_text;
 bool semantic_mode = false;
 bool article_mode = false;
 bool feed_mode = false, rich_list_mode = false, identity_mode = false;
-HWND identity_document = nullptr;
+HWND identity_document = nullptr, identity_background_document = nullptr;
+bool identity_multi_mode = false, identity_parent_mode = false;
 bool identity_race_mode = false;
 bool heading_mode = false, heading_semantic_mode = false;
 std::atomic<int> identity_reads{0};
@@ -45,9 +46,11 @@ void reload() {
         const auto split = text.find('\n');
         if (split != std::string::npos) {
             { std::lock_guard<std::mutex> guard(identity_mutex); identity_url = decode_utf8(text.substr(0, split)); }
-            auto title = text.substr(split + 1);
+            const auto body_start = text.find('\n', split + 1);
+            auto title = text.substr(split + 1, body_start == std::string::npos ? std::string::npos : body_start - split - 1);
             while (!title.empty() && (title.back() == '\r' || title.back() == '\n')) title.pop_back();
             if (identity_document) SetWindowTextW(identity_document, decode_utf8(title).c_str());
+            if (body && body_start != std::string::npos) SetWindowTextW(body, decode_utf8(text.substr(body_start + 1)).c_str());
         }
         return;
     }
@@ -90,7 +93,9 @@ public:
     HRESULT STDMETHODCALLTYPE get_Value(BSTR* result) override {
         if (!result) return E_POINTER;
         std::lock_guard<std::mutex> guard(identity_mutex);
-        const auto value = identity_race_mode && identity_reads.fetch_add(1) > 0 ? std::wstring(L"https://claude.ai/epitaxy/local_identity_race_b") : identity_url;
+        const auto value = hwnd_ == identity_background_document
+            ? std::wstring(identity_parent_mode ? L"https://claude.ai/chat/ancestor_aaaa" : L"https://claude.ai/chat/background_aaaa")
+            : identity_race_mode && identity_reads.fetch_add(1) > 0 ? std::wstring(L"https://claude.ai/epitaxy/local_identity_race_b") : identity_url;
         *result = SysAllocString(value.c_str()); return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_IsReadOnly(BOOL* result) override { if (!result) return E_POINTER; *result = TRUE; return S_OK; }
@@ -135,12 +140,28 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             return 0;
         }
         if (identity_mode) {
+            if (identity_multi_mode || identity_parent_mode)
+                identity_background_document = CreateWindowExW(0, L"CCLiveFixtureDocument", L"Separate URL document", WS_CHILD | WS_VISIBLE,
+                    0, 0, 630, 410, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
             identity_document = CreateWindowExW(0, L"CCLiveFixtureDocument", L"Identity fixture - Claude Code", WS_CHILD | WS_VISIBLE,
-                8, 8, 620, 400, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+                8, 8, 620, 400, identity_parent_mode ? identity_background_document : hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND content = identity_parent_mode
+                ? CreateWindowExW(0, L"CCLiveFixtureFeed", L"Current content", WS_CHILD | WS_VISIBLE, 0, 0, 610, 390, identity_document, nullptr, GetModuleHandleW(nullptr), nullptr)
+                : identity_document;
+            if (identity_multi_mode) {
+                // The current document outranks its peer via its own feed anchors,
+                // but its assistant uses the named-message extraction path.
+                CreateWindowExW(0, L"CCLiveFixtureFeed", L"Current feed one", WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, identity_document, nullptr, GetModuleHandleW(nullptr), nullptr);
+                CreateWindowExW(0, L"CCLiveFixtureFeed", L"Current feed two", WS_CHILD | WS_VISIBLE, 2, 0, 1, 1, identity_document, nullptr, GetModuleHandleW(nullptr), nullptr);
+                const HWND peer_feed = CreateWindowExW(0, L"CCLiveFixtureFeed", L"Peer content", WS_CHILD | WS_VISIBLE, 0, 0, 600, 380, identity_background_document, nullptr, GetModuleHandleW(nullptr), nullptr);
+                const HWND peer_assistant = CreateWindowExW(0, L"BUTTON", L"Assistant message", WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 8, 8, 580, 300, peer_feed, nullptr, GetModuleHandleW(nullptr), nullptr);
+                CreateWindowExW(0, L"STATIC", L"Claude responded:", WS_CHILD | WS_VISIBLE, 8, 24, 550, 30, peer_assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+                CreateWindowExW(0, L"STATIC", L"PEER B BODY MUST NOT BE TRANSLATED.", WS_CHILD | WS_VISIBLE, 8, 58, 550, 200, peer_assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            }
             const HWND assistant = CreateWindowExW(0, L"BUTTON", L"Assistant message", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                8, 8, 590, 300, identity_document, nullptr, GetModuleHandleW(nullptr), nullptr);
+                8, 8, 590, 300, content, nullptr, GetModuleHandleW(nullptr), nullptr);
             CreateWindowExW(0, L"STATIC", L"Claude responded:", WS_CHILD | WS_VISIBLE, 8, 24, 550, 30, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
-            CreateWindowExW(0, L"STATIC", L"Identity fixture assistant body.", WS_CHILD | WS_VISIBLE, 8, 58, 550, 200, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            body = CreateWindowExW(0, L"STATIC", L"Identity fixture assistant body.", WS_CHILD | WS_VISIBLE, 8, 58, 550, 200, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
             reload(); SetTimer(hwnd, 1, 100, nullptr); return 0;
         }
         if (rich_list_mode) {
@@ -322,7 +343,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (args && count > 2) article_mode = std::wstring(args[2]) == L"--article";
     if (args && count > 2) feed_mode = std::wstring(args[2]) == L"--feed";
     if (args && count > 2) rich_list_mode = std::wstring(args[2]) == L"--rich-list";
-    if (args && count > 2) identity_mode = std::wstring(args[2]) == L"--identity" || std::wstring(args[2]) == L"--identity-race";
+    if (args && count > 2) identity_multi_mode = std::wstring(args[2]) == L"--identity-multi";
+    if (args && count > 2) identity_parent_mode = std::wstring(args[2]) == L"--identity-parent";
+    if (args && count > 2) identity_mode = std::wstring(args[2]) == L"--identity" || std::wstring(args[2]) == L"--identity-race" || identity_multi_mode || identity_parent_mode;
     if (args && count > 2) identity_race_mode = std::wstring(args[2]) == L"--identity-race";
     if (args && count > 2) stream_list_mode = std::wstring(args[2]) == L"--stream-list";
     if (args && count > 2) semantic_list_mode = std::wstring(args[2]) == L"--semantic-list";

@@ -26,14 +26,17 @@ echo Building embedded application icon...
 "%WINDRES%" -Iresources -Iinclude -O coff -i resources\app.rc -o build-cpp\app-resource.o
 if errorlevel 1 exit /b 1
 echo Building native C++ desktop application...
-"%CXX%" %FLAGS% -municode -mwindows src\main.cpp src\reader.cpp src\core.cpp src\chatgpt.cpp src\task_cache.cpp src\text_layout.cpp build-cpp\app-resource.o -o build-cpp\ClaudeTranslator.exe %LIBS%
+"%CXX%" %FLAGS% -municode -mwindows src\main.cpp src\reader.cpp src\core.cpp src\chatgpt.cpp src\codex_cli.cpp src\task_cache.cpp src\text_layout.cpp build-cpp\app-resource.o -o build-cpp\ClaudeTranslator.exe %LIBS%
 if errorlevel 1 exit /b 1
 if "%RUN_TESTS%"=="0" goto package
 echo Building core regression tests...
-"%CXX%" %FLAGS% tests\core_tests.cpp src\core.cpp src\chatgpt.cpp -o build-cpp\core_tests.exe %LIBS%
+"%CXX%" %FLAGS% tests\core_tests.cpp src\core.cpp src\chatgpt.cpp src\codex_cli.cpp -o build-cpp\core_tests.exe %LIBS%
 if errorlevel 1 exit /b 1
 echo Building ChatGPT account and protocol regression tests...
-"%CXX%" %FLAGS% -DCCLIVE_CHATGPT_TESTING tests\chatgpt_tests.cpp src\chatgpt.cpp src\core.cpp -o build-cpp\chatgpt_tests.exe %LIBS%
+"%CXX%" %FLAGS% -DCCLIVE_CHATGPT_TESTING tests\chatgpt_tests.cpp src\chatgpt.cpp src\codex_cli.cpp src\core.cpp -o build-cpp\chatgpt_tests.exe %LIBS%
+if errorlevel 1 exit /b 1
+echo Building Codex CLI protocol and process regression tests...
+"%CXX%" %FLAGS% -DCCLIVE_CODEX_CLI_TESTING -municode tests\codex_cli_tests.cpp src\codex_cli.cpp src\core.cpp src\chatgpt.cpp -o build-cpp\codex_cli_tests.exe %LIBS%
 if errorlevel 1 exit /b 1
 echo Building task cache regression tests...
 "%CXX%" %FLAGS% tests\task_cache_tests.cpp src\task_cache.cpp -o build-cpp\task_cache_tests.exe %LIBS%
@@ -47,12 +50,14 @@ echo Building read-only accessibility fixture...
 if errorlevel 1 exit /b 1
 if not exist tests\reader_smoke.cpp goto run_tests
 echo Building accessibility smoke test...
-"%CXX%" %FLAGS% -municode tests\reader_smoke.cpp src\core.cpp src\chatgpt.cpp -o build-cpp\reader_smoke.exe %LIBS%
+"%CXX%" %FLAGS% -municode tests\reader_smoke.cpp src\core.cpp src\chatgpt.cpp src\codex_cli.cpp -o build-cpp\reader_smoke.exe %LIBS%
 if errorlevel 1 exit /b 1
 :run_tests
 build-cpp\core_tests.exe
 if errorlevel 1 exit /b 1
 build-cpp\chatgpt_tests.exe
+if errorlevel 1 exit /b 1
+build-cpp\codex_cli_tests.exe
 if errorlevel 1 exit /b 1
 build-cpp\task_cache_tests.exe
 if errorlevel 1 exit /b 1

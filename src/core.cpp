@@ -5,6 +5,7 @@
 #include <wincrypt.h>
 #include "core.hpp"
 #include "chatgpt.hpp"
+#include "codex_cli.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -301,15 +302,15 @@ std::string to_utf8(const std::wstring& s) {
     std::string out(n,'\0'); WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,s.data(),static_cast<int>(s.size()),out.data(),n,nullptr,nullptr);return out;
 }
 std::string translation_service_key(const Settings& settings) {
-    if(settings.provider=="google"||settings.provider=="demo"||settings.provider=="baidu"||settings.provider=="chatgpt")return settings.provider;
-    if(settings.provider!="openai"&&settings.provider!="ollama")throw TranslationError("翻译服务须为 google、openai、ollama、baidu、chatgpt 或 demo。");
+    if(settings.provider=="google"||settings.provider=="demo"||settings.provider=="baidu"||settings.provider=="chatgpt"||settings.provider=="codex")return settings.provider;
+    if(settings.provider!="openai"&&settings.provider!="ollama")throw TranslationError("翻译服务须为 google、openai、ollama、baidu、chatgpt、codex 或 demo。");
     auto destination=crack(endpoint(settings));
     std::transform(destination.host.begin(),destination.host.end(),destination.host.begin(),[](wchar_t c){return static_cast<wchar_t>(towlower(c));});
     return settings.provider+"|"+(destination.secure?"https://":"http://")+to_utf8(destination.host)+":"+
            std::to_string(destination.port)+to_utf8(destination.path);
 }
 void Settings::validate() const {
-    if(provider!="google"&&provider!="openai"&&provider!="ollama"&&provider!="baidu"&&provider!="chatgpt"&&provider!="demo")throw TranslationError("翻译服务须为 google、openai、ollama、baidu、chatgpt 或 demo。");
+    if(provider!="google"&&provider!="openai"&&provider!="ollama"&&provider!="baidu"&&provider!="chatgpt"&&provider!="codex"&&provider!="demo")throw TranslationError("翻译服务须为 google、openai、ollama、baidu、chatgpt、codex 或 demo。");
     if(settle_ms<100||settle_ms>10000)throw TranslationError("翻译等待时间须在 100 到 10000 毫秒之间。");
     if(font_size<8||font_size>40)throw TranslationError("字号须在 8 到 40 之间。");
     if(trim(target).empty()||to_wide(target).size()>80)throw TranslationError("请填写有效的目标语言。");
@@ -318,6 +319,9 @@ void Settings::validate() const {
     if(!baidu_app_id.empty()&&(baidu_app_id.size()>64||!std::all_of(baidu_app_id.begin(),baidu_app_id.end(),[](unsigned char c){return c>='0'&&c<='9';})))throw TranslationError("百度翻译 APP ID 须为开放平台提供的数字标识。");
     if(provider=="baidu")baidu_target(target);
     if(base_url.size()>2048||model.size()>256||chatgpt_model.size()>256)throw TranslationError("翻译服务地址或模型名称过长。");
+    if(codex_path.size()>32700||codex_model.size()>256)throw TranslationError("Codex CLI 路径或模型名称过长。");
+    auto control=[](const std::string& value){return std::any_of(value.begin(),value.end(),[](unsigned char c){return c<32||c==127;});};
+    if(control(codex_path)||control(codex_model)||(!codex_model.empty()&&codex_model.front()=='-'))throw TranslationError("Codex CLI 路径或模型名称包含无效字符。");
 }
 Settings load_settings(const std::filesystem::path& path) {
     if(!std::filesystem::exists(path))return {};
@@ -329,13 +333,13 @@ Settings load_settings(const std::filesystem::path& path) {
     auto str=[&](const char* k,std::string& v){if(j.contains(k)){if(!j[k].is_string())throw TranslationError(std::string("配置项 ")+k+" 的类型不正确。");v=j[k].get<std::string>();}};
     auto number=[&](const char* k,int& v){if(j.contains(k)){if(!j[k].is_number_integer()||j[k].get<std::int64_t>()<std::numeric_limits<int>::min()||j[k].get<std::int64_t>()>std::numeric_limits<int>::max())throw TranslationError(std::string("配置项 ")+k+" 的类型不正确。");v=j[k].get<int>();}};
     auto boolean=[&](const char* k,bool& v){if(j.contains(k)){if(!j[k].is_boolean())throw TranslationError(std::string("配置项 ")+k+" 的类型不正确。");v=j[k].get<bool>();}};
-    str("provider",s.provider);str("base_url",s.base_url);str("model",s.model);str("api_key_env",s.api_key_env);str("baidu_app_id",s.baidu_app_id);str("baidu_key_env",s.baidu_key_env);str("chatgpt_model",s.chatgpt_model);str("target",s.target);
+    str("provider",s.provider);str("base_url",s.base_url);str("model",s.model);str("api_key_env",s.api_key_env);str("baidu_app_id",s.baidu_app_id);str("baidu_key_env",s.baidu_key_env);str("chatgpt_model",s.chatgpt_model);str("codex_path",s.codex_path);str("codex_model",s.codex_model);str("target",s.target);
     number("settle_ms",s.settle_ms);number("font_size",s.font_size);boolean("show_original",s.show_original);boolean("always_on_top",s.always_on_top);
     s.validate();return s;
 }
 void save_settings(const std::filesystem::path& path,const Settings& s) {
     s.validate();if(!path.parent_path().empty())std::filesystem::create_directories(path.parent_path());
-    json j={{"provider",s.provider},{"base_url",s.base_url},{"model",s.model},{"api_key_env",s.api_key_env},{"baidu_app_id",s.baidu_app_id},{"baidu_key_env",s.baidu_key_env},{"chatgpt_model",s.chatgpt_model},{"target",s.target},{"settle_ms",s.settle_ms},{"font_size",s.font_size},{"show_original",s.show_original},{"always_on_top",s.always_on_top}};
+    json j={{"provider",s.provider},{"base_url",s.base_url},{"model",s.model},{"api_key_env",s.api_key_env},{"baidu_app_id",s.baidu_app_id},{"baidu_key_env",s.baidu_key_env},{"chatgpt_model",s.chatgpt_model},{"codex_path",s.codex_path},{"codex_model",s.codex_model},{"target",s.target},{"settle_ms",s.settle_ms},{"font_size",s.font_size},{"show_original",s.show_original},{"always_on_top",s.always_on_top}};
     static std::atomic<unsigned> counter{0}; auto temporary=path;
     temporary+=L"."+std::to_wstring(GetCurrentProcessId())+L"."+std::to_wstring(++counter)+L".tmp";
     try{
@@ -415,6 +419,7 @@ std::string translate(const Settings& s,const std::string& text,const Delta& del
     std::string result;auto emit=[&](const std::string& value){check_cancel(cancel);if(!value.empty()){if(result.size()+value.size()>max_response)throw TranslationError("译文过长，已停止读取。");result+=value;if(delta)delta(value);check_cancel(cancel);}};
     auto deadline=ticks()+90000;
     if(s.provider=="demo")emit(demo(text));
+    else if(s.provider=="codex")emit(codex_cli::translate(s,text,{},cancel));
     else if(s.provider=="chatgpt") {
         if(trim(s.chatgpt_model).empty())throw TranslationError("请先在设置中选择 ChatGPT 翻译模型。");
         const auto completed=chatgpt::translate(chatgpt::default_account_path(),s.chatgpt_model,s.target,text,emit,cancel);

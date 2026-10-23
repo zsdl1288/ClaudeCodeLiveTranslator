@@ -1,4 +1,4 @@
-# Claude 桌面实时翻译 · C++ 版 v1.1.0
+# Claude 桌面实时翻译 · C++ 版 v1.2.1
 
 Windows 10/11 x64 的原生 C++ 独立翻译窗口，继续配合现有 Claude 桌面客户端使用。程序通过 Windows UI Automation 只读获取客户端公开的助手文字，按稳定句子增量翻译。
 
@@ -6,7 +6,7 @@ Windows 10/11 x64 的原生 C++ 独立翻译窗口，继续配合现有 Claude �
 
 ## 使用
 
-从 [v1.1.0 Release](https://github.com/zsdl1288/ClaudeCodeLiveTranslator/releases/tag/v1.1.0) 下载 `ClaudeTranslator-v1.1.0-windows-x64.zip`，完整解压后双击 `ClaudeTranslator.exe`。本版本新增百度翻译 API 与 ChatGPT 账号授权，可在设置中选择翻译服务。这是 Windows 10/11 x64 便携版，无需安装；请解压到有写入权限的文件夹，以便保存设置。
+从 [v1.2.1 Release](https://github.com/zsdl1288/ClaudeCodeLiveTranslator/releases/tag/v1.2.1) 下载 `ClaudeTranslator-v1.2.1-windows-x64.zip`，完整解压后双击 `ClaudeTranslator.exe`。本版本新增 Codex CLI 翻译服务，可复用本机 CLI 的当前登录，并修复同一会话中译文出现后又消失的问题；百度翻译 API、ChatGPT 账号授权等服务仍可在设置中选择。这是 Windows 10/11 x64 便携版，无需安装；请解压到有写入权限的文件夹，以便保存设置。
 
 源码用户编译后可双击项目根目录的 `启动翻译.cmd`，或运行 `dist\ClaudeTranslator\ClaudeTranslator.exe`。离线演示可运行 `ClaudeTranslator.exe --demo`；源码目录也提供 `离线演示.cmd`。
 
@@ -66,6 +66,7 @@ build-cpp\ClaudeTranslator.exe --self-test --auto-start --status-file "%CD%\buil
 
 - **百度翻译 API**：开通百度通用文本翻译，填写 APPID，在「本次密钥」输入密钥，或填写已配置的密钥环境变量名（默认 `BAIDU_TRANSLATE_KEY`）。请求固定通过 HTTPS 发送给百度官方接口，使用官方 MD5 签名；密钥值不写入配置。`zh-CN`、`zh-TW` 等常见目标语言会转换为百度语言代码。请求按服务节流，百度限流错误会进入冷却队列。APPID、密钥与服务额度可在[百度翻译开放平台](https://fanyi-api.baidu.com/product/11)管理。
 - **ChatGPT 账号**：点击 **Continue with ChatGPT**，在系统浏览器中登录、选择账号和工作区并授权本程序使用 ChatGPT 套餐。登录后加载该账号可用的模型，选择模型后保存。切换账号后需重新选择并保存模型。适用性、额度及模型由 OpenAI 和账号/工作区策略决定；符合条件的 Plus/Pro 账号可使用已有套餐额度。此方式使用 OpenAI 官方账号授权接口，不依赖桌面聊天窗口，不读取桌面客户端现有登录文件。详见[官方账号接入说明](https://developers.openai.com/siwc/quickstart)。
+- **Codex CLI（本机登录）**：复用本机 Codex CLI 的当前登录；CLI 已使用 ChatGPT 登录时，不需要为本程序单独授权或填写 API Key。安装并用 `codex login` 登录后，在设置中选择此服务即可；本机 CLI 已登录时可直接使用。程序自动查找 `codex.exe`，也可指定官方原生 EXE 的绝对路径；不支持 `.cmd`、`.ps1` 或自定义命令。模型可留空使用 CLI 默认模型。待译文字通过标准输入交给独立 CLI 子进程，由 Codex 服务处理，认证方式、计费及额度由 CLI 当前登录决定；程序不读取或复制 CLI 的登录令牌。调用使用只读、临时会话，关闭命令、浏览器、插件等工具，并支持停止和超时取消。CLI 启动与服务推理会增加延迟。已在 Codex CLI 0.163.0 上验证；需兼容本文所用非交互参数，相关说明见 [Codex 非交互模式](https://learn.chatgpt.com/docs/non-interactive-mode)。
 - **兼容 API**：填写 Chat Completions 服务地址、模型名称和 API Key 环境变量名。待译文字会发送给所填地址；也可连接自建的兼容服务。
 - **Ollama 本地模型**：通常填写 `http://127.0.0.1:11434` 和本机已安装的模型名；待译文字发送至该服务地址。
 
@@ -86,6 +87,7 @@ Claude 普通 Chat 和 Code 页面暴露的辅助功能结构可能不同，也�
 - 设置保存到 EXE 所在目录的 `data/config.json`。
 - 各任务的标题、原文、译文与阅读位置仅缓存在当前进程内存中，不生成本地缓存文件；关闭软件后自动释放。
 - 每个任务仅保留最新 100 个逻辑字幕行，超过后从最旧内容开始裁剪。逻辑行以文本换行区分，窗口宽度导致的自动折行不另外计数；缓存本身也会裁剪，并非只隐藏显示内容。
+- 同一会话的辅助功能内容短暂缺失或回退为旧前缀时，保留已有译文；原文真实更新时显示旧译文并标记更新，直到新译文完整返回。会话 URL 暂不可确认时暂停接纳正文，避免将其他会话内容加入当前缓存。
 - 「清空」只清除当前任务的内存内容，其他任务缓存保留；重启软件不会恢复上次内容。
 - API Key 不加入任务缓存；程序不提供译文导出文件功能。
 - 不读取 Claude 的登录令牌、Cookie 或账号文件，不写入 Claude 的安装或账号目录。
@@ -121,6 +123,7 @@ build.cmd --tests
 - `src/reader.cpp`：只读辅助功能助手文字提取。
 - `src/core.cpp`：设置、稳定分句、去重和翻译服务。
 - `src/chatgpt.cpp`、`include/chatgpt.hpp`：本程序自己的 ChatGPT 授权、加密凭据、模型列表与翻译请求。
+- `src/codex_cli.cpp`、`include/codex_cli.hpp`：复用本机 CLI 登录的原生子进程翻译和取消处理。
 - `src/task_cache.cpp`、`include/task_cache.hpp`：按任务区分的纯内存缓存与容量限制。
 - `src/text_layout.cpp`、`include/text_layout.hpp`：标题、粗体、列表及段落的原生富文本排版。
 - `assets/app-icon.svg`、`assets/app.ico`、`resources/app.rc`：应用矢量图标、多尺寸 Windows 图标与嵌入资源。

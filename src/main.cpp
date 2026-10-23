@@ -788,6 +788,8 @@ struct Watcher {
   unsigned consistentTaskSnapshots = 0;
   std::map<std::string, std::size_t> sourceIndices;
   std::map<std::string, json> forwardedSlots;
+  std::map<std::string, std::string> acceptedBodies;
+  bool sourceIdentityPending = false;
   std::set<std::string> previousBlockKeys;
   std::size_t previousSourceCount = 0, previousMinimum = 0;
   uint64_t windowReplayNonce = 0;
@@ -874,23 +876,92 @@ struct Watcher {
   };
   void publishSnapshot(const json &snapshot, cclive::Ledger &ledger) {
     auto nextTaskId = snapshot.value("task_id", snapshot.value("context", ""));
-    if (nextTaskId != currentTaskId) {
+    const auto quality = snapshot.value("identity_quality", "view_fallback");
+    const auto sourceHwnd = snapshot.value("source_hwnd", hwnd);
+    const auto sourcePid = snapshot.value("source_pid", 0ULL);
+    // A reader restart can lose its URL cache. Never publish an unverified
+    // fallback body into a task previously identified by URL on this window.
+    const bool unverifiedFallback = !currentTaskId.empty() &&
+        currentTask.value("identity_quality", "") == "url" && quality != "url" &&
+        currentTask.value("source_hwnd", 0ULL) == sourceHwnd &&
+        currentTask.value("source_pid", 0ULL) == sourcePid;
+    sourceIdentityPending = snapshot.value("identity_pending", false) ||
+                            unverifiedFallback;
+    if (nextTaskId.empty() || unverifiedFallback ||
+        (sourceIdentityPending &&
+         (nextTaskId == currentTaskId || quality != "url")))
+      return;
+    const bool taskChanged = nextTaskId != currentTaskId;
+    if (taskChanged) {
       consistentTaskSnapshots = 0;
       forwardedSlots.clear();
+      acceptedBodies.clear();
+      sourceIndices.clear();
       previousBlockKeys.clear();
-      previousSourceCount = previousMinimum = 0;
+      previousSourceCount = previousMinimum = minimumSourceIndex = 0;
       windowReplayNonce = 0;
     }
     currentTaskId = nextTaskId;
-    ++consistentTaskSnapshots;
-    if (currentTaskId.empty())
-      return;
     currentTask = {{"task_id", currentTaskId},
                    {"task_title", snapshot.value("task_title", "Claude 任务")},
-                   {"identity_quality",
-                    snapshot.value("identity_quality", "view_fallback")},
-                   {"source_hwnd", snapshot.value("source_hwnd", hwnd)},
-                   {"source_pid", snapshot.value("source_pid", 0ULL)}};
+                   {"identity_quality", quality},
+                   {"source_hwnd", sourceHwnd},
+                   {"source_pid", sourcePid}};
+    auto identityOnly = [&] {
+      auto event = currentTask;
+      event["type"] = "task";
+      event["identity_pending"] = sourceIdentityPending;
+      emit(std::move(event));
+    };
+    if (sourceIdentityPending) {
+      // A new explicit URL is sufficient to switch tasks, but its body is not
+      // trusted until the reader verifies that identity after extraction.
+      identityOnly();
+      return;
+    }
+    if (!snapshot.contains("blocks") || !snapshot["blocks"].is_array() ||
+        snapshot["blocks"].empty()) {
+      if (taskChanged)
+        identityOnly();
+      return;
+    }
+    auto effective = snapshot;
+    effective["blocks"] = json::array();
+    std::map<std::string, std::string> nextBodies;
+    for (const auto &raw : snapshot["blocks"]) {
+      if (effective["blocks"].size() >= 128)
+        break;
+      if (!raw.is_object() || !raw.contains("key") ||
+          !raw["key"].is_string() || !raw.contains("text") ||
+          !raw["text"].is_string())
+        continue;
+      auto key = raw["key"].get<std::string>();
+      auto body = raw["text"].get<std::string>();
+      // Match the reader's 128 blocks / 64000 UTF-16-unit acquisition bound.
+      if (key.empty() || key.size() > 4096 || body.size() > 64000 * 3)
+        continue;
+      auto previous = acceptedBodies.find(key);
+      if (previous != acceptedBodies.end() &&
+          body.size() < previous->second.size() &&
+          previous->second.compare(0, body.size(), body) == 0)
+        body = previous->second;
+      if (body.empty())
+        continue;
+      auto block = raw;
+      block["text"] = body;
+      effective["blocks"].push_back(std::move(block));
+      nextBodies[key] = std::move(body);
+    }
+    if (effective["blocks"].empty()) {
+      if (taskChanged)
+        identityOnly();
+      return;
+    }
+    // Keep only the currently observed block set; no historical body cache.
+    acceptedBodies = std::move(nextBodies);
+    ++consistentTaskSnapshots;
+    if (consistentTaskSnapshots < 2 && previousSourceCount)
+      return; // Reconnection must not publish an empty source window.
     auto meta = currentTask;
     meta["type"] = "task";
     meta["source_block_keys"] = json::array();
@@ -898,9 +969,8 @@ struct Watcher {
     sourceIndices.clear();
     std::vector<std::size_t> englishPositions;
     std::set<std::string> blockKeys;
-    if (consistentTaskSnapshots >= 2 && snapshot.contains("blocks") &&
-        snapshot["blocks"].is_array()) {
-      for (const auto &block : snapshot["blocks"]) {
+    if (consistentTaskSnapshots >= 2) {
+      for (const auto &block : effective["blocks"]) {
         if (!block.is_object() || !block.contains("key") ||
             !block["key"].is_string())
           continue;
@@ -932,17 +1002,15 @@ struct Watcher {
     meta["source_minimum_index"] = minimumSourceIndex;
     meta["source_last_index"] =
         englishPositions.empty() ? 0 : englishPositions.back();
-    bool sharedBlock = std::any_of(blockKeys.begin(), blockKeys.end(),
-                                   [&](const std::string &key) {
-                                     return previousBlockKeys.count(key) != 0;
-                                   });
-    bool replayWindow = consistentTaskSnapshots >= 2 && sharedBlock &&
-                        (sourceIndices.size() < previousSourceCount ||
-                         minimumSourceIndex < previousMinimum);
+    // Missing blocks become history. A smaller same-block correction normally
+    // updates Ledger slots in place; only an earlier cropped window needs replay.
+    bool replayWindow = consistentTaskSnapshots >= 2 &&
+                        blockKeys == previousBlockKeys &&
+                        minimumSourceIndex < previousMinimum;
     meta["source_window_replay"] = replayWindow;
     emit(std::move(meta));
     if (consistentTaskSnapshots < 2) {
-      auto identityOnly = snapshot;
+      auto identityOnly = effective;
       identityOnly["blocks"] = json::array();
       identityOnly["context"] =
           currentTaskId + (windowReplayNonce
@@ -976,7 +1044,6 @@ struct Watcher {
     previousBlockKeys = std::move(blockKeys);
     previousSourceCount = sourceIndices.size();
     previousMinimum = minimumSourceIndex;
-    auto effective = snapshot;
     effective["context"] =
         currentTaskId + (windowReplayNonce
                              ? "|window:" + std::to_string(windowReplayNonce)
@@ -1109,7 +1176,7 @@ struct Watcher {
           } else if (value.value("type", "") == "error")
             status(value.value("text", "辅助功能读取暂不可用"));
         }
-        if (consistentTaskSnapshots >= 2)
+        if (consistentTaskSnapshots >= 2 && !sourceIdentityPending)
           for (auto event : ledger.flush())
             publishLedger(std::move(event));
         if (WaitForSingleObject(child.h, 0) == WAIT_OBJECT_0)
@@ -1150,13 +1217,14 @@ struct Record {
   std::string key, source, translation, error, sourceSignature,
       state = "waiting";
   uint64_t serial = 0, version = 0;
+  bool pendingReplacement = false;
 };
 class App;
 struct Config {
   App *app = nullptr;
   HWND hwnd = nullptr, previousFocus = nullptr;
   // Keep edits[0..7] stable for the native GUI regressions. Baidu uses
-  // independent controls [8..10], so changing services never reuses a secret.
+  // independent controls [8..10]; ChatGPT uses [11], and Codex uses [12..13].
   std::vector<HWND> edits, labels;
   HWND error = nullptr, keyHint = nullptr, serviceHint = nullptr;
   HWND chatgptLogin = nullptr, chatgptSignout = nullptr,
@@ -1190,7 +1258,7 @@ struct ConfigProvider {
 constexpr ConfigProvider configProviders[] = {
     {"google", L"Google公共翻译"}, {"baidu", L"百度翻译API"},
     {"openai", L"兼容API"}, {"ollama", L"Ollama本地"},
-    {"chatgpt", L"ChatGPT账号"}};
+    {"chatgpt", L"ChatGPT账号"}, {"codex", L"Codex CLI（本机登录）"}};
 int configProviderIndex(const std::string &provider) {
   for (int i = 0; i < static_cast<int>(std::size(configProviders)); ++i)
     if (provider == configProviders[i].id)
@@ -1206,27 +1274,32 @@ const char *selectedConfigProvider(const Config &config) {
 void updateConfigProviderFields(Config &config) {
   const std::string provider = selectedConfigProvider(config);
   const bool baidu = provider == "baidu", api = provider == "openai",
-             ollama = provider == "ollama", chatgpt = provider == "chatgpt";
+             ollama = provider == "ollama", chatgpt = provider == "chatgpt",
+             codex = provider == "codex";
   auto field = [&](int index, bool visible, bool enabled) {
     for (auto control : {config.edits[index], config.labels[index]}) {
       EnableWindow(control, enabled);
       ShowWindow(control, visible ? SW_SHOW : SW_HIDE);
     }
   };
-  field(1, !baidu && !chatgpt, api || ollama);
-  field(2, !baidu && !chatgpt, api || ollama);
-  field(3, !baidu && !chatgpt, api);
-  field(7, !baidu && !chatgpt, api);
+  field(1, !baidu && !chatgpt && !codex, api || ollama);
+  field(2, !baidu && !chatgpt && !codex, api || ollama);
+  field(3, !baidu && !chatgpt && !codex, api);
+  field(7, !baidu && !chatgpt && !codex, api);
   for (int index : {8, 9, 10})
     field(index, baidu, baidu);
+  for (int index : {12, 13})
+    field(index, codex, codex);
   SetWindowTextW(config.keyHint,
-                 chatgpt ? L"Continue with ChatGPT 会打开系统浏览器完成授权；无需填写 API 密钥。"
+                 codex ? L"使用本机 Codex CLI 现有登录；无需本应用的 OAuth 或 API Key。"
+                 : chatgpt ? L"Continue with ChatGPT 会打开系统浏览器完成授权；无需填写 API 密钥。"
                  : baidu ? L"百度密钥只在本次运行使用，不写入配置。留空则读取指定环境变量。"
                        : L"密钥只在本次运行使用，不写入配置。留空则读取指定环境变量。");
   const wchar_t *hint =
       baidu ? L"待译文字通过 HTTPS 发送至百度翻译 API。\r\n请先开通百度通用翻译 API，填写 APPID 和对应密钥。\r\n环境变量名默认 BAIDU_TRANSLATE_KEY，与兼容 API 分开。"
       : api ? L"待译文字发送至你填写的 API 地址。\r\n填写兼容 Chat Completions 的地址、模型与密钥。\r\n环境变量名与本次密钥均仅用于兼容 API。"
       : ollama ? L"待译文字发送至你填写的 Ollama 地址。\r\n本机通常为 http://127.0.0.1:11434；填写已安装的模型名。\r\n使用远程地址时，文字会发送至该远程服务。"
+      : codex ? L"复用 Codex CLI 当前登录与额度，待译文字发送至 Codex 服务。\r\n路径留空自动检测，模型留空使用 CLI 默认。\r\n未安装或未登录时，请先安装 Codex CLI 并运行 codex login。"
       : chatgpt ? L"使用 ChatGPT 账号授权；待译文字发送至账号授权的服务。\r\n登录后从账号读取可用模型。"
                 : L"待译文字通过 HTTPS 发送至 Google 公共翻译接口。\r\n无需密钥；接口可能限流或暂时不可用。\r\n此服务不使用 API 地址、模型或密钥设置。";
   SetWindowTextW(config.serviceHint, hint);
@@ -1558,6 +1631,10 @@ public:
                     ? std::string("百度翻译 API · 待译文字发送至百度")
                 : settings.provider == "chatgpt"
                     ? "ChatGPT · " + settings.chatgpt_model + " · 待译文字发送至 OpenAI"
+                : settings.provider == "codex"
+                    ? "Codex CLI（本机登录） · " +
+                          (settings.codex_model.empty() ? "CLI 默认模型" : settings.codex_model) +
+                          " · 待译文字发送至 Codex"
                 : settings.provider == "ollama" ? "Ollama · " + settings.model
                 : settings.provider == "openai"
                     ? "API · " + settings.model
@@ -1748,13 +1825,17 @@ public:
     const bool api = settings.provider == "openai" ||
                      settings.provider == "ollama";
     const bool baidu = settings.provider == "baidu",
-               chatgpt = settings.provider == "chatgpt";
+               chatgpt = settings.provider == "chatgpt",
+               codex = settings.provider == "codex";
     return {{"provider", settings.provider},
             {"model", api ? settings.model : std::string()},
             {"target", settings.target},
             {"baidu_account_hash", baidu ? contentSignature(settings.baidu_app_id)
                                          : std::string()},
             {"chatgpt_model", chatgpt ? settings.chatgpt_model : std::string()},
+            {"codex_model", codex ? settings.codex_model : std::string()},
+            {"codex_path_hash", codex ? contentSignature(settings.codex_path)
+                                      : std::string()},
             {"chatgpt_account_hash", chatgpt ? chatgptAccountHash : std::string()},
             {"endpoint_hash", api ? contentSignature(settings.base_url)
                                    : std::string()}};
@@ -1837,6 +1918,7 @@ public:
                        {"source", record.source},
                        {"translation", record.translation},
                        {"state", record.state},
+                       {"pending_replacement", record.pendingReplacement},
                        {"error", record.error},
                        {"source_signature", record.sourceSignature},
                        {"serial", record.serial}});
@@ -1908,7 +1990,8 @@ public:
     if (id == activeTaskId && metadata.value("source_window_replay", false)) {
       windowReplayMemo.clear();
       for (const auto &record : records)
-        if (record.state == "done" && !record.translation.empty())
+        if (record.state == "done" && !record.pendingReplacement &&
+            !record.translation.empty())
           windowReplayMemo[record.sourceSignature.empty()
                                ? contentSignature(record.source)
                                : record.sourceSignature] = record.translation;
@@ -1932,6 +2015,7 @@ public:
         sourceNeedsReplay = true;
         for (auto &record : records) {
           record.translation.clear();
+          record.pendingReplacement = false;
           record.error.clear();
           record.version = ++revision;
           record.state = paused ? "paused" : "waiting";
@@ -1997,9 +2081,13 @@ public:
                 item.value("source_signature", contentSignature(record.source));
             record.translation = matching ? item.value("translation", "") : "";
             record.error = matching ? item.value("error", "") : "";
+            record.pendingReplacement =
+                matching && item.value("pending_replacement", false) &&
+                !record.translation.empty();
             auto state = item.value("state", "waiting");
             record.state =
-                matching && state == "done" && !record.translation.empty()
+                matching && state == "done" && !record.pendingReplacement &&
+                        !record.translation.empty()
                     ? "done"
                 : matching && state == "error" ? "error"
                                                : "waiting";
@@ -2353,7 +2441,8 @@ public:
            ++previous)
         if ((previous->source == source ||
              previous->sourceSignature == incomingSignature) &&
-            previous->state == "done" && !previous->translation.empty()) {
+            previous->state == "done" && !previous->pendingReplacement &&
+            !previous->translation.empty()) {
           memo = previous->translation;
           break;
         }
@@ -2393,9 +2482,12 @@ public:
       return;
     }
     worker->cancel(it->key);
+    it->pendingReplacement = it->pendingReplacement ||
+        (it->state == "done" && !it->translation.empty());
     it->source = std::move(source);
     it->sourceSignature = incomingSignature;
-    it->translation.clear();
+    if (!it->pendingReplacement)
+      it->translation.clear();
     it->error.clear();
     it->version = ++revision;
     it->state = paused ? "paused" : "waiting";
@@ -2519,9 +2611,11 @@ public:
     }
     if (!confirmChatgptIdentity())
       return;
-    if (settings.provider == "chatgpt" && !records.empty() &&
-        activeProfile != translationProfile()) {
-      status("ChatGPT 账号或模型已变化，请点击开始重新读取后再重试。");
+    if ((settings.provider == "chatgpt" || settings.provider == "codex") &&
+        !records.empty() && activeProfile != translationProfile()) {
+      status(settings.provider == "codex"
+                 ? "Codex CLI 路径或模型已变化，请点击开始重新读取后再重试。"
+                 : "ChatGPT 账号或模型已变化，请点击开始重新读取后再重试。");
       return;
     }
     for (auto &r : records)
@@ -2564,9 +2658,9 @@ public:
         value += wide(r.source);
       else {
         value += wide(r.translation);
-        if (r.state != "done") {
+        if (r.state != "done" || r.pendingReplacement) {
           if (!r.translation.empty())
-            value += L"  ";
+            value += r.pendingReplacement ? L"  更新中 · " : L"  ";
           value += wide(!r.error.empty()           ? r.error
                         : r.state == "paused"      ? "已暂停"
                         : r.state == "stopped"     ? "已停止"
@@ -2707,6 +2801,8 @@ public:
                          settings.baidu_app_id != updated.baidu_app_id ||
                          settings.baidu_key_env != updated.baidu_key_env ||
                          settings.chatgpt_model != updated.chatgpt_model ||
+                         settings.codex_path != updated.codex_path ||
+                         settings.codex_model != updated.codex_model ||
                          settings.target != updated.target ||
                          settings.settle_ms != updated.settle_ms;
     const bool wasRunning = running, wasPaused = paused;
@@ -2841,8 +2937,18 @@ public:
       return;
     const auto previousState = it->state;
     it->state = v.value("state", "");
-    it->translation = v.value("translation", "");
+    auto translated = v.value("translation", "");
+    if (!it->pendingReplacement)
+      it->translation = std::move(translated);
+    else if (it->state == "done" && !translated.empty()) {
+      it->translation = std::move(translated);
+      it->pendingReplacement = false;
+    } else if (it->state == "done") {
+      it->state = "error";
+    }
     it->error = v.value("error", "");
+    if (it->pendingReplacement && it->state == "error" && it->error.empty())
+      it->error = "更新翻译未完成，可重试";
     dirty = cacheDirty = true;
     if (it->state == "error")
       status("部分文字翻译失败，可检查设置后重试");
@@ -3440,6 +3546,152 @@ public:
     check("chatgpt_ui_selftest_never_reads_accounts_or_uses_network",
           settings.provider == "demo" && !watcher && !IsWindowVisible(hwnd));
 
+    // Codex settings use synthetic paths and models only. Save handlers must
+    // never resolve an executable, inspect CLI login state or start a process.
+    const auto codexFixtureSettings = settings;
+    const bool codexFixtureRunning = running;
+    const auto codexApiEnvironment = apiEnvironment.value();
+    const auto codexBaiduEnvironment = baiduEnvironment.value();
+    running = false;
+    settings.codex_path = "C:\\Offline Fixture\\codex.exe";
+    settings.codex_model = "offline-codex-model";
+    openConfig();
+    if (config) {
+      auto selectCodexProvider = [&](const char *provider) {
+        SendMessageW(config->edits[0], CB_SETCURSEL,
+                     configProviderIndex(provider), 0);
+        SendMessageW(config->hwnd, WM_COMMAND,
+                     MAKEWPARAM(200, CBN_SELCHANGE), 0);
+      };
+      auto codexShown = [](HWND control) {
+        return (GetWindowLongPtrW(control, GWL_STYLE) & WS_VISIBLE) != 0;
+      };
+      selectCodexProvider("codex");
+      check("codex_provider_follows_chatgpt_with_native_login_label",
+            configProviderIndex("codex") == configProviderIndex("chatgpt") + 1 &&
+                textOf(config->edits[0]) == L"Codex CLI（本机登录）");
+      check("codex_displays_only_its_independent_provider_fields",
+            config->edits.size() == 14 && config->labels.size() == 14 &&
+                codexShown(config->edits[12]) && codexShown(config->edits[13]) &&
+                IsWindowEnabled(config->edits[12]) &&
+                IsWindowEnabled(config->edits[13]) &&
+                !(GetWindowLongPtrW(config->edits[12], GWL_STYLE) & ES_PASSWORD) &&
+                !codexShown(config->edits[1]) && !codexShown(config->edits[2]) &&
+                !codexShown(config->edits[3]) && !codexShown(config->edits[7]) &&
+                !codexShown(config->edits[8]) && !codexShown(config->edits[9]) &&
+                !codexShown(config->edits[10]) && !codexShown(config->edits[11]) &&
+                !codexShown(config->chatgptLogin) &&
+                textOf(config->serviceHint).find(L"codex login") != std::wstring::npos);
+      SetWindowTextW(config->edits[12], L"C:\\Synthetic CLI\\codex.exe");
+      SetWindowTextW(config->edits[13], L"fixture-codex-model");
+      selectCodexProvider("openai");
+      const auto preservedApi = textOf(config->edits[1]);
+      const auto preservedApiModel = textOf(config->edits[2]);
+      const auto preservedBaidu = textOf(config->edits[8]);
+      selectCodexProvider("baidu");
+      check("codex_fields_remain_separate_while_other_providers_are_visible",
+            !codexShown(config->edits[12]) && !codexShown(config->edits[13]) &&
+                codexShown(config->edits[8]) &&
+                textOf(config->edits[12]) == L"C:\\Synthetic CLI\\codex.exe" &&
+                textOf(config->edits[13]) == L"fixture-codex-model");
+      selectCodexProvider("chatgpt");
+      const auto cancelAccountLoading = config->authCancel;
+      selectCodexProvider("codex");
+      check("codex_selection_cancels_unneeded_oauth_loading",
+            cancelAccountLoading->load() && !config->authBusy &&
+                !config->authLoaded && textOf(config->edits[1]) == preservedApi &&
+                textOf(config->edits[2]) == preservedApiModel &&
+                textOf(config->edits[8]) == preservedBaidu);
+      SendMessageW(config->hwnd, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+      check("codex_save_preserves_path_model_without_oauth_or_cli_probe",
+            !config && settings.codex_path == "C:\\Synthetic CLI\\codex.exe" &&
+                settings.codex_model == "fixture-codex-model" &&
+                settings.base_url == utf8(preservedApi) &&
+                settings.model == utf8(preservedApiModel) &&
+                settings.baidu_app_id == utf8(preservedBaidu) &&
+                settings.provider == "demo" && !watcher);
+      check("codex_save_never_updates_other_provider_secret_environments",
+            apiEnvironment.value() == codexApiEnvironment &&
+                baiduEnvironment.value() == codexBaiduEnvironment);
+      if (config)
+        closeConfig(false);
+      auto codexProfile = [&] {
+        const auto current = settings.provider;
+        settings.provider = "codex";
+        const auto profile = translationProfile();
+        settings.provider = current;
+        return profile;
+      };
+      const auto originalCodexProfile = codexProfile();
+      settings.codex_model = "another-fixture-model";
+      const bool modelChangesProfile = codexProfile() != originalCodexProfile;
+      settings.codex_model = "fixture-codex-model";
+      settings.codex_path = "C:\\Different CLI\\codex.exe";
+      check("codex_cache_identity_tracks_its_model_and_executable_path",
+            modelChangesProfile && codexProfile() != originalCodexProfile &&
+                originalCodexProfile.dump().find("Synthetic CLI") == std::string::npos);
+      const auto unrelatedProfile = translationProfile();
+      settings.codex_path = "C:\\Synthetic CLI\\codex.exe";
+      settings.codex_model = "another-fixture-model";
+      check("codex_settings_do_not_change_other_provider_cache_identity",
+            translationProfile() == unrelatedProfile);
+      const auto codexRetryRecords = records;
+      const auto codexRetryProfile = activeProfile;
+      Record retryFixture;
+      retryFixture.key = "codex-retry-profile-fixture";
+      retryFixture.source = "Offline CLI profile fixture.";
+      retryFixture.state = "stopped";
+      records = {retryFixture};
+      activeProfile = originalCodexProfile;
+      const auto codexRetryProvider = settings.provider;
+      settings.provider = "codex";
+      const auto codexSubmissions = worker->submitted.load();
+      retry();
+      check("codex_retry_rejects_old_profile_without_launching_cli",
+            worker->submitted.load() == codexSubmissions &&
+                records.front().state == "stopped" &&
+                activeProfile == originalCodexProfile);
+      settings.provider = codexRetryProvider;
+      records = codexRetryRecords;
+      activeProfile = codexRetryProfile;
+      settings.codex_model = "fixture-codex-model";
+      auto codexFixturePath = reportPath;
+      codexFixturePath += L".codex-settings-test.json";
+      bool codexRoundtrip = false;
+      try {
+        cclive::save_settings(codexFixturePath, settings);
+        const auto restored = cclive::load_settings(codexFixturePath);
+        codexRoundtrip = restored.codex_path == settings.codex_path &&
+                         restored.codex_model == settings.codex_model;
+      } catch (...) {
+      }
+      std::error_code codexIgnored;
+      fs::remove(codexFixturePath, codexIgnored);
+      check("codex_settings_roundtrip_keeps_independent_path_and_model", codexRoundtrip);
+      openConfig();
+      if (config) {
+        selectCodexProvider("codex");
+        check("codex_reopening_settings_restores_its_saved_fields",
+              textOf(config->edits[12]) == L"C:\\Synthetic CLI\\codex.exe" &&
+                  textOf(config->edits[13]) == L"fixture-codex-model");
+        SetWindowTextW(config->edits[12], L"");
+        SetWindowTextW(config->edits[13], L"");
+        SendMessageW(config->hwnd, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+        check("codex_empty_path_and_model_save_as_automatic_defaults",
+              !config && settings.codex_path.empty() && settings.codex_model.empty());
+        if (config)
+          closeConfig(false);
+      } else
+        check("codex_reopening_settings_restores_its_saved_fields", false);
+    } else
+      check("codex_settings_fixture_created", false);
+    if (config)
+      closeConfig(false);
+    settings = codexFixtureSettings;
+    running = codexFixtureRunning;
+    provider();
+    check("codex_ui_selftest_remains_hidden_without_reader_or_network",
+          settings.provider == "demo" && !watcher && !IsWindowVisible(hwnd));
     // A committed account change outlives the settings dialog and its model
     // lookup. Inject only this app's safe local-status reader, never OAuth/files.
     const auto identityFixtureSettings = settings;
@@ -3726,6 +3978,41 @@ public:
     acceptResult(result(generation - 1, currentVersion, "stale generation"));
     check("obsolete_result_generation_rejected",
           records[0].translation == "current translation");
+    const auto completedVersion = records[0].version;
+    accept(textEvent("rewrite", "A genuinely revised source sentence.", 3,
+                     sourceGeneration));
+    const auto replacementVersion = records[0].version;
+    check("completed_rewrite_keeps_verified_translation_until_done",
+          records[0].pendingReplacement &&
+              records[0].source == "A genuinely revised source sentence." &&
+              records[0].translation == "current translation" &&
+              replacementVersion > completedVersion &&
+              output(false).find(L"更新中") != std::wstring::npos);
+    acceptResult(result(generation, completedVersion, "stale completed source"));
+    check("previous_source_result_cannot_commit_replacement",
+          records[0].translation == "current translation" &&
+              records[0].pendingReplacement);
+    for (const auto &state : {"translating", "rate_limited", "error"}) {
+      auto update = result(generation, replacementVersion, "partial replacement");
+      update["state"] = state;
+      update["error"] = state == std::string("error") ? "离线模拟失败" : "";
+      acceptResult(update);
+      check(state == std::string("translating")
+                ? "replacement_partial_keeps_verified_translation"
+            : state == std::string("rate_limited")
+                ? "replacement_rate_limit_keeps_verified_translation"
+                : "replacement_error_keeps_verified_translation",
+            records[0].translation == "current translation" &&
+                records[0].pendingReplacement);
+    }
+    acceptResult(result(generation, replacementVersion, ""));
+    check("empty_done_cannot_commit_replacement",
+          records[0].state == "error" && records[0].pendingReplacement &&
+              records[0].translation == "current translation");
+    acceptResult(result(generation, replacementVersion, "new complete translation"));
+    check("current_nonempty_done_atomically_commits_replacement",
+          records[0].state == "done" && !records[0].pendingReplacement &&
+              records[0].translation == "new complete translation");
     auto markdown = cclive::make_text_layout(L"# Heading\n**bold**\n- item");
     check("markdown_markers_are_not_shown_as_source_syntax",
           markdown.text.find(L"# ") == std::wstring::npos &&
@@ -4107,6 +4394,50 @@ public:
     check("manual_clear_erases_only_current_task",
           !taskCache->get(taskA).has_value() &&
               taskCache->get(taskB).has_value());
+    accept(taskMeta("replacement-cache-A", {"Original source A."}));
+    accept(taskText("replacement-cache-A", "replace-A", "Original source A."));
+    complete(0, "已确认旧译文 A");
+    accept(taskText("replacement-cache-A", "replace-A", "Revised source A."));
+    const auto pendingCachePayload = taskPayload();
+    check("replacement_marker_is_preserved_in_ram_payload",
+          pendingCachePayload["records"][0].value("pending_replacement", false) &&
+              records[0].pendingReplacement &&
+              records[0].translation == "已确认旧译文 A");
+    accept(taskMeta("replacement-cache-B", {"Revised source A."}));
+    accept(taskText("replacement-cache-B", "replace-B", "Revised source A."));
+    check("other_task_never_reuses_pending_replacement_translation",
+          records.size() == 1 && records[0].translation.empty() &&
+              !records[0].pendingReplacement);
+    complete(0, "独立译文 B");
+    accept(taskMeta("replacement-cache-A", {"Revised source A."}));
+    accept(taskText("replacement-cache-A", "replace-A-restored", "Revised source A."));
+    check("pending_replacement_survives_A_B_A_ram_restore",
+          records.size() == 1 && records[0].pendingReplacement &&
+              records[0].state == "paused" &&
+              records[0].translation == "已确认旧译文 A");
+    accept(taskText("replacement-cache-A", "replace-A-new-occurrence", "Revised source A."));
+    check("new_source_cannot_memoize_retained_old_translation",
+          records.size() == 2 && records[1].translation.empty() &&
+              !records[1].pendingReplacement);
+    complete(0, "已确认新译文 A");
+    check("restored_pending_replacement_commits_only_current_done",
+          !records[0].pendingReplacement && records[0].state == "done" &&
+              records[0].translation == "已确认新译文 A");
+    accept(taskMeta("replacement-cache-B", {"Revised source A."}));
+    check("replacement_task_B_cache_remains_independent",
+          records.size() == 1 && records[0].state == "done" &&
+              records[0].translation == "独立译文 B");
+    accept(taskMeta("replacement-cache-A", {"Revised source A."}));
+    accept(taskText("replacement-cache-A", "replace-A-again", "Revised source A."));
+    accept(taskText("replacement-cache-A", "replace-A-again", "Third revision source A."));
+    settings.target = "zh-TW";
+    accept(taskMeta("replacement-cache-A", {"Third revision source A."}));
+    check("profile_change_clears_pending_replacement_and_old_translation",
+          std::all_of(records.begin(), records.end(), [](const Record &record) {
+            return !record.pendingReplacement && record.translation.empty();
+          }));
+    settings.target = oldTarget;
+    clear();
     // Actual Watcher -> Ledger -> ordered Bus replay, with no process/UIA
     // calls.
     paused = true;
@@ -4218,65 +4549,172 @@ public:
               std::all_of(
                   records.begin(), records.end(),
                   [](const Record &record) { return record.state == "done"; }));
-    // Same-block shortening must replay slots previously outside the visible
-    // suffix, without allowing hundreds of empty deletions to evict task meta.
-    const auto oldHugeGeneration = generation;
-    const auto oldHugeKey = records.front().key;
-    const auto oldHugeVersion = records.front().version;
+    // Older UIA prefixes and empty snapshots are partial views of this same
+    // block, not deletions of its accepted latest 100 captions.
+    const auto hugeGeneration = generation;
+    const auto hugeVersion = records.front().version;
+    const auto hugeKey = records.front().key;
+    const auto hugeAliases = sourceAliases.size();
+    const auto hugeIndices = supplied.sourceIndices;
+    const auto hugeSlots = supplied.forwardedSlots;
     auto shortA = largeSnapshot("huge-task-A", "rebuilt-huge-block-A", 50);
     supplied.publishSnapshot(shortA, suppliedLedger);
     {
       std::lock_guard<std::mutex> lock(replayBus->mutex);
-      const auto tasks = std::count_if(
+      const auto texts = std::count_if(
           replayBus->source.begin(), replayBus->source.end(),
-          [](const json &event) { return event.value("type", "") == "task"; });
-      const auto removed =
-          std::count_if(replayBus->source.begin(), replayBus->source.end(),
-                        [](const json &event) {
-                          return event.value("type", "") == "text" &&
-                                 event.value("text", "").empty();
-                        });
-      check("700_to_50_deletions_keep_task_inside_bounded_bus",
-            tasks == 1 && removed <= 100 && replayBus->source.size() <= 202);
+          [](const json &event) { return event.value("type", "") == "text"; });
+      check("700_to_50_old_prefix_emits_no_text_deletions",
+            texts == 0 && replayBus->source.size() == 1);
     }
     drainSupplied();
-    check("700_to_unchanged_first_50_replays_new_visible_window",
-          activeTaskId == "huge-task-A" && records.size() == 50 &&
-              records.front().source == "Large source 0." &&
-              records.back().source == "Large source 49.");
-    acceptResult({{"task_id", activeTaskId},
-                  {"generation", oldHugeGeneration},
-                  {"key", oldHugeKey},
-                  {"version", oldHugeVersion},
-                  {"state", "done"},
-                  {"translation", "STALE BEFORE WINDOW SHRINK"}});
-    check("late_result_cannot_refill_removed_700_suffix",
-          records.size() == 50 &&
-              std::none_of(
-                  records.begin(), records.end(), [](const Record &record) {
-                    return record.translation == "STALE BEFORE WINDOW SHRINK";
-                  }));
-    for (std::size_t index = 0; index < records.size(); ++index)
-      complete(index, "已译 " + records[index].source);
-    supplied.publishSnapshot(hugeA, suppliedLedger);
-    {
-      std::lock_guard<std::mutex> lock(replayBus->mutex);
-      const auto tasks = std::count_if(
-          replayBus->source.begin(), replayBus->source.end(),
-          [](const json &event) { return event.value("type", "") == "task"; });
-      check("50_to_700_regrowth_keeps_task_event",
-            tasks == 1 && replayBus->source.size() <= 102);
-    }
-    drainSupplied();
-    check("700_to_50_to_700_retains_only_latest_100_without_old_rows",
+    check("700_to_50_old_prefix_preserves_latest_100_translations",
           activeTaskId == "huge-task-A" && records.size() == 100 &&
               records.front().source == "Large source 600." &&
               records.back().source == "Large source 699." &&
-              std::none_of(records.begin(), records.end(),
-                           [](const Record &record) {
-                             return record.source == "Large source 0." ||
-                                    record.source == "Large source 49.";
-                           }));
+              records.front().translation == "已译 Large source 600." &&
+              records.back().translation == "已译 Large source 699." &&
+              generation == hugeGeneration && records.front().version == hugeVersion &&
+              records.front().key == hugeKey && sourceAliases.size() == hugeAliases);
+    auto emptyA = hugeA;
+    emptyA["blocks"] = json::array();
+    supplied.publishSnapshot(emptyA, suppliedLedger);
+    check("empty_snapshot_preserves_accepted_ledger_indices_and_slots",
+          replayBus->source.empty() && supplied.sourceIndices == hugeIndices &&
+              supplied.forwardedSlots == hugeSlots);
+    drainSupplied();
+    emptyA = hugeA;
+    emptyA["blocks"][0]["text"] = "";
+    supplied.publishSnapshot(emptyA, suppliedLedger);
+    drainSupplied();
+    check("empty_same_block_body_keeps_latest_verified_translation",
+          records.size() == 100 && records.front().key == hugeKey &&
+              records.back().translation == "已译 Large source 699.");
+    auto pendingIdentity = hugeA;
+    pendingIdentity["identity_pending"] = true;
+    pendingIdentity["blocks"][0]["text"] = "Unverified navigation body.";
+    supplied.publishSnapshot(pendingIdentity, suppliedLedger);
+    check("identity_pending_same_task_does_not_update_source_or_aliases",
+          replayBus->source.empty() && supplied.sourceIdentityPending &&
+              supplied.sourceIndices == hugeIndices &&
+              supplied.forwardedSlots == hugeSlots && sourceAliases.size() == hugeAliases);
+    auto fallbackIdentity = pendingIdentity;
+    fallbackIdentity["identity_pending"] = false;
+    fallbackIdentity["identity_quality"] = "view_fallback";
+    fallbackIdentity["task_id"] = "unverified-restarted-reader";
+    supplied.publishSnapshot(fallbackIdentity, suppliedLedger);
+    check("reader_restart_url_to_fallback_pauses_unknown_body",
+          replayBus->source.empty() && supplied.currentTaskId == "huge-task-A" &&
+              supplied.sourceIdentityPending && records.front().key == hugeKey);
+    supplied.consistentTaskSnapshots = 0;
+    supplied.publishSnapshot(hugeA, suppliedLedger);
+    check("same_task_reader_reconnect_first_snapshot_keeps_aliases",
+          replayBus->source.empty() && sourceAliases.size() == hugeAliases);
+    supplied.publishSnapshot(hugeA, suppliedLedger);
+    drainSupplied();
+    check("full_snapshot_after_partial_restore_adds_no_duplicate_records",
+          records.size() == 100 && records.front().key == hugeKey &&
+              records.front().translation == "已译 Large source 600." &&
+              worker->submitted.load() == beforeHugeReplay &&
+              !supplied.sourceIdentityPending);
+    auto nextHugeA = largeSnapshot("huge-task-A", "rebuilt-huge-block-A", 701);
+    supplied.publishSnapshot(nextHugeA, suppliedLedger);
+    {
+      std::lock_guard<std::mutex> lock(replayBus->mutex);
+      const auto texts = std::count_if(
+          replayBus->source.begin(), replayBus->source.end(),
+          [](const json &event) { return event.value("type", "") == "text"; });
+      check("701st_source_after_partial_snapshot_emits_only_one_increment",
+            texts == 1 && replayBus->source.size() == 2);
+    }
+    drainSupplied();
+    check("701st_source_keeps_latest_100_without_retranslating_old_99",
+          records.size() == 100 && retainedLines() == 100 &&
+              records.front().source == "Large source 601." &&
+              records.front().translation == "已译 Large source 601." &&
+              records.back().source == "Large source 700." &&
+              records.back().translation.empty() &&
+              worker->submitted.load() == beforeHugeReplay);
+    auto correction = largeSnapshot("real-correction-task", "correction-block", 2);
+    supplied.publishSnapshot(correction, suppliedLedger);
+    drainSupplied();
+    supplied.publishSnapshot(correction, suppliedLedger);
+    drainSupplied();
+    complete(0, "原来的首句译文");
+    complete(1, "原来的末句译文");
+    correction["blocks"][0]["text"] = "Corrected first sentence.\n\nLarge source 1.\n\n";
+    supplied.publishSnapshot(correction, suppliedLedger);
+    drainSupplied();
+    check("real_nonprefix_source_correction_keeps_old_translation_pending",
+          records.size() == 2 && records[0].source == "Corrected first sentence." &&
+              records[0].pendingReplacement &&
+              records[0].translation == "原来的首句译文" &&
+              records[1].translation == "原来的末句译文");
+    complete(0, "纠正后的首句译文");
+    check("real_nonprefix_correction_commits_current_complete_result",
+          records[0].state == "done" && !records[0].pendingReplacement &&
+              records[0].translation == "纠正后的首句译文");
+    correction["blocks"][0]["text"] = "Shortened actual replacement.\n\n";
+    supplied.publishSnapshot(correction, suppliedLedger);
+    drainSupplied();
+    check("real_nonprefix_shrink_updates_existing_slot_without_bulk_replay",
+          records.size() == 1 &&
+              records[0].source == "Shortened actual replacement." &&
+              records[0].pendingReplacement &&
+              records[0].translation == "纠正后的首句译文");
+    complete(0, "缩短纠正后的完整译文");
+    check("real_nonprefix_shrink_commits_new_version_and_removes_true_tail",
+          records.size() == 1 && records[0].state == "done" &&
+              !records[0].pendingReplacement &&
+              records[0].translation == "缩短纠正后的完整译文");
+    auto multiBlock = largeSnapshot("multiple-block-task", "thinking-block", 1);
+    multiBlock["blocks"][0]["kind"] = "thinking";
+    multiBlock["blocks"][0]["text"] = "Thinking source sentence.\n\n";
+    multiBlock["blocks"].push_back({{"key", "answer-block"}, {"kind", "answer"},
+                                      {"text", "Answer source sentence.\n\n"}});
+    supplied.publishSnapshot(multiBlock, suppliedLedger);
+    drainSupplied();
+    supplied.publishSnapshot(multiBlock, suppliedLedger);
+    drainSupplied();
+    complete(0, "已确认思考译文");
+    complete(1, "已确认回答译文");
+    auto onlyAnswer = multiBlock;
+    onlyAnswer["blocks"].erase(0);
+    supplied.publishSnapshot(onlyAnswer, suppliedLedger);
+    {
+      std::lock_guard<std::mutex> lock(replayBus->mutex);
+      check("missing_thinking_block_emits_no_translation_deletions",
+            std::none_of(replayBus->source.begin(), replayBus->source.end(),
+                         [](const json &event) {
+                           return event.value("type", "") == "text";
+                         }));
+    }
+    drainSupplied();
+    check("thinking_and_answer_to_answer_keeps_both_verified_translations",
+          records.size() == 2 && records[0].translation == "已确认思考译文" &&
+              records[1].translation == "已确认回答译文");
+    supplied.publishSnapshot(multiBlock, suppliedLedger);
+    drainSupplied();
+    check("restored_thinking_and_answer_blocks_do_not_duplicate_translations",
+          records.size() == 2 && retainedLines() == 2 &&
+              records[0].translation == "已确认思考译文" &&
+              records[1].translation == "已确认回答译文" &&
+              supplied.acceptedBodies.size() == 2);
+    auto pendingNewTask = largeB;
+    pendingNewTask["identity_pending"] = true;
+    supplied.publishSnapshot(pendingNewTask, suppliedLedger);
+    {
+      std::lock_guard<std::mutex> lock(replayBus->mutex);
+      check("pending_new_explicit_URL_emits_identity_only",
+            replayBus->source.size() == 1 &&
+                replayBus->source.front().value("type", "") == "task" &&
+                !replayBus->source.front().contains("source_block_keys"));
+    }
+    drainSupplied();
+    check("pending_new_URL_switches_to_its_independent_cached_task",
+          activeTaskId == "large-task-B" && records.size() == 1 &&
+              records[0].source == "Large source 0." &&
+              !records[0].pendingReplacement);
     accept(taskMeta("pending-task-C", {"Pending cached source."}));
     accept(taskText("pending-task-C", "pending-runtime",
                     "Pending cached source."));
@@ -4613,6 +5051,17 @@ LRESULT CALLBACK configProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                              388, 279, 88, 28, 223);
     c->chatgptRefresh = make(L"BUTTON", L"刷新模型", BS_PUSHBUTTON | WS_TABSTOP,
                              484, 279, 88, 28, 224);
+    const wchar_t *codexLabels[] = {L"CLI 路径（空自动检测）", L"Codex 模型（可空）"};
+    const std::wstring codexValues[] = {wide(a.settings.codex_path),
+                                       wide(a.settings.codex_model)};
+    for (int i = 0; i < 2; ++i) {
+      const int row = i + 1;
+      c->labels.push_back(make(L"STATIC", codexLabels[i], 0, 24,
+                              24 + row * 37, 158, 25, 0));
+      c->edits.push_back(make(L"EDIT", codexValues[i].c_str(),
+                             WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP,
+                             190, 20 + row * 37, 382, 28, 212 + i));
+    }
     updateConfigProviderFields(*c);
     c->error = make(L"STATIC", L"", 0, 24, 450, 552, 48, 0);
     make(L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP, 380, 510, 88, 32,
@@ -4679,6 +5128,8 @@ LRESULT CALLBACK configProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         updated.api_key_env = utf8(textOf(c->edits[3]));
         updated.baidu_app_id = utf8(textOf(c->edits[8]));
         updated.baidu_key_env = utf8(textOf(c->edits[9]));
+        updated.codex_path = utf8(textOf(c->edits[12]));
+        updated.codex_model = utf8(textOf(c->edits[13]));
         updated.target = utf8(textOf(c->edits[4]));
         auto number = [](const std::wstring &value) {
           size_t n = 0;

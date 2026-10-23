@@ -138,7 +138,7 @@ std::string task_digest(const std::string& input) {
     if (result.empty()) throw std::runtime_error("Task identity hash unavailable");
     return result;
 }
-struct TaskMetadata { std::string id, title, quality, document_id; std::size_t url_candidates = 0; };
+struct TaskMetadata { std::string id, title, quality, document_id, document_key, content_document_id; std::size_t url_candidates = 0; bool identity_pending = false; };
 struct Node {
     Ptr<IUIAutomationElement> element;
     std::wstring name, class_name, automation_id, aria_role, localized_type;
@@ -192,6 +192,8 @@ class Reader {
     std::unordered_map<std::string, N> parents_;
     std::unordered_map<std::string, std::pair<std::string, std::string>> view_identities_;
     std::unordered_map<std::string, std::string> view_first_users_;
+    struct VerifiedTask { std::string id, title; };
+    std::unordered_map<std::string, VerifiedTask> verified_document_tasks_;
     struct DocumentValue { Ptr<IUIAutomationValuePattern> value; Ptr<IUIAutomationLegacyIAccessiblePattern> legacy; PROPERTYID property = 0; };
     std::unordered_map<std::string, DocumentValue> document_values_;
     std::string identity(IUIAutomationElement* element) {
@@ -322,8 +324,11 @@ class Reader {
     TaskMetadata task_metadata(HWND hwnd, DWORD pid, const N& window, const std::vector<N>& all) {
         TaskMetadata result;
         const auto window_name = clean_task_title(utf8(window_title(hwnd)));
-        int best_title_score = -1, best_url_score = -1;
-        std::string selected_title, selected_url_title, view_anchor;
+        int best_title_score = -1;
+        std::string selected_title, view_anchor;
+        N selected_document;
+        std::unordered_map<std::string, std::string> document_urls;
+        const auto scope = std::to_string(pid) + ":" + std::to_string(reinterpret_cast<std::uintptr_t>(hwnd));
         for (const auto& document : all) if (document->type == UIA_DocumentControlTypeId) {
             const auto title = clean_task_title(utf8(document->name));
             int score = title.empty() ? 0 : 10;
@@ -334,22 +339,42 @@ class Reader {
                     if (ancestor->type == UIA_DocumentControlTypeId) { if (ancestor->id == document->id) score += 100; break; }
                 }
             }
-            if (score >= best_title_score) { best_title_score = score; selected_title = title; }
+            if (score >= best_title_score) { best_title_score = score; selected_title = title; selected_document = document; }
             const auto url = document_task_url(document);
-            if (!url.empty()) {
-                ++result.url_candidates;
-                if (score >= best_url_score) { best_url_score = score; result.id = url; selected_url_title = title; result.document_id = document->id; }
-            }
+            if (!url.empty()) { ++result.url_candidates; document_urls[document->id] = url; }
             view_anchor += "|doc:" + document->id;
         }
-        result.title = !selected_url_title.empty() ? selected_url_title : !selected_title.empty() ? selected_title : window_name;
+        result.title = !selected_title.empty() ? selected_title : window_name;
         if (result.title.empty()) result.title = "未命名任务";
-        if (!result.id.empty()) { result.quality = "url"; return result; }
+        if (selected_document) {
+            result.content_document_id = selected_document->id;
+            result.document_key = scope + "|doc:" + selected_document->id;
+            // A nested content Document may expose its URL through an ancestor.
+            // Never borrow the identity of an unrelated peer Document instead.
+            int depth = 0;
+            for (auto current = selected_document; current && current->id != window->id && depth < 64; ++depth, current = parent(current)) {
+                if (const auto found = document_urls.find(current->id); found != document_urls.end()) {
+                    result.id = found->second; result.document_id = current->id;
+                    result.quality = "url";
+                    return result;
+                }
+            }
+            if (const auto known = verified_document_tasks_.find(result.document_key); known != verified_document_tasks_.end()) {
+                // A temporarily missing URL is not evidence of a different task.
+                // Keep its verified identity visible, but publish no unknown body.
+                result.id = known->second.id; result.title = known->second.title;
+                result.document_id = selected_document->id; result.quality = "url";
+                result.identity_pending = true;
+                return result;
+            }
+        }
+        // Other Documents have URLs, but none belongs to the selected content.
+        // Its unverified body must not be attributed to one of those other tasks.
+        if (result.url_candidates) result.identity_pending = true;
         std::string feed_anchor;
         for (const auto& candidate : all) if (lower(candidate->aria_role) == L"feed") feed_anchor += "|feed:" + candidate->id;
         if (!feed_anchor.empty()) view_anchor = feed_anchor;
         if (view_anchor.empty()) view_anchor = "|window:" + window->id;
-        const auto scope = std::to_string(pid) + ":" + std::to_string(reinterpret_cast<std::uintptr_t>(hwnd));
         const auto view = scope + view_anchor;
         const std::wregex first_user_name(LR"(^(?:Message\s+1(?: of \d+)?|消息\s*1)$)", flags);
         std::string first_user, first_user_node;
@@ -782,24 +807,30 @@ public:
         const auto window_nodes = descendants(window);
         auto task = task_metadata(hwnd, pid, window, window_nodes);
         std::string context = task.id;
+        const auto selected = nodes_.find(task.content_document_id);
+        const auto content = selected == nodes_.end() ? window : selected->second;
+        std::vector<N> content_nodes;
+        for (const auto& item : window_nodes)
+            if (content->id == window->id || inside(item, content)) content_nodes.push_back(item);
         std::vector<N> messages;
-        for (const auto& item : window_nodes) if (is_message(item)) messages.push_back(item);
-        std::vector<Block> blocks = streaming_article_blocks(window, pid, window_nodes);
-        if (blocks.empty()) blocks = feed_blocks(window, pid, window_nodes);
+        for (const auto& item : content_nodes) if (is_message(item)) messages.push_back(item);
+        std::vector<Block> blocks = streaming_article_blocks(content, pid, content_nodes);
+        if (blocks.empty()) blocks = feed_blocks(content, pid, content_nodes);
         std::size_t tried = 0;
         for (auto message = messages.rbegin(); message != messages.rend() && tried < 4 && blocks.empty(); ++message, ++tried) {
-            blocks = output_blocks(*message, std::to_string(pid) + "|message|" + (*message)->id, &window_nodes);
+            blocks = output_blocks(*message, std::to_string(pid) + "|message|" + (*message)->id, &content_nodes);
             blocks.erase(std::remove_if(blocks.begin(), blocks.end(), [](const Block& block) { return blank(block.text); }), blocks.end());
             if (!blocks.empty()) break;
         }
-        if (blocks.empty()) blocks = semantic_blocks(window, pid);
+        if (blocks.empty()) blocks = semantic_blocks(content, pid);
         json output = json::array();
         for (const auto& block : blocks) {
             if (output.size() == 128) break;
             if (!blank(block.text)) output.push_back({{"key", block.key}, {"text", utf8(block.text.substr(0, 64000))}, {"kind", block.kind}});
         }
-        bool identity_pending = false;
-        if (task.quality == "url") {
+        bool identity_pending = task.identity_pending;
+        if (identity_pending) output.clear();
+        else if (task.quality == "url") {
             // Re-read only the selected Document value after extraction. Navigation
             // must never attach text from one task to another task's cache.
             const auto verified = verify_task_url(task);
@@ -808,6 +839,10 @@ public:
                 if (!verified.empty()) { task.id = verified; context = task.id; }
                 const auto visible_title = clean_task_title(utf8(window_title(hwnd)));
                 if (!visible_title.empty()) task.title = visible_title;
+            } else {
+                // Commit only after the post-extraction URL check succeeds. An
+                // observed navigation race must not replace a verified identity.
+                verified_document_tasks_[task.document_key] = {task.id, task.title};
             }
         }
         const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();

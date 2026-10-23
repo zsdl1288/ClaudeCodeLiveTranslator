@@ -17,6 +17,8 @@ struct Settings {
     std::string baidu_app_id;
     std::string baidu_key_env = "BAIDU_TRANSLATE_KEY";
     std::string chatgpt_model;
+    std::string codex_path;
+    std::string codex_model;
     std::string target = "zh-CN";
     int settle_ms = 900;
     bool show_original = false;

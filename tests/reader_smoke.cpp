@@ -9,6 +9,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -97,6 +98,59 @@ json read_once(const fs::path& app, HWND hwnd, bool allow_fixture = true, bool i
     require(end != std::string::npos, "reader did not emit a JSON line");
     return json::parse(bytes.substr(0, end));
 }
+struct ReaderStream {
+    Child helper;
+    Handle read_pipe;
+    std::string buffered;
+    ReaderStream(const fs::path& app, HWND hwnd) {
+        SECURITY_ATTRIBUTES attributes{sizeof(attributes), nullptr, TRUE};
+        Handle write_pipe;
+        require(CreatePipe(&read_pipe.value, &write_pipe.value, &attributes, 0), "persistent reader pipe failed");
+        SetHandleInformation(read_pipe.value, HANDLE_FLAG_INHERIT, 0);
+        STARTUPINFOW startup{}; startup.cb = sizeof(startup);
+        startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW; startup.wShowWindow = SW_HIDE;
+        startup.hStdOutput = write_pipe.value; startup.hStdError = write_pipe.value;
+        startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        auto command = quote(app.wstring()) + L" --reader " + std::to_wstring(reinterpret_cast<std::uintptr_t>(hwnd)) + L" --fixture";
+        require(CreateProcessW(app.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, app.parent_path().c_str(), &startup, &helper.process), "persistent reader could not start");
+    }
+    json next() {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (const auto end = buffered.find('\n'); end != std::string::npos) {
+                auto line = buffered.substr(0, end); buffered.erase(0, end + 1);
+                auto snapshot = json::parse(line);
+                require(snapshot.value("type", "") == "snapshot", "persistent reader returned a capture error");
+                return snapshot;
+            }
+            DWORD available = 0;
+            require(PeekNamedPipe(read_pipe.value, nullptr, 0, nullptr, &available, nullptr), "persistent reader pipe closed");
+            if (available) {
+                char bytes[16384]; DWORD count = 0;
+                require(ReadFile(read_pipe.value, bytes, std::min<DWORD>(available, sizeof(bytes)), &count, nullptr), "persistent reader output failed");
+                buffered.append(bytes, count);
+                require(buffered.size() < 4 * 1024 * 1024, "persistent reader output exceeds limit");
+            } else {
+                require(WaitForSingleObject(helper.process.hProcess, 0) == WAIT_TIMEOUT, "persistent reader exited early");
+                Sleep(20);
+            }
+        }
+        throw std::runtime_error("persistent reader snapshot timed out");
+    }
+    json until(const std::function<bool(const json&)>& matches) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto snapshot = next();
+            for (const auto& block : snapshot.value("blocks", json::array())) {
+                const auto text = block.value("text", std::string{});
+                require(text.find("UNATTRIBUTED B BODY") == std::string::npos, "unverified task body escaped persistent reader");
+                require(text.find("PEER B BODY") == std::string::npos, "unrelated Document body escaped selected task scope");
+            }
+            if (matches(snapshot)) return snapshot;
+        }
+        throw std::runtime_error("persistent reader did not reach expected identity state");
+    }
+};
 std::string block_text(const json& snapshot) {
     std::string result;
     for (const auto& block : snapshot.value("blocks", json::array())) result += block.value("text", std::string{});
@@ -295,6 +349,85 @@ int wmain(int argc, wchar_t** argv) {
         require(GetForegroundWindow() != race_hwnd, "navigation guard activated synthetic source");
         report["checks"].push_back("URL recheck discards body on mid-snapshot task navigation and resumes after stable identity");
         PostMessageW(race_hwnd, WM_CLOSE, 0, 0); WaitForSingleObject(race_window.process.hProcess, 2000);
+        write_source(input, "https://claude.ai/chat/persistent_aaaa\nPersistent A - Claude Code\nVerified A assistant body.");
+        Child persistent_window;
+        auto persistent_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" --identity";
+        require(CreateProcessW(fixture.c_str(), persistent_command.data(), nullptr, nullptr, FALSE, 0, nullptr, fixture.parent_path().c_str(), &startup, &persistent_window.process), "persistent identity fixture could not start");
+        HWND persistent_hwnd = nullptr;
+        for (int retry = 0; retry < 50 && !persistent_hwnd; ++retry) { Sleep(50); persistent_hwnd = find_window(persistent_window.process.dwProcessId); }
+        require(persistent_hwnd != nullptr, "persistent identity fixture did not appear");
+        {
+            ReaderStream reader(app, persistent_hwnd);
+            const std::string id_a = "https://claude.ai/chat/persistent_aaaa", id_b = "https://claude.ai/chat/persistent_bbbb";
+            auto confirmed = [&](const std::string& id, const std::string& body) {
+                return reader.until([&](const json& value) {
+                    return value.value("task_id", "") == id && !value.value("identity_pending", true) && block_text(value).find(body) != std::string::npos;
+                });
+            };
+            auto pending_a = [&] {
+                auto missing = reader.until([&](const json& value) {
+                    return value.value("task_id", "") == id_a && value.value("identity_pending", false);
+                });
+                require(missing.value("context", "") == id_a && missing.value("identity_quality", "") == "url" && missing.at("blocks").empty(), "missing URL did not retain verified identity with empty body");
+                require(missing.value("task_title", "") == "Persistent A", "unknown navigation title replaced verified task title");
+                auto repeated = reader.next();
+                require(repeated.value("task_id", "") == id_a && repeated.value("identity_pending", false) && repeated.at("blocks").empty(), "repeated missing URL lost identity protection");
+            };
+            confirmed(id_a, "Verified A assistant body.");
+            write_source(input, "\nUnknown navigation - Claude Code\nUNATTRIBUTED B BODY MUST NOT BE PUBLISHED.");
+            pending_a();
+            write_source(input, "https://claude.ai/chat/persistent_aaaa\nPersistent A - Claude Code\nVerified A body after URL recovery.");
+            confirmed(id_a, "Verified A body after URL recovery.");
+            report["checks"].push_back("persistent Reader retains verified A identity across repeated missing URL and resumes A without exposing unknown B body");
+            write_source(input, "\nUnknown navigation - Claude Code\nUNATTRIBUTED B BODY MUST NOT BE PUBLISHED.");
+            pending_a();
+            write_source(input, "https://claude.ai/chat/persistent_bbbb\nPersistent B - Claude Code\nVerified B assistant body.");
+            auto task_b = confirmed(id_b, "Verified B assistant body.");
+            require(task_b.value("context", "") == id_b && task_b.value("identity_quality", "") == "url", "real B URL did not replace cached A identity");
+            report["checks"].push_back("persistent Reader discards unknown navigation body until real B URL is verified");
+            write_source(input, "https://claude.ai/chat/persistent_aaaa\nPersistent A - Claude Code\nVerified A returned body.");
+            confirmed(id_a, "Verified A returned body.");
+            write_source(input, "https://claude.ai/chat/persistent_bbbb\nPersistent B - Claude Code\nVerified B direct switch body.");
+            confirmed(id_b, "Verified B direct switch body.");
+            write_source(input, "https://claude.ai/chat/persistent_aaaa\nPersistent A - Claude Code\nVerified A final return body.");
+            confirmed(id_a, "Verified A final return body.");
+            require(GetForegroundWindow() != persistent_hwnd, "persistent identity reader activated source");
+            report["checks"].push_back("persistent Reader preserves distinct A-B-A URL identities after recovery without activating source");
+        }
+        PostMessageW(persistent_hwnd, WM_CLOSE, 0, 0); WaitForSingleObject(persistent_window.process.hProcess, 2000);
+        write_source(input, "https://claude.ai/chat/current_aaaa\nCurrent A - Claude Code\nCurrent A verified body.");
+        Child multi_window;
+        auto multi_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" --identity-multi";
+        require(CreateProcessW(fixture.c_str(), multi_command.data(), nullptr, nullptr, FALSE, 0, nullptr, fixture.parent_path().c_str(), &startup, &multi_window.process), "multi-Document fixture could not start");
+        HWND multi_hwnd = nullptr;
+        for (int retry = 0; retry < 50 && !multi_hwnd; ++retry) { Sleep(50); multi_hwnd = find_window(multi_window.process.dwProcessId); }
+        require(multi_hwnd != nullptr, "multi-Document fixture did not appear");
+        {
+            ReaderStream reader(app, multi_hwnd);
+            reader.until([](const json& value) { return value.value("task_id", "") == "https://claude.ai/chat/current_aaaa" && !value.value("identity_pending", true) && block_text(value).find("Current A verified body.") != std::string::npos; });
+            write_source(input, "\nUnknown current view - Claude Code\nUNATTRIBUTED B BODY MUST NOT BE PUBLISHED.");
+            const auto missing = reader.until([](const json& value) { return value.value("task_id", "") == "https://claude.ai/chat/current_aaaa" && value.value("identity_pending", false); });
+            require(missing.at("blocks").empty(), "peer Document URL bypassed known current Document pending guard");
+            const auto fresh = read_once(app, multi_hwnd);
+            require(fresh.value("identity_pending", false) && fresh.at("blocks").empty() && fresh.value("task_id", "") != "https://claude.ai/chat/background_aaaa", "peer Document URL captured unknown current view without verified cache");
+            write_source(input, "https://claude.ai/chat/current_bbbb\nCurrent B - Claude Code\nCurrent B verified body.");
+            reader.until([](const json& value) { return value.value("task_id", "") == "https://claude.ai/chat/current_bbbb" && !value.value("identity_pending", true) && block_text(value).find("Current B verified body.") != std::string::npos; });
+            require(GetForegroundWindow() != multi_hwnd, "multi-Document reader activated source");
+        }
+        report["checks"].push_back("current Document never borrows unrelated peer URL or assistant body with or without verified identity cache");
+        PostMessageW(multi_hwnd, WM_CLOSE, 0, 0); WaitForSingleObject(multi_window.process.hProcess, 2000);
+        write_source(input, "\nNested content view - Claude Code\nVerified ancestor URL body.");
+        Child parent_window;
+        auto parent_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" --identity-parent";
+        require(CreateProcessW(fixture.c_str(), parent_command.data(), nullptr, nullptr, FALSE, 0, nullptr, fixture.parent_path().c_str(), &startup, &parent_window.process), "ancestor-Document fixture could not start");
+        HWND parent_hwnd = nullptr;
+        for (int retry = 0; retry < 50 && !parent_hwnd; ++retry) { Sleep(50); parent_hwnd = find_window(parent_window.process.dwProcessId); }
+        require(parent_hwnd != nullptr, "ancestor-Document fixture did not appear");
+        const auto inherited = read_once(app, parent_hwnd);
+        require(inherited.value("task_id", "") == "https://claude.ai/chat/ancestor_aaaa" && !inherited.value("identity_pending", true) && block_text(inherited).find("Verified ancestor URL body.") != std::string::npos, "nested content Document lost its explicit ancestor URL identity");
+        require(GetForegroundWindow() != parent_hwnd, "ancestor-Document reader activated source");
+        report["checks"].push_back("nested content Document can use its containing ancestor Document URL without peer identity fallback");
+        PostMessageW(parent_hwnd, WM_CLOSE, 0, 0); WaitForSingleObject(parent_window.process.hProcess, 2000);
         for (const std::wstring mode : {L"--headings", L"--semantic-headings"}) {
             std::wstring heading_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" " + mode;
             Child heading_window;
