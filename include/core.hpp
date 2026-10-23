@@ -23,10 +23,18 @@ struct Settings {
 };
 Settings load_settings(const std::filesystem::path& path);
 void save_settings(const std::filesystem::path& path, const Settings& settings);
+// Identifies the actual destination shared by requests and service cooldowns.
+std::string translation_service_key(const Settings& settings);
 std::wstring to_wide(const std::string& utf8);
 std::string to_utf8(const std::wstring& text);
 class TranslationError : public std::runtime_error { public: using std::runtime_error::runtime_error; };
 class TranslationCancelled : public TranslationError { public: using TranslationError::TranslationError; };
+// The caller controls cancellation and retries; this delay is always 1 second to 24 hours.
+class TranslationRateLimited : public TranslationError {
+public:
+    explicit TranslationRateLimited(std::int64_t delay_ms);
+    const std::int64_t retry_after_ms;
+};
 using Delta = std::function<void(const std::string&)>;
 std::string translate(const Settings&, const std::string& utf8, const Delta&, const std::atomic_bool& cancel);
 // Parsing helpers are also used by the native regression checks.

@@ -1,4 +1,4 @@
-# Claude 桌面实时翻译 · C++ 版 v1.0.0
+# Claude 桌面实时翻译 · C++ 版 v1.0.1
 
 Windows 10/11 x64 的原生 C++ 独立翻译窗口，继续配合现有 Claude 桌面客户端使用。程序通过 Windows UI Automation 只读获取客户端公开的助手文字，按稳定句子增量翻译。
 
@@ -6,7 +6,7 @@ Windows 10/11 x64 的原生 C++ 独立翻译窗口，继续配合现有 Claude �
 
 ## 使用
 
-从 [v1.0.0 Release](https://github.com/zsdl1288/ClaudeCodeLiveTranslator/releases/tag/v1.0.0) 下载 `ClaudeTranslator-v1.0.0-windows-x64.zip`，完整解压后双击 `ClaudeTranslator.exe`。这是 Windows 10/11 x64 便携版，无需安装；请解压到有写入权限的文件夹，以便保存设置。
+从 [v1.0.1 Release](https://github.com/zsdl1288/ClaudeCodeLiveTranslator/releases/tag/v1.0.1) 下载 `ClaudeTranslator-v1.0.1-windows-x64.zip`，完整解压后双击 `ClaudeTranslator.exe`。这是 Windows 10/11 x64 便携版，无需安装；请解压到有写入权限的文件夹，以便保存设置。
 
 源码用户编译后可双击项目根目录的 `启动翻译.cmd`，或运行 `dist\ClaudeTranslator\ClaudeTranslator.exe`。离线演示可运行 `ClaudeTranslator.exe --demo`；源码目录也提供 `离线演示.cmd`。
 
@@ -60,6 +60,7 @@ build-cpp\ClaudeTranslator.exe --self-test --auto-start --status-file "%CD%\buil
 ## 翻译服务与数据去向
 
 默认使用 Google 无 Key 网页翻译接口。选择它时，待译的助手文字会通过 HTTPS 发送给 Google。该接口不是稳定的官方 API，可能限流、不可用或改变行为。
+程序为 Google 的实际请求设置至少 1.5 秒间隔（长段落分片也受限制）。出现 HTTP 429 表示所选翻译服务正在限流：程序暂停该服务的请求队列，遵守 `Retry-After`，并至少等待 60 秒；连续限流时增加等待时间，每段最多自动重试 3 次。冷却期间界面仍可暂停、停止、切换任务或在设置中更换服务；点击「重试失败」也会遵守冷却。服务可能按 IP、账户或配额继续限流，等待时间不代表一定恢复；持续受限时可检查所选服务的额度，或选择本地 Ollama。
 
 设置还支持：
 

@@ -11,8 +11,10 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <regex>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 namespace cclive {
@@ -20,6 +22,8 @@ using json = nlohmann::json;
 namespace {
 constexpr std::size_t max_response = 2 * 1024 * 1024;
 constexpr std::size_t max_line = 256 * 1024;
+constexpr std::int64_t default_retry_after_ms = 60000;
+constexpr std::int64_t max_retry_after_ms = 24 * 60 * 60 * 1000;
 std::int64_t ticks() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -135,6 +139,55 @@ std::wstring header(HINTERNET request,DWORD kind) {
     if(!WinHttpQueryHeaders(request,kind,WINHTTP_HEADER_NAME_BY_INDEX,data.data(),&size,WINHTTP_NO_HEADER_INDEX))return L"";
     return std::wstring(data.data());
 }
+std::int64_t retry_after_ms(std::wstring value) {
+    value=trimw(std::move(value));
+    if(value.empty())return default_retry_after_ms;
+    if(std::all_of(value.begin(),value.end(),[](wchar_t c){return c>=L'0'&&c<=L'9';})) {
+        // Saturate before multiplying so even arbitrarily long numeric headers are safe.
+        std::int64_t seconds=0;
+        for(wchar_t c:value)seconds=(std::min)(max_retry_after_ms/1000,seconds*10+(c-L'0'));
+        return (std::max)(std::int64_t(1000),seconds*1000);
+    }
+    // WinHTTP's parser also accepts malformed inputs such as "-2"; first require
+    // one of the three HTTP-date shapes (including the two obsolete HTTP forms).
+    static const std::wregex http_date([] {
+        const std::wstring day=L"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)";
+        const std::wstring long_day=L"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)";
+        const std::wstring month=L"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)";
+        const std::wstring time=L"[0-9]{2}:[0-9]{2}:[0-9]{2}";
+        return std::wregex(L"(?:"+day+L", [0-9]{2} "+month+L" [0-9]{4} "+time+L" GMT|"+
+                          long_day+L", [0-9]{2}-"+month+L"-[0-9]{2} "+time+L" GMT|"+
+                          day+L" "+month+L" (?: [0-9]|[0-9]{2}) "+time+L" [0-9]{4})",std::regex_constants::icase);
+    }());
+    if(!std::regex_match(value,http_date))return default_retry_after_ms;
+    SYSTEMTIME date{};FILETIME target{},now{};
+    if(!WinHttpTimeToSystemTime(value.c_str(),&date)||!SystemTimeToFileTime(&date,&target))return default_retry_after_ms;
+    GetSystemTimeAsFileTime(&now);
+    ULARGE_INTEGER target_ticks{},now_ticks{};
+    target_ticks.LowPart=target.dwLowDateTime;target_ticks.HighPart=target.dwHighDateTime;
+    now_ticks.LowPart=now.dwLowDateTime;now_ticks.HighPart=now.dwHighDateTime;
+    if(target_ticks.QuadPart<=now_ticks.QuadPart)return 1000;
+    const auto difference=target_ticks.QuadPart-now_ticks.QuadPart;
+    const auto milliseconds=difference/10000+(difference%10000!=0);
+    return (std::max)(std::int64_t(1000),static_cast<std::int64_t>((std::min)(milliseconds,static_cast<ULONGLONG>(max_retry_after_ms))));
+}
+void wait_for_google_request(const std::atomic_bool& cancel,std::int64_t deadline) {
+    static std::mutex mutex;
+    static std::int64_t next_request=0;
+    for(;;) {
+        check_cancel(cancel);
+        std::int64_t wait=0;
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            const auto now=ticks();
+            if(now>=deadline)throw TranslationError("翻译服务响应超时，请稍后重试。");
+            if(now>=next_request){next_request=now+1500;return;}
+            wait=(std::min)(std::int64_t(50),(std::min)(next_request-now,deadline-now));
+        }
+        // No lock is held during waits, and cancelled callers do not reserve a slot.
+        std::this_thread::sleep_for(std::chrono::milliseconds(wait));
+    }
+}
 // The function owns its WinHTTP handles and never touches UI or Claude state.
 // Redirects are disabled before sending credentials or text.
 void request(const std::string& url,const std::string& body,const std::wstring& auth,const std::atomic_bool& cancel,std::int64_t deadline,
@@ -157,6 +210,7 @@ void request(const std::string& url,const std::string& body,const std::wstring& 
     if(!WinHttpReceiveResponse(req.h,nullptr))network_failure(); check_cancel(cancel);
     DWORD status=0,size=sizeof(status);
     if(!WinHttpQueryHeaders(req.h,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,&status,&size,WINHTTP_NO_HEADER_INDEX))network_failure();
+    if(status==429)throw TranslationRateLimited(retry_after_ms(header(req.h,WINHTTP_QUERY_RETRY_AFTER)));
     if(status<200||status>=300)throw TranslationError("翻译失败：HTTP "+std::to_string(status)+"，请检查凭据、模型、配额或服务地址。");
     auto length=header(req.h,WINHTTP_QUERY_CONTENT_LENGTH);
     if(!length.empty()){try{if(std::stoull(length)>max_response)throw TranslationError("翻译服务响应过大，已停止读取。");}catch(const std::invalid_argument&){}catch(const std::out_of_range&){throw TranslationError("翻译服务响应过大，已停止读取。");}}
@@ -172,6 +226,9 @@ void request(const std::string& url,const std::string& body,const std::wstring& 
 }
 }
 
+TranslationRateLimited::TranslationRateLimited(std::int64_t delay_ms)
+    : TranslationError("翻译服务请求过于频繁（HTTP 429），请稍后重试。"),
+      retry_after_ms((std::max)(std::int64_t(1000),(std::min)(delay_ms,max_retry_after_ms))) {}
 std::wstring to_wide(const std::string& s) {
     if(s.empty())return {};
     int n=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,s.data(),static_cast<int>(s.size()),nullptr,0);
@@ -183,6 +240,14 @@ std::string to_utf8(const std::wstring& s) {
     int n=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,s.data(),static_cast<int>(s.size()),nullptr,0,nullptr,nullptr);
     if(!n)throw TranslationError("文本含有无效的 Unicode 字符。");
     std::string out(n,'\0'); WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,s.data(),static_cast<int>(s.size()),out.data(),n,nullptr,nullptr);return out;
+}
+std::string translation_service_key(const Settings& settings) {
+    if(settings.provider=="google"||settings.provider=="demo")return settings.provider;
+    if(settings.provider!="openai"&&settings.provider!="ollama")throw TranslationError("翻译服务须为 google、openai、ollama 或 demo。");
+    auto destination=crack(endpoint(settings));
+    std::transform(destination.host.begin(),destination.host.end(),destination.host.begin(),[](wchar_t c){return static_cast<wchar_t>(towlower(c));});
+    return settings.provider+"|"+(destination.secure?"https://":"http://")+to_utf8(destination.host)+":"+
+           std::to_string(destination.port)+to_utf8(destination.path);
 }
 void Settings::validate() const {
     if(provider!="google"&&provider!="openai"&&provider!="ollama"&&provider!="demo")throw TranslationError("翻译服务须为 google、openai、ollama 或 demo。");
@@ -242,6 +307,7 @@ std::string translate(const Settings& s,const std::string& text,const Delta& del
                 while(end<piece.second.size()&&end>start&&(static_cast<unsigned char>(piece.second[end])&0xc0)==0x80)--end;
                 std::string part=piece.second.substr(start,end-start),body;
                 auto url="https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl="+percent(s.target)+"&dt=t&q="+percent(part);
+                wait_for_google_request(cancel,deadline);
                 request(url,"",L"",cancel,deadline,[&](const std::string& chunk,bool){body+=chunk;},[](const std::string&){});
                 auto data=parse_json(body);if(!data.is_array()||data.empty()||!data[0].is_array())throw TranslationError("Google 公共翻译端点格式已变化，请切换或检查服务。");
                 std::string translated;for(const auto& row:data[0])if(row.is_array()&&!row.empty()&&row[0].is_string())translated+=row[0].get<std::string>();

@@ -381,14 +381,28 @@ struct Job {
       std::make_shared<std::atomic_bool>(false);
 };
 struct Worker {
+  using Translator = std::function<std::string(
+      const cclive::Settings &, const std::string &, const cclive::Delta &,
+      const std::atomic_bool &)>;
+  struct Cooldown {
+    Clock::time_point until{};
+    unsigned strikes = 0;
+  };
   std::mutex mutex;
   std::condition_variable changed;
   std::deque<std::shared_ptr<Job>> pending;
   std::shared_ptr<Job> active;
+  std::map<std::string, Cooldown> cooldowns;
   bool shutdown = false;
   std::atomic_uint64_t submitted{0};
   std::shared_ptr<Bus> bus;
-  explicit Worker(std::shared_ptr<Bus> b) : bus(std::move(b)) {}
+  Translator translator;
+  explicit Worker(std::shared_ptr<Bus> b,
+                  Translator translate = cclive::translate)
+      : bus(std::move(b)), translator(std::move(translate)) {}
+  static std::string serviceKey(const cclive::Settings &s) {
+    return cclive::translation_service_key(s);
+  }
   void cancel(const std::string &key) {
     std::lock_guard<std::mutex> lock(mutex);
     for (auto i = pending.begin(); i != pending.end();)
@@ -399,6 +413,7 @@ struct Worker {
         ++i;
     if (active && active->key == key)
       active->cancel->store(true);
+    changed.notify_all();
   }
   void cancelAll() {
     std::lock_guard<std::mutex> lock(mutex);
@@ -436,6 +451,7 @@ struct Worker {
         pending.pop_front();
         active = j;
       }
+      std::string service;
       std::string partial;
       auto publish = [&](const std::string &state,
                          const std::string &error = "") {
@@ -447,11 +463,53 @@ struct Worker {
                      {"translation", partial},
                      {"error", error}});
       };
-      if (!j->cancel->load()) {
+      unsigned retries = 0;
+      while (!j->cancel->load()) {
+        try {
+          if (service.empty())
+            service = serviceKey(j->settings);
+        } catch (const std::exception &e) {
+          publish("error", e.what());
+          break;
+        }
+        // A service cooldown also holds queued sentences and manual retries.
+        // Wait only on the worker; pause, cancellation and shutdown wake it.
+        {
+          std::unique_lock<std::mutex> lock(mutex);
+          Clock::time_point announced{};
+          for (;;) {
+            if (shutdown || j->cancel->load())
+              break;
+            const auto gate = cooldowns.find(service);
+            if (gate == cooldowns.end() || gate->second.until <= Clock::now())
+              break;
+            const auto until = gate->second.until;
+            if (announced != until) {
+              const auto seconds =
+                  (std::chrono::duration_cast<std::chrono::milliseconds>(
+                       until - Clock::now())
+                       .count() +
+                   999) /
+                  1000;
+              announced = until;
+              lock.unlock();
+              publish("rate_limited",
+                      "翻译服务限流（HTTP 429），等待约 " +
+                          std::to_string((std::max)(int64_t(1), seconds)) +
+                          " 秒后自动重试；可暂停或停止");
+              lock.lock();
+              continue;
+            }
+            changed.wait_until(lock, until);
+          }
+          if (shutdown || j->cancel->load())
+            break;
+        }
+        partial.clear();
         try {
           publish("translating");
           auto last = Clock::now();
-          auto result = cclive::translate(
+          auto result = translator(
               j->settings, j->source,
               [&](const std::string &delta) {
                 if (j->cancel->load())
@@ -465,14 +523,42 @@ struct Worker {
               *j->cancel);
           if (!j->cancel->load()) {
             partial = std::move(result);
+            {
+              std::lock_guard<std::mutex> lock(mutex);
+              cooldowns.erase(service);
+            }
             publish("done");
           }
+          break;
+        } catch (const cclive::TranslationRateLimited &e) {
+          partial.clear();
+          {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto &gate = cooldowns[service];
+            const auto exponent = (std::min)(gate.strikes, 4U);
+            gate.strikes = (std::min)(gate.strikes + 1, 5U);
+            const auto backoff =
+                (std::min)(int64_t(900000), int64_t(60000) << exponent);
+            const auto delay = (std::max)(e.retry_after_ms, backoff);
+            gate.until =
+                (std::max)(gate.until,
+                           Clock::now() + std::chrono::milliseconds(delay));
+          }
+          if (j->cancel->load())
+            break;
+          if (retries++ < 3)
+            continue;
+          publish("error", "翻译服务持续限流（HTTP 429），已停止本段自动重试。"
+                           "请稍后点击重试失败，或在设置中选择其他翻译服务");
+          break;
         } catch (const std::exception &e) {
           if (!j->cancel->load())
             publish("error", e.what());
+          break;
         } catch (...) {
           if (!j->cancel->load())
             publish("error", "翻译服务发生错误，请检查设置");
+          break;
         }
       }
       {
@@ -483,6 +569,182 @@ struct Worker {
     }
   }
 };
+json workerRateLimitChecks() {
+  // Inject a provider: no network. Advance the deadline only after verifying
+  // that the actual worker holds both the limited job and following sentences.
+  json checks = json::array();
+  auto check = [&](const char *name, bool passed) {
+    checks.push_back({{"name", name}, {"passed", passed}});
+  };
+  auto await = [](const std::function<bool()> &ready) {
+    const auto deadline = Clock::now() + std::chrono::seconds(2);
+    do {
+      if (ready())
+        return true;
+      Sleep(5);
+    } while (Clock::now() < deadline);
+    return ready();
+  };
+  auto job = [](const char *key, const char *provider = "google") {
+    auto j = std::make_shared<Job>();
+    j->key = j->source = key;
+    j->settings.provider = provider;
+    return j;
+  };
+  auto state = [](const std::shared_ptr<Bus> &bus, const std::string &key) {
+    std::lock_guard<std::mutex> lock(bus->mutex);
+    const auto found = bus->results.find("0|" + key + "|0");
+    return found == bus->results.end() ? std::string()
+                                       : found->second.value("state", "");
+  };
+  auto expire = [](const std::shared_ptr<Worker> &w,
+                   const std::shared_ptr<Job> &j) {
+    std::lock_guard<std::mutex> lock(w->mutex);
+    w->cooldowns[Worker::serviceKey(j->settings)].until = Clock::now();
+    w->changed.notify_all();
+  };
+  {
+    auto bus = std::make_shared<Bus>();
+    std::atomic_uint calls{0};
+    auto w = std::make_shared<Worker>(
+        bus, [&](const cclive::Settings &, const std::string &text,
+                 const cclive::Delta &delta, const std::atomic_bool &) {
+          if (++calls == 1) {
+            if (delta)
+              delta("discarded partial");
+            throw cclive::TranslationRateLimited(1000);
+          }
+          if (delta)
+            delta("translated " + text);
+          return "translated " + text;
+        });
+    auto first = job("first"), second = job("second");
+    w->submit(first);
+    w->submit(second);
+    std::thread thread([w] { w->run(); });
+    const bool cooling =
+        await([&] { return state(bus, "first") == "rate_limited"; });
+    Sleep(30);
+    check("http_429_holds_following_sentences_without_request_storm",
+          cooling && calls.load() == 1 && state(bus, "second").empty());
+    expire(w, first);
+    const bool resumed = await([&] { return state(bus, "second") == "done"; });
+    check("rate_limited_sentence_and_queue_resume_after_cooldown",
+          resumed && calls.load() == 3 && state(bus, "first") == "done");
+    {
+      std::lock_guard<std::mutex> lock(bus->mutex);
+      const auto found = bus->results.find("0|first|0");
+      check("http_429_retry_discards_partial_translation_before_restart",
+            found != bus->results.end() &&
+                found->second.value("translation", "") == "translated first");
+    }
+    w->stop();
+    thread.join();
+  }
+  {
+    auto bus = std::make_shared<Bus>();
+    std::atomic_uint calls{0};
+    auto w = std::make_shared<Worker>(
+        bus, [&](const cclive::Settings &s, const std::string &,
+                 const cclive::Delta &, const std::atomic_bool &) {
+          ++calls;
+          if (s.provider == "google")
+            throw cclive::TranslationRateLimited(600000);
+          return std::string("local translation");
+        });
+    auto first = job("cancelled"), other = job("other", "ollama");
+    w->submit(first);
+    w->submit(other);
+    std::thread thread([w] { w->run(); });
+    const bool cooling =
+        await([&] { return state(bus, "cancelled") == "rate_limited"; });
+    {
+      std::lock_guard<std::mutex> lock(w->mutex);
+      const auto gate = w->cooldowns.find(Worker::serviceKey(first->settings));
+      check("server_retry_after_longer_than_local_backoff_is_respected",
+            cooling && gate != w->cooldowns.end() &&
+                gate->second.until - Clock::now() > std::chrono::seconds(595));
+    }
+    w->cancel(first->key);
+    const bool switched = await([&] { return state(bus, "other") == "done"; });
+    check("cancel_during_cooldown_allows_another_service_to_proceed",
+          cooling && switched && calls.load() == 2);
+    auto retried = job("manual-retry");
+    w->submit(retried);
+    const bool held =
+        await([&] { return state(bus, "manual-retry") == "rate_limited"; });
+    check("manual_retry_does_not_bypass_shared_service_cooldown",
+          held && calls.load() == 2);
+    const auto beforeStop = Clock::now();
+    w->stop();
+    thread.join();
+    check("worker_shutdown_interrupts_long_rate_limit_wait",
+          Clock::now() - beforeStop < std::chrono::seconds(1));
+  }
+  {
+    auto bus = std::make_shared<Bus>();
+    std::atomic_uint calls{0};
+    auto w = std::make_shared<Worker>(
+        bus,
+        [&](const cclive::Settings &, const std::string &,
+            const cclive::Delta &, const std::atomic_bool &) -> std::string {
+          ++calls;
+          throw cclive::TranslationRateLimited(1000);
+        });
+    auto first = job("persistent-limit");
+    w->submit(first);
+    std::thread thread([w] { w->run(); });
+    bool bounded = true, backoff = true;
+    for (unsigned attempt = 1; attempt <= 4; ++attempt) {
+      const std::string wanted = attempt < 4 ? "rate_limited" : "error";
+      bounded =
+          await([&] {
+            return calls.load() == attempt && state(bus, first->key) == wanted;
+          }) &&
+          bounded;
+      {
+        std::lock_guard<std::mutex> lock(w->mutex);
+        const auto gate =
+            w->cooldowns.find(Worker::serviceKey(first->settings));
+        const auto expected =
+            std::chrono::milliseconds(int64_t(60000) << (attempt - 1));
+        backoff = gate != w->cooldowns.end() &&
+                  gate->second.until - Clock::now() >=
+                      expected - std::chrono::seconds(2) &&
+                  backoff;
+      }
+      if (attempt < 4)
+        expire(w, first);
+    }
+    check("repeated_http_429_uses_increasing_service_backoff", backoff);
+    check("http_429_auto_retry_is_bounded_to_three_retries",
+          bounded && calls.load() == 4);
+    w->stop();
+    thread.join();
+  }
+  {
+    auto bus = std::make_shared<Bus>();
+    std::atomic_uint calls{0};
+    auto w = std::make_shared<Worker>(bus,
+        [&](const cclive::Settings &, const std::string &,
+            const cclive::Delta &, const std::atomic_bool &) {
+          ++calls;
+          return std::string("valid translation");
+        });
+    auto invalid = job("invalid-service", "openai");
+    invalid->settings.base_url = "https://user:pass@example.com";
+    auto valid = job("after-invalid", "demo");
+    w->submit(invalid);
+    w->submit(valid);
+    std::thread thread([w] { w->run(); });
+    const bool survived = await([&] { return state(bus, valid->key) == "done"; });
+    check("invalid_service_address_reports_error_and_worker_continues",
+          survived && state(bus, invalid->key) == "error" && calls.load() == 1);
+    w->stop();
+    thread.join();
+  }
+  return checks;
+}
 std::vector<wchar_t> readerEnvironment(const std::string &secret) {
   std::set<std::wstring> allowed = {L"SYSTEMROOT",   L"WINDIR",
                                     L"PATH",         L"TEMP",
@@ -885,7 +1147,7 @@ struct Record {
 class App;
 struct Config {
   App *app = nullptr;
-  HWND hwnd = nullptr;
+  HWND hwnd = nullptr, previousFocus = nullptr;
   std::vector<HWND> edits;
   HWND error = nullptr;
 };
@@ -1745,7 +2007,8 @@ public:
       windowReplayMemo.clear();
     if ((it->source == source || it->sourceSignature == incomingSignature) &&
         (it->state == "done" || it->state == "queued" ||
-         it->state == "translating" || it->state == "paused")) {
+         it->state == "translating" || it->state == "rate_limited" ||
+         it->state == "paused")) {
       dirty = cacheDirty = true;
       trimRecords();
       return;
@@ -2183,18 +2446,24 @@ public:
         });
     if (it == records.end() || it->version != v.value("version", 0ULL))
       return;
+    const auto previousState = it->state;
     it->state = v.value("state", "");
     it->translation = v.value("translation", "");
     it->error = v.value("error", "");
     dirty = cacheDirty = true;
     if (it->state == "error")
       status("部分文字翻译失败，可检查设置后重试");
+    else if (it->state == "rate_limited")
+      status(it->error);
+    else if (previousState == "rate_limited" &&
+             (it->state == "translating" || it->state == "done"))
+      status("限流等待已结束，继续翻译");
     trimRecords();
   }
   json checkUiRegressions() {
     // Self-test only: supplied synthetic events, hidden native windows, demo
     // provider. No window enumeration, Claude reading, clipboard or network.
-    json checks = json::array();
+    json checks = workerRateLimitChecks();
     auto check = [&](const char *name, bool passed) {
       checks.push_back({{"name", name}, {"passed", passed}});
     };
@@ -2427,6 +2696,78 @@ public:
     records = std::move(fontFixtureRecords);
     paused = fixturePaused;
     followingSource = followingTranslation = true;
+
+    // Use the real modal open/close paths with hidden windows. Observe the
+    // owner during WM_DESTROY: enabling it only at WM_NCDESTROY is too late
+    // for Windows to choose it as the next active window.
+    struct SettingsCloseObservation {
+      HWND owner = nullptr;
+      bool destroyed = false, ownerEnabled = false;
+    };
+    auto observeSettingsClose = [](HWND window, UINT message, WPARAM wp,
+                                   LPARAM lp, UINT_PTR,
+                                   DWORD_PTR payload) -> LRESULT {
+      auto &observation =
+          *reinterpret_cast<SettingsCloseObservation *>(payload);
+      if (message == WM_DESTROY) {
+        observation.destroyed = true;
+        observation.ownerEnabled = IsWindowEnabled(observation.owner);
+      }
+      return DefSubclassProc(window, message, wp, lp);
+    };
+    const bool ownerInitiallyVisible = IsWindowVisible(hwnd),
+               ownerInitiallyIconic = IsIconic(hwnd);
+    const char *settingsCloseChecks[] = {
+        "settings_ok_reenables_owner_before_destroy",
+        "settings_cancel_reenables_owner_before_destroy",
+        "settings_close_reenables_owner_before_destroy",
+        "settings_escape_reenables_owner_before_destroy"};
+    for (int route = 0; route < 4; ++route) {
+      const HWND foregroundBefore = GetForegroundWindow();
+      openConfig();
+      if (!config) {
+        check(settingsCloseChecks[route], false);
+        continue;
+      }
+      const HWND dialog = config->hwnd;
+      const bool hiddenModal = !IsWindowVisible(dialog) && !IsWindowEnabled(hwnd);
+      SettingsCloseObservation observation{hwnd};
+      SetWindowSubclass(dialog, observeSettingsClose, 1,
+                        reinterpret_cast<DWORD_PTR>(&observation));
+      if (route < 2)
+        SendMessageW(dialog, WM_COMMAND,
+                     MAKEWPARAM(route == 0 ? IDOK : IDCANCEL, BN_CLICKED), 0);
+      else if (route == 2)
+        SendMessageW(dialog, WM_SYSCOMMAND, SC_CLOSE, 0);
+      else {
+        MSG escape{};
+        escape.hwnd = config->edits[1];
+        escape.message = WM_KEYDOWN;
+        escape.wParam = VK_ESCAPE;
+        IsDialogMessageW(dialog, &escape);
+      }
+      check(settingsCloseChecks[route],
+            hiddenModal && observation.destroyed && observation.ownerEnabled &&
+                !config && !IsWindow(dialog) && IsWindowEnabled(hwnd) &&
+                IsWindowVisible(hwnd) == ownerInitiallyVisible &&
+                IsIconic(hwnd) == ownerInitiallyIconic &&
+                GetForegroundWindow() == foregroundBefore);
+      if (config)
+        closeConfig(false);
+    }
+    openConfig();
+    if (config) {
+      const HWND dialog = config->hwnd;
+      SetWindowTextW(config->edits[6], L"invalid");
+      SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+      check("settings_invalid_save_keeps_dialog_and_owner_modal",
+            config && config->hwnd == dialog && IsWindow(dialog) &&
+                !IsWindowEnabled(hwnd) && !textOf(config->error).empty());
+      closeConfig(false);
+    } else
+      check("settings_invalid_save_keeps_dialog_and_owner_modal", false);
+    check("settings_self_test_keeps_main_hidden_and_offline",
+          !IsWindowVisible(hwnd) && !watcher && settings.provider == "demo");
 
     // Exercise long incremental output in the actual RichEdit control.
     // Synthetic text only: follow the end until a deliberate user scroll moves
@@ -3239,6 +3580,7 @@ public:
     publishDiagnostic(true);
   }
   void openConfig();
+  void closeConfig(bool restoreActivation = true);
   static LRESULT CALLBACK windowProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
     App *a = (App *)GetWindowLongPtrW(w, GWLP_USERDATA);
     if (m == WM_NCCREATE) {
@@ -3364,8 +3706,7 @@ public:
         }
       return 0;
     case WM_CLOSE:
-      if (a->config)
-        DestroyWindow(a->config->hwnd);
+      a->closeConfig(false);
       DestroyWindow(w);
       return 0;
     case WM_DESTROY:
@@ -3460,7 +3801,7 @@ LRESULT CALLBACK configProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
   }
   if (msg == WM_COMMAND && HIWORD(wp) == BN_CLICKED) {
     if (LOWORD(wp) == IDCANCEL) {
-      DestroyWindow(w);
+      a.closeConfig();
       return 0;
     }
     if (LOWORD(wp) == IDOK) {
@@ -3495,7 +3836,7 @@ LRESULT CALLBACK configProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (!(a.demo || a.selfTest))
           cclive::save_settings(a.configPath, updated);
         a.applySettings(std::move(updated), !key.empty());
-        DestroyWindow(w);
+        a.closeConfig();
       } catch (const std::exception &e) {
         SetWindowTextW(c->error, wide(e.what()).c_str());
       }
@@ -3528,25 +3869,56 @@ LRESULT CALLBACK configProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     return 1;
   }
   if (msg == WM_CLOSE) {
-    DestroyWindow(w);
+    a.closeConfig();
     return 0;
   }
   if (msg == WM_NCDESTROY) {
-    a.config = nullptr;
-    EnableWindow(a.hwnd, TRUE);
+    if (a.config == c)
+      a.config = nullptr;
+    // Defensive cleanup for failed creation or owner-driven destruction.
+    // Normal closes already enabled the owner before DestroyWindow.
+    if (IsWindow(a.hwnd))
+      EnableWindow(a.hwnd, TRUE);
     SetWindowLongPtrW(w, GWLP_USERDATA, 0);
     delete c;
     return DefWindowProcW(w, msg, wp, lp);
   }
   return DefWindowProcW(w, msg, wp, lp);
 }
+void App::closeConfig(bool restoreActivation) {
+  if (!config)
+    return;
+  const HWND dialog = config->hwnd;
+  const HWND previousFocus = config->previousFocus;
+  const bool wasForeground = GetForegroundWindow() == dialog;
+  // An active window's owner must be enabled before destroying that window,
+  // otherwise Windows can activate another application instead of the owner.
+  if (IsWindow(hwnd))
+    EnableWindow(hwnd, TRUE);
+  DestroyWindow(dialog);
+  if (restoreActivation && wasForeground && !selfTest && IsWindow(hwnd) &&
+      IsWindowVisible(hwnd)) {
+    if (IsIconic(hwnd))
+      ShowWindow(hwnd, SW_RESTORE);
+    SetActiveWindow(hwnd);
+    const HWND focus = IsWindow(previousFocus) && IsChild(hwnd, previousFocus) &&
+                               IsWindowEnabled(previousFocus) &&
+                               IsWindowVisible(previousFocus)
+                           ? previousFocus
+                           : settingsButton;
+    if (IsWindow(focus))
+      SetFocus(focus);
+  }
+}
 void App::openConfig() {
   if (config) {
-    ShowWindow(config->hwnd, SW_SHOW);
+    if (!selfTest)
+      ShowWindow(config->hwnd, SW_SHOW);
     return;
   }
   config = new Config();
   config->app = this;
+  config->previousFocus = GetFocus();
   RECT r{};
   GetWindowRect(hwnd, &r);
   HWND w = CreateWindowExW(WS_EX_DLGMODALFRAME, L"CCLiveSettings", L"翻译设置",
@@ -3560,7 +3932,10 @@ void App::openConfig() {
     return;
   }
   EnableWindow(hwnd, FALSE);
-  ShowWindow(w, SW_SHOW);
+  if (!selfTest) {
+    ShowWindow(w, SW_SHOW);
+    SetFocus(config->edits.front());
+  }
 }
 int gui(bool demo, bool check, const fs::path &report, bool automatic,
         const fs::path &statusPath) {

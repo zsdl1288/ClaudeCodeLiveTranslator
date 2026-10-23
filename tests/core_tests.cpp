@@ -2,6 +2,7 @@
 #define NOMINMAX
 #include <winsock2.h>
 #include <windows.h>
+#include <winhttp.h>
 #include "core.hpp"
 #include <chrono>
 #include <fstream>
@@ -48,6 +49,15 @@ struct HttpServer {
     void wait(){if(thread.joinable())thread.join();}
 };
 Settings api(const HttpServer& server,const std::string& provider="openai"){Settings s;s.provider=provider;s.model="test-model";s.base_url=server.base;return s;}
+std::string http_date_after(int seconds) {
+    FILETIME file{};GetSystemTimeAsFileTime(&file);
+    ULARGE_INTEGER value{};value.LowPart=file.dwLowDateTime;value.HighPart=file.dwHighDateTime;
+    value.QuadPart=static_cast<ULONGLONG>(static_cast<std::int64_t>(value.QuadPart)+static_cast<std::int64_t>(seconds)*10000000);
+    file.dwLowDateTime=value.LowPart;file.dwHighDateTime=value.HighPart;
+    SYSTEMTIME system{};wchar_t date[WINHTTP_TIME_FORMAT_BUFSIZE]{};
+    if(!FileTimeToSystemTime(&file,&system)||!WinHttpTimeFromSystemTime(&system,date))throw std::runtime_error("HTTP date fixture");
+    return to_utf8(date);
+}
 }
 int main(){
     WSADATA wsa{};if(WSAStartup(MAKEWORD(2,2),&wsa))return 2;
@@ -132,6 +142,29 @@ int main(){
         check(parse_openai_content(json::parse(R"({"choices":[{"delta":{"role":"assistant"}}]})"),true).empty(),"Role-only chunk accepted");
         rejects([]{parse_openai_content(json::parse(R"({"choices":["unexpected"]})"),false);},"Invalid choices shape rejected");
         rejects([]{parse_openai_content(json::parse(R"({"choices":[{"message":{"content":[{}]}}]})"),false);},"Nontext output rejected");
+        {
+            Settings openai;openai.provider="openai";const auto openai_key=translation_service_key(openai);
+            for(const auto* url:{"https://api.openai.com/v1","https://api.openai.com/v1/","https://api.openai.com/v1/chat/completions","https://API.OPENAI.COM:443/v1/chat/completions/"}) {
+                auto equivalent=openai;equivalent.base_url=url;
+                check(translation_service_key(equivalent)==openai_key,"OpenAI default, slash and full endpoint share cooldown key");
+            }
+            auto changed=openai;changed.model="another-model";changed.target="ja";changed.api_key_env="ANOTHER_API_KEY";
+            check(translation_service_key(changed)==openai_key,"Model, target and credential name do not bypass service cooldown");
+            for(const auto* url:{"https://proxy.example.com/v1","https://api.openai.com/V1","http://api.openai.com/v1","https://api.openai.com:8443/v1"}) {
+                changed=openai;changed.base_url=url;
+                check(translation_service_key(changed)!=openai_key,"Host, case-sensitive path, scheme and port distinguish service destinations");
+            }
+            Settings ollama;ollama.provider="ollama";const auto ollama_key=translation_service_key(ollama);
+            for(const auto* url:{"http://127.0.0.1:11434","http://127.0.0.1:11434/","http://127.0.0.1:11434/api/","http://127.0.0.1:11434/api/chat/"}) {
+                auto equivalent=ollama;equivalent.base_url=url;
+                check(translation_service_key(equivalent)==ollama_key,"Ollama default, slash and full endpoint share cooldown key");
+            }
+            check(ollama_key!=openai_key,"Different providers keep distinct service cooldown keys");
+            Settings fixed;const auto google_key=translation_service_key(fixed);fixed.base_url="https://ignored.example/";fixed.model="unused";fixed.target="fr";
+            check(translation_service_key(fixed)==google_key,"Google always uses its fixed service destination key");
+            fixed.provider="demo";const auto demo_key=translation_service_key(fixed);fixed.base_url.clear();
+            check(translation_service_key(fixed)==demo_key&&demo_key!=google_key,"Demo has a fixed service key distinct from Google");
+        }
         std::atomic_bool cancel{false};Settings offline;offline.provider="demo";
         check(translate(offline,"All tests passed.",{},cancel)=="所有测试均已通过。","Offline demo translates fixed example");
         check(translate(offline,"Unrecognized sentence",{},cancel).find("离线演示")!=std::string::npos,"Offline unknown text explicitly labeled");
@@ -167,6 +200,35 @@ int main(){
         {
             HttpServer server("SUPER_SECRET_SERVER_BODY","application/json",401);std::string error;try{translate(api(server),"Hello",{},cancel);}catch(const TranslationError&e){error=e.what();}
             check(error.find("401")!=std::string::npos&&error.find("SUPER_SECRET_SERVER_BODY")==std::string::npos,"HTTP errors safely summarized");
+        }
+        {
+            auto rate_limit=[&](const std::string& headers,std::int64_t minimum,std::int64_t maximum,const std::string& provider="openai") {
+                // A successful stream body would emit a delta if HTTP status handling read it.
+                HttpServer server("data: {\"choices\":[{\"delta\":{\"content\":\"SUPER_SECRET_SERVER_BODY\"}}]}\n\ndata: [DONE]\n\n","text/event-stream",429,headers);
+                std::vector<std::string> deltas;bool limited=false;std::int64_t delay=0;std::string message;
+                try{translate(api(server,provider),"Hello",[&](const std::string& value){deltas.push_back(value);},cancel);}
+                catch(const TranslationRateLimited& e){limited=true;delay=e.retry_after_ms;message=e.what();}
+                catch(const TranslationError& e){message=e.what();}
+                if(!limited||delay<minimum||delay>maximum)std::cerr<<"Retry-After fixture: "<<headers<<" delay="<<delay<<", expected "<<minimum<<".."<<maximum<<"\n";
+                check(limited&&delay>=minimum&&delay<=maximum,"HTTP 429 exposes typed bounded Retry-After delay");
+                check(message.find("429")!=std::string::npos&&message.find("请求过于频繁")!=std::string::npos&&message.find("SUPER_SECRET_SERVER_BODY")==std::string::npos,"HTTP 429 displays friendly summary without server body");
+                check(deltas.empty(),"HTTP 429 never emits response body as translation delta");
+                server.wait();check(server.requests==1,"HTTP 429 returns to caller without hidden retries");
+            };
+            rate_limit("Retry-After: 7\r\n",7000,7000);
+            rate_limit("Retry-After: \t3 \t\r\n",3000,3000);
+            rate_limit("Retry-After: 0\r\n",1000,1000);
+            rate_limit("",60000,60000);
+            rate_limit("Retry-After: invalid-date\r\n",60000,60000);
+            rate_limit("Retry-After: nonsense 12:00:00 GMT\r\n",60000,60000);
+            rate_limit("Retry-After: Sun, 99 Oct 2026 99:99:99 GMT\r\n",60000,60000);
+            rate_limit("Retry-After: -2\r\n",60000,60000);
+            rate_limit("Retry-After: 1.5\r\n",60000,60000);
+            rate_limit("Retry-After: 999999999999999999999999999999999999\r\n",86400000,86400000);
+            rate_limit("Retry-After: "+http_date_after(120)+"\r\n",110000,120000);
+            rate_limit("Retry-After: "+http_date_after(-120)+"\r\n",1000,1000);
+            rate_limit("Retry-After: "+http_date_after(2*24*60*60)+"\r\n",86400000,86400000);
+            rate_limit("Retry-After: 9\r\n",9000,9000,"ollama");
         }
         {
             HttpServer server("","application/json",302,"Location: http://127.0.0.1:1/forbidden\r\n");std::string error;try{translate(api(server),"Hello",{},cancel);}catch(const TranslationError&e){error=e.what();}
