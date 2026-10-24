@@ -65,6 +65,46 @@ int main(){
     try{
         check(to_utf8(to_wide("中文 English 😀"))=="中文 English 😀","Unicode roundtrip");
         {
+            for(const auto& text:std::vector<std::string>{"全部修改已完成。", "繁體中文也直接顯示。", "## 更新结果\n- **完成 123 项**，耗时 3.14 秒。✅", "𠀀字与中文标点，😀"})
+                check(is_chinese_text(text),"Chinese detection accepts Han prose with formatting numbers punctuation and emoji");
+            for(const auto& text:std::vector<std::string>{"", " \n\t", "12345，✅", "English prose.", "中文 mixed prose。", "检查 `app.cpp` 文件。", "中文 русский", "中文 café", "中文かな", "中文한국어"})
+                check(!is_chinese_text(text),"Chinese detection requires Han prose without foreign-language letters");
+            Settings settings;
+            for(const auto* target:{"zh", "zh-CN", "zh-TW", "ZH-hans", "CHT"}) {
+                settings.target=target;
+                check(chinese_passthrough(settings,"中文保持原样。"),"Chinese targets accept local Chinese passthrough case insensitively");
+            }
+            for(const auto* target:{"en", "ja", "zhfoo"}) {
+                settings.target=target;
+                check(!chinese_passthrough(settings,"中文需要翻译。"),"Non-Chinese targets retain translation behavior for Chinese source");
+            }
+            settings.target="zh-CN";
+            const std::string table="| 项目 | 说明 |\n| --- | --- |\n| 1 | 第一行<br>第二行 |";
+            check(chinese_passthrough(settings,table),"Chinese table detection decodes cell line breaks without treating br as English");
+            check(!chinese_passthrough(settings,"| 项目 | 说明 |\n| --- | --- |\n| 1 | English |"),"A table with English cell text still needs translation");
+        }
+        {
+            const std::string source="## 更新结果\n\n全部修改已完成，保留 **粗体** 和 123。✅";
+            std::atomic_bool cancel{false};
+            for(const auto* provider:{"google", "openai", "ollama", "baidu", "chatgpt", "codex", "demo"}) {
+                Settings settings;settings.provider=provider;
+                settings.base_url="invalid endpoint";settings.api_key_env="invalid-name";
+                settings.baidu_app_id="invalid-app-id";settings.codex_model="--invalid-model";
+                std::vector<std::string> deltas;
+                check(translate(settings,source,[&](const auto& value){deltas.push_back(value);},cancel)==source &&
+                      deltas==std::vector<std::string>{source},"Every provider returns Chinese locally before configuration credentials model or service access");
+            }
+            Settings settings;settings.provider="chatgpt";
+            cancel=true;int callbacks=0;bool cancelled=false;
+            try { translate(settings,source,[&](const auto&){++callbacks;},cancel); }
+            catch(const TranslationCancelled&){cancelled=true;}
+            check(cancelled&&callbacks==0,"Chinese passthrough honors cancellation before publishing any text");
+            cancel=false;cancelled=false;
+            try { translate(settings,source,[&](const auto&){++callbacks;cancel=true;},cancel); }
+            catch(const TranslationCancelled&){cancelled=true;}
+            check(cancelled&&callbacks==1,"Chinese passthrough honors cancellation raised by its single coherent delta");
+        }
+        {
             const std::string table = "| Item | Time | Notes |\n| :--- | ---: | --- |\n| Shot 1. Second sentence. | 11–14 | a\\|b |\n| Shot 2 | 17–31 |  |";
             const auto parts = split_text_segments("Before.\n\n" + table + "\n\nAfter.");
             check(parts.size()==3 && parts[1].text==table && parts[1].paragraph==1,
@@ -233,8 +273,29 @@ int main(){
             l.observe_at({{"context","chat-a"},{"blocks",json::array()}},3200);check(l.observe_at(snap("Old pending reply."),4500).empty(),"Reappearing emitted block deduplicates");
         }
         {
-            Ledger l;l.observe_at(snap("全部修改已完成。\n\n12345"),0);check(l.flush_at(1000).empty(),"Chinese and numbers skip blank cards");
-            l.observe_at(snap("All done."),1100);auto first=l.flush_at(2100)[0];l.observe_at(snap("已完成。"),2200);auto clear=l.flush_at(3200)[0];check(clear["text"]==""&&clear["key"]==first["key"]&&clear["revision"]==2,"English to Chinese rewrite removes stale translation");
+            Ledger l;l.observe_at(snap("全部修改已完成。\n\n12345"),0);
+            check(texts(l.flush_at(1000))==std::vector<std::string>{"全部修改已完成。"},"Chinese paragraphs are emitted while numeric-only cards remain filtered");
+            check(l.flush_at(2000).empty(),"Unchanged Chinese paragraphs are deduplicated");
+            Ledger rewrite;
+            rewrite.observe_at(snap("All done."),0);auto first=rewrite.flush_at(1000)[0];
+            rewrite.observe_at(snap("已完成。"),1100);auto chinese=rewrite.flush_at(2100)[0];
+            check(chinese["text"]=="已完成。"&&chinese["key"]==first["key"]&&chinese["revision"]==2,
+                  "English to Chinese rewrite retains its slot and emits source text for local display");
+            rewrite.observe_at(snap("已完成，全部检查通过。"),2200);auto revised=rewrite.flush_at(3200)[0];
+            check(revised["text"]=="已完成，全部检查通过。"&&revised["key"]==first["key"]&&revised["revision"]==3,
+                  "Chinese source revisions replace the same stable caption slot");
+            rewrite.observe_at(snap("The final result."),3300);auto english=rewrite.flush_at(4300)[0];
+            check(english["text"]=="The final result."&&english["key"]==first["key"]&&english["revision"]==4,
+                  "Chinese to English rewrite retains normal translation event identity");
+        }
+        {
+            Ledger structured(100);
+            structured.observe_at(snap("## 更新结果\n\n正文已完成。\n\n- 检查通过\n- 无需联网"),0);
+            check(structured.flush_at(99).empty(),"Chinese source still observes the configured stability delay");
+            const auto events=structured.flush_at(100);
+            check(texts(events)==std::vector<std::string>({"## 更新结果","正文已完成。","- 检查通过","- 无需联网"})&&
+                  events[0]["paragraph"]!=events[1]["paragraph"]&&events[1]["paragraph"]!=events[2]["paragraph"]&&events[2]["paragraph"]!=events[3]["paragraph"],
+                  "Chinese headings paragraphs and list items retain their normal layout boundaries");
         }
         {
             Ledger l;l.observe_at(snap("An interim result.","chat-a","intermediate"),0);auto first=l.flush_at(1000)[0];l.observe_at(snap("An interim result.","chat-a","answer"),1100);auto final=l.flush_at(2100)[0];
@@ -385,6 +446,22 @@ int main(){
         check(translate(google,"~~~cpp\nreturn 0;",{},cancel)=="~~~cpp\nreturn 0;","Unclosed code fence never sent for translation");
         check(translate(offline," \n",{},cancel).empty(),"Whitespace input returns empty");rejects([&]{translate(offline,std::string(50001,'a'),{},cancel);},"Input size bounded");
         cancel=true;rejects([&]{translate(offline,"Hello",{},cancel);},"Cancellation before provider");cancel=false;
+        {
+            HttpServer server(R"({"choices":[{"message":{"content":"混合内容的译文。"}}]})");
+            const auto settings=api(server);const std::string chinese="已完成，保留原文。";
+            check(translate(settings,chinese,{},cancel)==chinese&&server.requests==0,"Chinese passthrough makes no request to a configured provider");
+            const std::string mixed="检查 English 正文。";
+            check(translate(settings,mixed,{},cancel)=="混合内容的译文。","Mixed Chinese and English prose still reaches the translation provider");
+            server.wait();
+            check(server.requests==1&&json::parse(server.received.substr(server.received.find("\r\n\r\n")+4))["messages"].back()["content"]==mixed,
+                  "Only the mixed paragraph is sent after Chinese local display");
+        }
+        {
+            HttpServer server(R"({"choices":[{"message":{"content":"The work is complete."}}]})");
+            auto settings=api(server);settings.target="en";
+            check(translate(settings,"全部完成。",{},cancel)=="The work is complete.","Chinese source is translated when a non-Chinese target is selected");
+            server.wait();check(server.requests==1,"Non-Chinese target does not activate Chinese passthrough");
+        }
         {
             HttpServer server(R"({"choices":[{"message":{"content":"你好"}}]})");auto cfg=api(server);cfg.base_url+="/v1";cfg.api_key_env="CCLIVE_TEST_KEY";std::vector<std::string> deltas;
             check(translate(cfg,"Inspect C:\\repo\\app.cpp",[&](const std::string& d){deltas.push_back(d);},cancel)=="你好"&&deltas==std::vector<std::string>({"你好"}),"WinHTTP OpenAI JSON translation");

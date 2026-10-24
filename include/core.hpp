@@ -41,6 +41,10 @@ public:
     TranslationRateLimited(std::int64_t delay_ms, const std::string& safe_message);
     const std::int64_t retry_after_ms;
 };
+// Conservative Han prose detection: symbols, numbers and Markdown are allowed;
+// other-language letters keep the normal translation path.
+bool is_chinese_text(const std::string& utf8);
+bool chinese_passthrough(const Settings&, const std::string& utf8);
 using Delta = std::function<void(const std::string&)>;
 std::string translate(const Settings&, const std::string& utf8, const Delta&, const std::atomic_bool& cancel);
 // Parsing helpers are also used by the native regression checks.

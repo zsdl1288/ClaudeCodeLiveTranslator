@@ -302,6 +302,48 @@ std::string to_utf8(const std::wstring& s) {
     if(!n)throw TranslationError("文本含有无效的 Unicode 字符。");
     std::string out(n,'\0'); WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,s.data(),static_cast<int>(s.size()),out.data(),n,nullptr,nullptr);return out;
 }
+bool is_chinese_text(const std::string& text) {
+    std::string prose = text;
+    const auto table = markdown::table(std::string_view(text));
+    if (!table.empty()) {
+        prose.clear();
+        for (std::size_t r = 0; r < table.size(); ++r) {
+            if (r == 1) continue;
+            const auto& row = table[r];
+            const auto line = std::string_view(text).substr(row.start, row.length);
+            for (const auto& cell : row.cells) {
+                prose += markdown::decode_cell(line.substr(cell.start, cell.length));
+                prose += '\n';
+            }
+        }
+    }
+    const auto wide = to_wide(prose);
+    if (wide.empty()) return false;
+    std::vector<WORD> types(wide.size());
+    if (!GetStringTypeW(CT_CTYPE1, wide.data(), static_cast<int>(wide.size()), types.data())) return false;
+    bool han = false;
+    for (std::size_t i = 0; i < wide.size(); ++i) {
+        auto cp = static_cast<std::uint32_t>(wide[i]);
+        if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < wide.size()) {
+            cp = 0x10000 + ((cp - 0xd800) << 10) + (static_cast<std::uint32_t>(wide[++i]) - 0xdc00);
+        }
+        if ((cp >= 0x3400 && cp <= 0x4dbf) || (cp >= 0x4e00 && cp <= 0x9fff) ||
+            (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0x20000 && cp <= 0x2fa1f) ||
+            (cp >= 0x30000 && cp <= 0x323af) || cp == 0x3007) {
+            han = true;
+        } else if (cp > 0xffff) {
+            // Emoji and ideographic variation selectors are neutral. Unknown
+            // supplementary scripts are kept on the translation path.
+            if (!((cp >= 0x1f000 && cp <= 0x1faff) || (cp >= 0xe0100 && cp <= 0xe01ef))) return false;
+        } else if (types[i] & C1_ALPHA) return false;
+    }
+    return han;
+}
+bool chinese_passthrough(const Settings& settings, const std::string& text) {
+    auto target = trim(settings.target);
+    std::transform(target.begin(), target.end(), target.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return (target == "zh" || target.rfind("zh-", 0) == 0 || target == "cht") && is_chinese_text(text);
+}
 std::string translation_service_key(const Settings& settings) {
     if(settings.provider=="google"||settings.provider=="demo"||settings.provider=="baidu"||settings.provider=="chatgpt"||settings.provider=="codex")return settings.provider;
     if(settings.provider!="openai"&&settings.provider!="ollama")throw TranslationError("翻译服务须为 google、openai、ollama、baidu、chatgpt、codex 或 demo。");
@@ -416,7 +458,13 @@ std::string parse_baidu_content(const json& data) {
     if(trim(result).empty())throw TranslationError("百度翻译未返回有效译文。");to_wide(result);return result;
 }
 std::string translate(const Settings& s,const std::string& text,const Delta& delta,const std::atomic_bool& cancel) {
-    check_cancel(cancel);if(trim(text).empty())return "";if(to_wide(text).size()>50000)throw TranslationError("单次待翻译内容过长，请分段后重试。");s.validate();
+    check_cancel(cancel);if(trim(text).empty())return "";if(to_wide(text).size()>50000)throw TranslationError("单次待翻译内容过长，请分段后重试。");
+    if (chinese_passthrough(s, text)) {
+        if (delta) delta(text);
+        check_cancel(cancel);
+        return text;
+    }
+    s.validate();
     // Translate cell contents separately: providers never receive or rewrite
     // table separators, empty cells, numeric-only cells or row/column positions.
     const auto table = markdown::table(std::string_view(text));
@@ -699,7 +747,7 @@ std::vector<json> Ledger::observe_at(const json& snapshot,std::int64_t now){
 std::vector<json> Ledger::flush_at(std::int64_t now){
     std::vector<json> out;
     for(auto& block:blocks_){if(!block.present)continue;for(std::size_t i=0;i<block.segments.size();++i){auto& slot=block.segments[i];if(now-slot.changed<settle_)continue;
-        std::string wanted=(english(slot.text)||!markdown::table(std::string_view(slot.text)).empty())?slot.text:"";
+        std::string wanted=(english(slot.text)||is_chinese_text(slot.text)||!markdown::table(std::string_view(slot.text)).empty())?slot.text:"";
         if(slot.emitted&&slot.emitted_text==wanted&&slot.emitted_kind==block.kind&&slot.emitted_paragraph==slot.paragraph)continue;
         if(wanted.empty()&&slot.emitted_text.empty()){slot.emitted=true;slot.emitted_text="";slot.emitted_kind=block.kind;slot.emitted_paragraph=slot.paragraph;continue;}
         ++slot.revision;out.push_back({{"type","text"},{"key",json::array({epoch_,block.key,slot.id}).dump()},{"block_key",block.key},{"segment",slot.id},{"source_segment",i},{"paragraph",slot.paragraph},{"text",wanted},{"kind",block.kind},{"epoch",epoch_},{"revision",slot.revision},{"stable",true}});

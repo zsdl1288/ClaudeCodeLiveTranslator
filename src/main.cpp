@@ -2501,6 +2501,17 @@ public:
   }
   void enqueue(Record &r) {
     worker->cancel(r.key);
+    if (cclive::chinese_passthrough(settings, r.source)) {
+      const bool changed = !r.visible || r.translation != r.source || r.pendingReplacement;
+      r.translation = r.source;
+      r.state = "done";
+      r.error.clear();
+      r.pendingReplacement = false;
+      r.visible = true;
+      if (changed) r.displayedUpdate = ++displayedUpdateSequence;
+      dirty = cacheDirty = true;
+      return;
+    }
     auto j = std::make_shared<Job>();
     j->generation = generation;
     j->version = r.version;
@@ -2880,7 +2891,7 @@ public:
     it->error.clear();
     it->version = ++revision;
     it->state = paused ? "paused" : "waiting";
-    if (!paused)
+    if (!paused || cclive::chinese_passthrough(settings, it->source))
       enqueue(*it);
     dirty = cacheDirty = true;
     trimRecords();
@@ -5356,6 +5367,110 @@ public:
                     {"translation", translated},
                     {"error", ""}});
     };
+    {
+      // An isolated, unstarted worker proves local Chinese updates cannot
+      // submit a provider job or wait behind its cooldown/English queue.
+      const auto previousWorker = worker;
+      const auto previousSettings = settings;
+      const bool previousPaused = paused;
+      worker = std::make_shared<Worker>(std::make_shared<Bus>());
+      settings.provider = "codex";
+      worker->cooldowns["codex"].until = Clock::now() + std::chrono::hours(1);
+      paused = false;
+      const std::string chineseTask = "chinese-local-layout";
+      const std::string chineseSource = "## 更新进度\n\n第一段保留 **粗体** 和数字 123。\n\n- 第一项完成\n- 第二项完成\n\n| 项目 | 说明 |\n| --- | --- |\n| 已完成 | 第一行<br>第二行 |";
+      accept(taskMeta(chineseTask, {chineseSource}));
+      cclive::Ledger chineseLedger(0);
+      const auto chineseSnapshot = json{{"context", chineseTask},
+          {"blocks", json::array({{{"key", "chinese-block"}, {"text", chineseSource}}})}};
+      const auto chineseEvents = chineseLedger.observe_at(chineseSnapshot, 0);
+      for (auto event : chineseEvents) {
+        event["task_id"] = chineseTask;
+        event["_generation"] = sourceGeneration;
+        accept(std::move(event));
+      }
+      render();
+      const auto chineseLayout = cclive::make_text_layout(output(false));
+      const auto boldPosition = cclive::native_text_position(chineseLayout,
+          static_cast<LONG>(chineseLayout.text.find(L"粗体")));
+      check("chinese_source_completes_locally_without_provider_jobs",
+            records.size() == 5 && worker->submitted.load() == 0 &&
+            std::all_of(records.begin(), records.end(), [](const Record &r) {
+              return r.state == "done" && r.translation == r.source && !r.pendingReplacement;
+            }) && output(false) == output(true));
+      check("chinese_source_preserves_native_heading_bold_lists_and_table",
+            std::any_of(chineseLayout.paragraphs.begin(), chineseLayout.paragraphs.end(),
+                        [](const auto &p) { return p.heading_level == 2; }) &&
+            std::count_if(chineseLayout.paragraphs.begin(), chineseLayout.paragraphs.end(),
+                          [](const auto &p) { return p.bullet; }) == 2 &&
+            boldPosition >= 0 && (paneStyle(translationEdit, boldPosition, 2).dwEffects & CFE_BOLD) &&
+            renderedBodies[translationEdit].hasTables && latestVisibleRecord() == &records.back());
+      const auto chineseUpdates = displayedUpdateSequence;
+      const auto chineseOutput = output(false);
+      check("chinese_stable_repaint_does_not_submit_or_move_latest_marker",
+            chineseLedger.observe_at(chineseSnapshot, 1).empty() &&
+            displayedUpdateSequence == chineseUpdates && worker->submitted.load() == 0);
+      accept(taskMeta("chinese-local-other", {}));
+      accept(taskMeta(chineseTask, {chineseSource}));
+      render();
+      check("chinese_local_layout_restores_from_task_cache_without_provider_jobs",
+            output(false) == chineseOutput && worker->submitted.load() == 0 &&
+            renderedBodies[translationEdit].hasTables && latestVisibleRecord() == &records.back());
+
+      const std::string rewriteTask = "chinese-local-rewrite";
+      accept(taskMeta(rewriteTask, {"Pending English source."}));
+      accept(taskText(rewriteTask, "chinese-rewrite", "Pending English source."));
+      const auto obsoleteChineseJob = worker->pending.front();
+      const auto rewriteKey = records[0].key;
+      const auto obsoleteChineseVersion = records[0].version;
+      records[0].state = "rate_limited";
+      records[0].error = "synthetic cooldown";
+      const auto beforeChineseRewrite = worker->submitted.load();
+      accept(taskText(rewriteTask, "chinese-rewrite", "这一段现在全部是中文。"));
+      render();
+      check("english_to_chinese_revision_cancels_old_job_and_bypasses_cooldown",
+            records.size() == 1 && records[0].key == rewriteKey &&
+            records[0].translation == "这一段现在全部是中文。" && records[0].state == "done" &&
+            records[0].error.empty() && !records[0].pendingReplacement &&
+            records[0].version > obsoleteChineseVersion && obsoleteChineseJob->cancel->load() &&
+            worker->pending.empty() && worker->submitted.load() == beforeChineseRewrite);
+      const auto revisedChineseMarker = records[0].displayedUpdate;
+      acceptResult({{"generation", generation}, {"task_id", rewriteTask},
+                    {"key", rewriteKey}, {"version", obsoleteChineseVersion},
+                    {"state", "done"}, {"translation", "过期英文请求的译文"}});
+      check("late_english_result_cannot_overwrite_local_chinese_revision",
+            records[0].translation == "这一段现在全部是中文。" &&
+            records[0].displayedUpdate == revisedChineseMarker);
+      accept(taskText(rewriteTask, "chinese-rewrite", "中文内容再次修改，保留 **格式**。"));
+      render();
+      check("chinese_revision_updates_in_place_and_advances_latest_marker_without_jobs",
+            records.size() == 1 && records[0].key == rewriteKey &&
+            records[0].translation == records[0].source &&
+            records[0].displayedUpdate > revisedChineseMarker &&
+            worker->submitted.load() == beforeChineseRewrite);
+      accept(taskText(rewriteTask, "chinese-rewrite", "English returns to the same paragraph."));
+      check("chinese_to_english_revision_uses_normal_translation_queue",
+            records.size() == 1 && records[0].key == rewriteKey &&
+            records[0].state == "queued" && records[0].pendingReplacement &&
+            records[0].translation == "中文内容再次修改，保留 **格式**。" &&
+            worker->submitted.load() == beforeChineseRewrite + 1);
+      accept(taskText(rewriteTask, "chinese-rewrite", "恢复中文显示。"));
+      clear(true);
+      accept(taskText(rewriteTask, "chinese-rewrite", "恢复中文显示。"));
+      check("clear_does_not_reinsert_unchanged_local_chinese",
+            records.empty() && textOf(translationEdit).empty());
+      paused = true;
+      accept(taskText(rewriteTask, "chinese-rewrite", "清空后新增中文，立即显示。"));
+      render();
+      check("new_chinese_after_clear_displays_while_provider_translation_is_paused",
+            records.size() == 1 && records[0].state == "done" &&
+            records[0].translation == "清空后新增中文，立即显示。" &&
+            worker->submitted.load() == beforeChineseRewrite + 1);
+      clear();
+      worker = previousWorker;
+      settings = previousSettings;
+      paused = previousPaused;
+    }
     accept(taskMeta("latest-marker-task", {"First marker source.", "Second marker source."}));
     accept(taskText("latest-marker-task", "marker-first", "First marker source."));
     complete(0, "**相同字幕**");

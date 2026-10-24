@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ClaudeLiveTranslator VERSION 1.2.8 LANGUAGES CXX)
+project(ClaudeLiveTranslator VERSION 1.2.9 LANGUAGES CXX)
 if(NOT WIN32)
   message(FATAL_ERROR "This application uses Windows UI Automation and WinHTTP.")
 endif()
