@@ -13,6 +13,7 @@
 #include <ole2.h>
 // clang-format on
 #include "core.hpp"
+#include "markdown_table.hpp"
 #include "chatgpt.hpp"
 #include "reader.hpp"
 #include "resource.h"
@@ -274,6 +275,7 @@ std::size_t logicalLines(const std::string &text) {
   return lines;
 }
 std::string tailLines(const std::string &text, std::size_t keep) {
+  if (auto table = cclive::markdown::table_tail(text, keep)) return *table;
   if (!keep)
     return {};
   auto end = text.size();
@@ -331,7 +333,7 @@ struct Bus {
   std::mutex mutex;
   std::deque<json> source, misc;
   std::optional<json> reset, telemetry;
-  uint64_t captureSequence = 0;
+  uint64_t captureSequence = 0, resultSequence = 0;
   std::map<std::string, json> results;
   void emit(json v) {
     std::lock_guard<std::mutex> lock(mutex);
@@ -369,9 +371,30 @@ struct Bus {
     auto k = std::to_string(v.value("generation", 0ULL)) + "|" +
              v.value("key", "") + "|" +
              std::to_string(v.value("version", 0ULL));
+    // Coalesce each job's stream while retaining its latest arrival time.
+    // String keys such as record-10 and record-9 are not chronological.
+    v["_result_sequence"] = ++resultSequence;
     results[k] = std::move(v);
-    while (results.size() > 256)
-      results.erase(results.begin());
+    while (results.size() > 256) {
+      const auto oldest = std::min_element(
+          results.begin(), results.end(), [](const auto &left, const auto &right) {
+            return left.second.value("_result_sequence", 0ULL) <
+                   right.second.value("_result_sequence", 0ULL);
+          });
+      results.erase(oldest);
+    }
+  }
+  static std::vector<json>
+  orderedResults(std::map<std::string, json> completed) {
+    std::vector<json> ordered;
+    ordered.reserve(completed.size());
+    for (auto &entry : completed)
+      ordered.push_back(std::move(entry.second));
+    std::sort(ordered.begin(), ordered.end(), [](const json &left, const json &right) {
+      return left.value("_result_sequence", 0ULL) <
+             right.value("_result_sequence", 0ULL);
+    });
+    return ordered;
   }
 };
 struct Job {
@@ -1574,7 +1597,9 @@ public:
   struct BodyRender {
     std::wstring input, displayed;
     uint64_t styleRevision = 0, replacements = 0, formats = 0;
-    int fontPoints = 0, dpi = 0;
+    int fontPoints = 0, dpi = 0, bodyWidth = 0;
+    LONG nativeLength = 0;
+    bool hasTables = false;
     LONG latestInputStart = -1, latestInputLength = 0;
     CHARRANGE latestDisplay{-1, -1};
     bool valid = false;
@@ -1963,6 +1988,9 @@ public:
                      reinterpret_cast<LPARAM>(&view.scroll));
       repaintBody(view.window);
     }
+    if (std::any_of(renderedBodies.begin(), renderedBodies.end(),
+                    [](const auto &item) { return item.second.hasTables; }))
+      render(); // Table cell boundaries follow the new reading-pane width.
     InvalidateRect(hwnd, nullptr, FALSE);
   }
   void paintDividers(HDC dc) const {
@@ -3170,7 +3198,7 @@ public:
   void scrollToLatest(HWND edit) {
     auto found = renderedBodies.find(edit);
     if (found == renderedBodies.end() || found->second.latestDisplay.cpMin < 0 ||
-        found->second.latestDisplay.cpMax >= static_cast<LONG>(found->second.displayed.size())) {
+        found->second.latestDisplay.cpMax >= found->second.nativeLength) {
       SendMessageW(edit, WM_VSCROLL, SB_BOTTOM, 0);
       return;
     }
@@ -3239,9 +3267,13 @@ public:
   }
   void editText(HWND edit, const std::wstring &value, LONG latestStart = -1, LONG latestLength = 0) {
     auto &rendered = renderedBodies[edit];
+    RECT bodyArea{};
+    GetClientRect(edit, &bodyArea);
+    const auto bodyWidth = bodyArea.right - bodyArea.left;
     if (rendered.valid && rendered.input == value &&
         rendered.styleRevision == bodyStyleRevision &&
         rendered.fontPoints == settings.font_size && rendered.dpi == dpi &&
+        (!rendered.hasTables || rendered.bodyWidth == bodyWidth) &&
         rendered.latestInputStart == latestStart && rendered.latestInputLength == latestLength)
       return;
     auto formatted = cclive::make_text_layout(value, latestStart, latestLength);
@@ -3253,8 +3285,18 @@ public:
     SendMessageW(edit, EM_EXGETSEL, 0, (LPARAM)&selected);
     SendMessageW(edit, WM_SETREDRAW, FALSE, 0);
     // A style refresh need not replace identical text or disturb its selection.
-    if (!rendered.valid || rendered.displayed != formatted.text) {
-      SetWindowTextW(edit, formatted.text.c_str());
+    const bool tableReflow = formatted.has_tables &&
+        (rendered.input != value || rendered.styleRevision != bodyStyleRevision || rendered.fontPoints != settings.font_size ||
+         rendered.dpi != dpi || rendered.bodyWidth != bodyWidth);
+    if (!rendered.valid || rendered.displayed != formatted.text ||
+        rendered.hasTables != formatted.has_tables || tableReflow) {
+      if (!cclive::replace_text_layout(edit, formatted)) {
+        SetWindowTextW(edit, formatted.text.c_str());
+        formatted.has_tables = false;
+        formatted.native_positions.clear();
+        for (auto &paragraph : formatted.paragraphs) paragraph.table = false;
+        status("表格排版未完成，暂时显示单元格文字");
+      }
       ++rendered.replacements;
     }
     cclive::apply_text_layout(edit, formatted, settings.font_size, dpi);
@@ -3264,12 +3306,16 @@ public:
     rendered.styleRevision = bodyStyleRevision;
     rendered.fontPoints = settings.font_size;
     rendered.dpi = dpi;
+    rendered.bodyWidth = bodyWidth;
+    rendered.hasTables = formatted.has_tables;
+    rendered.nativeLength = cclive::native_text_position(formatted, static_cast<LONG>(formatted.text.size()));
     rendered.latestInputStart = latestStart;
     rendered.latestInputLength = latestLength;
     rendered.latestDisplay = {-1, -1};
     for (const auto &range : formatted.ranges)
       if (range.style == cclive::TextStyle::Latest)
-        rendered.latestDisplay = {range.start, range.start + range.length};
+        rendered.latestDisplay = {cclive::native_text_position(formatted, range.start),
+                                  cclive::native_text_position(formatted, range.start + range.length)};
     rendered.valid = true;
     SendMessageW(edit, EM_EXSETSEL, 0, (LPARAM)&selected);
     SendMessageW(edit, EM_GETLINECOUNT, 0, 0);
@@ -5359,9 +5405,161 @@ public:
     check("RAM_task_restore_preserves_latest_updated_record",
           records.size() == 2 && records[0].displayedUpdate == restoredMarkerSequence &&
           latestVisibleRecord() == &records[0]);
+    // Exercise the same coalescing and ordering path used by tick(), including
+    // the lexical record-9 / record-10 boundary that a map alone misorders.
+    accept(taskMeta("latest-marker-bus-order", {}));
+    for (int n = 0; n < 10; ++n)
+      accept(taskText("latest-marker-bus-order", "bus-marker-" + std::to_string(n),
+                      "Bus marker source " + std::to_string(n) + "."));
+    Bus markerResults;
+    auto markerResult = [&](std::size_t index, const std::string &state,
+                            const std::string &translated) {
+      const auto &record = records.at(index);
+      return json{{"generation", generation}, {"task_id", activeTaskId},
+                  {"key", record.key}, {"version", record.version},
+                  {"state", state}, {"translation", translated}, {"error", ""}};
+    };
+    auto drainMarkerResults = [&] {
+      std::map<std::string, json> completed;
+      {
+        std::lock_guard<std::mutex> lock(markerResults.mutex);
+        completed.swap(markerResults.results);
+      }
+      auto ordered = Bus::orderedResults(std::move(completed));
+      for (const auto &result : ordered)
+        acceptResult(result);
+      return ordered;
+    };
+    markerResults.result(markerResult(8, "done", "第九条"));
+    markerResults.result(markerResult(9, "done", "第十条"));
+    const auto initialMarkerBatch = drainMarkerResults();
+    render();
+    check("same_batch_record_9_and_10_follow_result_arrival_not_string_key_order",
+          records[8].key == "record-9" && records[9].key == "record-10" &&
+          initialMarkerBatch.size() == 2 &&
+          initialMarkerBatch[0]["key"] == records[8].key &&
+          initialMarkerBatch[1]["key"] == records[9].key &&
+          latestVisibleRecord() == &records[9] &&
+          records[8].displayedUpdate < records[9].displayedUpdate &&
+          paneStyle(translationEdit, renderedBodies[translationEdit].latestDisplay.cpMin, 1).crTextColor ==
+              cclive::text_layout_palette.latest);
+    const auto beforeCoalescedMarker = displayedUpdateSequence;
+    markerResults.result(markerResult(8, "translating", "尚未显示的累计片段"));
+    markerResults.result(markerResult(9, "done", "第十条再次完成"));
+    markerResults.result(markerResult(8, "done", "第九条最后完成"));
+    const auto coalescedMarkerBatch = drainMarkerResults();
+    check("same_job_stream_coalesces_to_latest_snapshot_at_its_actual_arrival_order",
+          coalescedMarkerBatch.size() == 2 &&
+          coalescedMarkerBatch[0]["key"] == records[9].key &&
+          coalescedMarkerBatch[1]["key"] == records[8].key &&
+          coalescedMarkerBatch[1]["state"] == "done" &&
+          records[8].translation == "第九条最后完成" &&
+          latestVisibleRecord() == &records[8] &&
+          displayedUpdateSequence == beforeCoalescedMarker + 2);
+    const auto beforeObsoleteMarker = displayedUpdateSequence;
+    auto obsoleteMarkerVersion = markerResult(9, "done", "过期版本");
+    obsoleteMarkerVersion["version"] = records[9].version - 1;
+    markerResults.result(std::move(obsoleteMarkerVersion));
+    auto obsoleteMarkerGeneration = markerResult(9, "done", "过期代次");
+    obsoleteMarkerGeneration["generation"] = generation - 1;
+    markerResults.result(std::move(obsoleteMarkerGeneration));
+    drainMarkerResults();
+    check("chronological_batch_obsolete_results_cannot_move_latest_marker",
+          latestVisibleRecord() == &records[8] &&
+          records[9].translation == "第十条再次完成" &&
+          displayedUpdateSequence == beforeObsoleteMarker);
+    Bus boundedMarkerResults;
+    for (int n = 1; n <= 257; ++n)
+      boundedMarkerResults.result({{"generation", 0},
+                                    {"key", "record-" + std::to_string(n)},
+                                    {"version", 1}, {"state", "done"}});
+    const auto boundedMarkerBatch =
+        Bus::orderedResults(std::move(boundedMarkerResults.results));
+    check("bounded_result_bus_evicts_oldest_arrival_and_preserves_newest",
+          boundedMarkerBatch.size() == 256 &&
+          boundedMarkerBatch.front()["key"] == "record-2" &&
+          boundedMarkerBatch.back()["key"] == "record-257");
     clear(true);
     check("clear_removes_latest_highlight_with_old_subtitles",
           !latestVisibleRecord() && textOf(translationEdit).empty() &&
+          renderedBodies[translationEdit].latestDisplay.cpMin == -1);
+    const std::string tableSource = "| Item | Time | Notes |\n| --- | ---: | --- |\n| All tests passed. | 387 | a\\|b |\n| Working on your request... | 736 | second<br>line |";
+    const std::string tableTranslation = "| 项目 | 时间 | 说明 |\n| --- | ---: | --- |\n| 所有测试通过。 | 387 | a\\|b |\n| 正在处理请求。 | 736 | 第二行<br>续行 |";
+    accept(taskMeta("native-table-task", {tableSource}));
+    accept(taskText("native-table-task", "native-table-source", tableSource));
+    complete(0, tableTranslation);
+    render();
+    const auto nativeTable = cclive::make_text_layout(wide(tableTranslation));
+    const auto nativeCell = cclive::native_text_position(nativeTable,
+        static_cast<LONG>(nativeTable.text.find(L"387")));
+    PARAFORMAT2 tableFormat{}; tableFormat.cbSize = sizeof(tableFormat);
+    CHARRANGE tableCell{nativeCell, nativeCell + 1};
+    SendMessageW(translationEdit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&tableCell));
+    SendMessageW(translationEdit, EM_GETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&tableFormat));
+    check("translated_table_uses_native_grid_with_intact_cells",
+          renderedBodies[translationEdit].hasTables && (tableFormat.wEffects & PFE_TABLE) &&
+          textOf(translationEdit).find(L"387") != std::wstring::npos &&
+          textOf(translationEdit).find(L"---") == std::wstring::npos &&
+          textOf(translationEdit).find(L"a|b") != std::wstring::npos);
+    check("translated_table_latest_span_uses_native_character_positions",
+          paneStyle(translationEdit, nativeCell, 1).crTextColor == cclive::text_layout_palette.latest);
+    accept(taskText("native-table-task", "native-table-tail", "A new caption after the table."));
+    complete(1, "表后新字幕");
+    render();
+    auto nativeMarker = renderedBodies[translationEdit].latestDisplay;
+    std::wstring markedText(64, L'\0');
+    SendMessageW(translationEdit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&nativeMarker));
+    const auto markedLength = SendMessageW(translationEdit, EM_GETSELTEXT, 0,
+                                          reinterpret_cast<LPARAM>(markedText.data()));
+    markedText.resize(static_cast<std::size_t>(markedLength));
+    check("caption_after_native_table_has_correct_latest_text_and_color",
+          markedText == L"表后新字幕" &&
+          paneStyle(translationEdit, nativeMarker.cpMin, 1).crTextColor == cclive::text_layout_palette.latest &&
+          paneStyle(translationEdit, nativeCell, 1).crTextColor == cclive::text_layout_palette.body);
+    const auto oldTableVersion = records[0].version;
+    auto revisedTable = tableSource;
+    revisedTable.replace(revisedTable.find("387"), 3, "867");
+    accept(taskText("native-table-task", "native-table-source", revisedTable));
+    check("table_revision_keeps_verified_grid_until_complete",
+          records.size() == 2 && records[0].pendingReplacement &&
+          records[0].version > oldTableVersion && records[0].translation == tableTranslation);
+    auto revisedTranslation = tableTranslation;
+    revisedTranslation.replace(revisedTranslation.find("387"), 3, "867");
+    complete(0, revisedTranslation);
+    render();
+    check("table_revision_updates_original_grid_and_latest_marker_in_place",
+          records.size() == 2 && !records[0].pendingReplacement &&
+          records[0].translation == revisedTranslation &&
+          latestVisibleRecord() == &records[0] &&
+          textOf(translationEdit).find(L"867") != std::wstring::npos &&
+          textOf(translationEdit).find(L"387") == std::wstring::npos &&
+          paneStyle(translationEdit, nativeCell, 1).crTextColor == cclive::text_layout_palette.latest);
+    accept(taskMeta("native-table-other", {}));
+    accept(taskMeta("native-table-task", {revisedTable, "A new caption after the table."}));
+    render();
+    check("native_table_and_latest_marker_survive_RAM_task_restore",
+          records.size() == 2 && records[0].translation == revisedTranslation &&
+          renderedBodies[translationEdit].hasTables && latestVisibleRecord() == &records[0]);
+    const std::wstring tableStructureA = L"| A |\n| --- |\n| B |\nC\nAfter";
+    const std::wstring tableStructureB = L"A\n| B |\n| --- |\n| C |\nAfter";
+    editText(translationEdit, tableStructureA);
+    const auto structureReplacements = renderedBodies[translationEdit].replacements;
+    editText(translationEdit, tableStructureB);
+    const auto structureLayout = cclive::make_text_layout(tableStructureB);
+    CHARRANGE structureCell{cclive::native_text_position(structureLayout,
+        static_cast<LONG>(structureLayout.text.find(L"C"))), 0};
+    structureCell.cpMax = structureCell.cpMin + 1;
+    SendMessageW(translationEdit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&structureCell));
+    PARAFORMAT2 structureStyle{}; structureStyle.cbSize = sizeof(structureStyle);
+    SendMessageW(translationEdit, EM_GETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&structureStyle));
+    check("same_visible_text_with_changed_table_structure_rebuilds_native_rows",
+          cclive::make_text_layout(tableStructureA).text == structureLayout.text &&
+          renderedBodies[translationEdit].replacements == structureReplacements + 1 &&
+          (structureStyle.wEffects & PFE_TABLE));
+    clear(true);
+    check("clear_native_table_immediately_removes_grid_and_latest_marker",
+          records.empty() && textOf(translationEdit).empty() &&
+          !renderedBodies[translationEdit].hasTables &&
           renderedBodies[translationEdit].latestDisplay.cpMin == -1);
     accept(taskMeta("latest-navigation-task", {}));
     for (int n = 0; n < 100; ++n) {
@@ -6253,8 +6451,8 @@ public:
       accept(std::move(*reset));
     for (auto &v : items)
       accept(std::move(v));
-    for (auto &pair : results)
-      acceptResult(pair.second);
+    for (const auto &result : Bus::orderedResults(std::move(results)))
+      acceptResult(result);
     if (demo || selfTest)
       synthetic();
     if (cacheDirty && Clock::now() - lastCacheSave > std::chrono::seconds(1))

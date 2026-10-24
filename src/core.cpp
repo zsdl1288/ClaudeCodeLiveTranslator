@@ -6,6 +6,7 @@
 #include "core.hpp"
 #include "chatgpt.hpp"
 #include "codex_cli.hpp"
+#include "markdown_table.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -416,6 +417,40 @@ std::string parse_baidu_content(const json& data) {
 }
 std::string translate(const Settings& s,const std::string& text,const Delta& delta,const std::atomic_bool& cancel) {
     check_cancel(cancel);if(trim(text).empty())return "";if(to_wide(text).size()>50000)throw TranslationError("单次待翻译内容过长，请分段后重试。");s.validate();
+    // Translate cell contents separately: providers never receive or rewrite
+    // table separators, empty cells, numeric-only cells or row/column positions.
+    const auto table = markdown::table(std::string_view(text));
+    if (!table.empty()) {
+        std::string result;
+        std::map<std::string, std::string> translated_cells;
+        for (std::size_t r = 0; r < table.size(); ++r) {
+            if (r) result += '\n';
+            const auto& row = table[r];
+            const auto line = std::string_view(text).substr(row.start, row.length);
+            if (r == 1) { result += line; continue; }
+            result += '|';
+            for (const auto& cell : row.cells) {
+                auto raw = line.substr(cell.start, cell.length);
+                auto value = markdown::decode_cell(raw);
+                if (english(value)) {
+                    if (auto known = translated_cells.find(value); known != translated_cells.end()) value = known->second;
+                    else {
+                        auto translated = translate(s, value, {}, cancel);
+                        translated_cells.emplace(value, translated);
+                        value = std::move(translated);
+                    }
+                }
+                result += ' ';
+                result += markdown::encode_cell(value);
+                result += " |";
+                if (result.size() > max_response) throw TranslationError("译文过长，已停止读取。");
+            }
+        }
+        check_cancel(cancel);
+        if (delta) delta(result); // Publish a coherent table, never broken partial rows.
+        check_cancel(cancel);
+        return result;
+    }
     std::string result;auto emit=[&](const std::string& value){check_cancel(cancel);if(!value.empty()){if(result.size()+value.size()>max_response)throw TranslationError("译文过长，已停止读取。");result+=value;if(delta)delta(value);check_cancel(cancel);}};
     auto deadline=ticks()+90000;
     if(s.provider=="demo")emit(demo(text));
@@ -494,7 +529,18 @@ std::string translate(const Settings& s,const std::string& text,const Delta& del
 std::vector<TextSegment> split_text_segments(const std::string& input) {
     auto text=to_wide(input);std::wstring clean;std::size_t p=0,plain=0;wchar_t opened=0;std::size_t open_count=0;
     while(p<text.size()){
-        wchar_t c=text[p];if((c==L'`'||c==L'~')&&p+2<text.size()&&text[p+1]==c&&text[p+2]==c){
+        // Fences occupy their own source line. A table cell can legitimately
+        // use three or more backticks for inline code containing backticks.
+        const wchar_t c = text[p];
+        const bool candidate_fence = (c == L'`' || c == L'~') && p + 2 < text.size() && text[p + 1] == c && text[p + 2] == c;
+        bool line_fence = false;
+        if (candidate_fence) {
+            const auto previous_line = p ? text.find_last_of(L"\r\n", p - 1) : std::wstring::npos;
+            const auto line_begin = previous_line == std::wstring::npos ? 0 : previous_line + 1;
+            line_fence = p - line_begin <= 3;
+            for (auto n = line_begin; line_fence && n < p; ++n) line_fence = text[n] == L' ';
+        }
+        if (line_fence) {
             std::size_t n=3;while(p+n<text.size()&&text[p+n]==c)++n;
             if(!opened){clean+=text.substr(plain,p-plain);clean+=L"\n\n";opened=c;open_count=n;}
             else if(opened==c&&n>=open_count){opened=0;plain=p+n;}
@@ -515,9 +561,26 @@ std::vector<TextSegment> split_text_segments(const std::string& input) {
         if (!pending.empty()) units.push_back({pending, pending_list});
         pending.clear(); pending_list = false;
     };
+    std::vector<std::wstring> source_lines;
     std::wistringstream lines(clean);
     std::wstring line;
-    while (std::getline(lines, line)) {
+    while (std::getline(lines, line)) source_lines.push_back(line);
+    for (std::size_t line_index = 0; line_index < source_lines.size(); ++line_index) {
+        line = source_lines[line_index];
+        std::vector<markdown::Cell> header, divider, cells;
+        if (line_index + 1 < source_lines.size() &&
+            markdown::row(std::wstring_view(line), header) &&
+            markdown::row(std::wstring_view(source_lines[line_index + 1]), divider) &&
+            header.size() == divider.size() &&
+            markdown::separator(std::wstring_view(source_lines[line_index + 1]), divider)) {
+            flush();
+            std::wstring table = line + L"\n" + source_lines[++line_index];
+            while (line_index + 1 < source_lines.size() &&
+                   markdown::row(std::wstring_view(source_lines[line_index + 1]), cells) &&
+                   cells.size() == header.size()) table += L"\n" + source_lines[++line_index];
+            units.push_back({std::move(table), true});
+            continue;
+        }
         const auto normalized = trimw(std::regex_replace(line, whitespace, L" "));
         if (normalized.empty()) { flush(); continue; }
         if (std::regex_match(line, heading_line)) {
@@ -636,7 +699,7 @@ std::vector<json> Ledger::observe_at(const json& snapshot,std::int64_t now){
 std::vector<json> Ledger::flush_at(std::int64_t now){
     std::vector<json> out;
     for(auto& block:blocks_){if(!block.present)continue;for(std::size_t i=0;i<block.segments.size();++i){auto& slot=block.segments[i];if(now-slot.changed<settle_)continue;
-        std::string wanted=english(slot.text)?slot.text:"";
+        std::string wanted=(english(slot.text)||!markdown::table(std::string_view(slot.text)).empty())?slot.text:"";
         if(slot.emitted&&slot.emitted_text==wanted&&slot.emitted_kind==block.kind&&slot.emitted_paragraph==slot.paragraph)continue;
         if(wanted.empty()&&slot.emitted_text.empty()){slot.emitted=true;slot.emitted_text="";slot.emitted_kind=block.kind;slot.emitted_paragraph=slot.paragraph;continue;}
         ++slot.revision;out.push_back({{"type","text"},{"key",json::array({epoch_,block.key,slot.id}).dump()},{"block_key",block.key},{"segment",slot.id},{"source_segment",i},{"paragraph",slot.paragraph},{"text",wanted},{"kind",block.kind},{"epoch",epoch_},{"revision",slot.revision},{"stable",true}});

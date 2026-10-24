@@ -1,9 +1,11 @@
 #include "text_layout.hpp"
+#include "markdown_table.hpp"
 #include <richedit.h>
 #include <algorithm>
 #include <array>
 #include <cwchar>
 #include <string_view>
+#include <cstring>
 namespace cclive {
 namespace {
 struct SourceLine {
@@ -75,8 +77,31 @@ std::size_t bold_end(const std::wstring& value, std::size_t start) {
     }
     return std::wstring::npos;
 }
-void append_inline(TextLayout& layout, const std::wstring& value, std::size_t source_start, HighlightMap& highlight, bool allow_bold = true) {
+void append_run(TextLayout& layout, std::wstring_view value, std::size_t source_start, HighlightMap& highlight, bool table) {
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        if (table && value[index] == L'\\' && index + 1 < value.size() && (value[index + 1] == L'|' || value[index + 1] == L'\\')) {
+            highlight.append(layout, value.substr(index + 1, 1), source_start + index + 1); ++index;
+        } else if (table && value.substr(index, 4) == L"<br>") {
+            highlight.append(layout, L"\v", source_start + index); index += 3;
+        } else if (table && value.substr(index, 5) == L"&amp;") {
+            highlight.append(layout, L"&", source_start + index); index += 4;
+        } else if (table && value.substr(index, 4) == L"&lt;") {
+            highlight.append(layout, L"<", source_start + index); index += 3;
+        } else if (table && value.substr(index, 4) == L"&gt;") {
+            highlight.append(layout, L">", source_start + index); index += 3;
+        } else highlight.append(layout, value.substr(index, 1), source_start + index);
+    }
+}
+void append_inline(TextLayout& layout, const std::wstring& value, std::size_t source_start, HighlightMap& highlight, bool allow_bold = true, bool table = false) {
     for (std::size_t index = 0; index < value.size();) {
+        if (table && ((value[index] == L'\\' && index + 1 < value.size() && (value[index + 1] == L'|' || value[index + 1] == L'\\')) || value.compare(index, 4, L"<br>") == 0)) {
+            const auto count = value[index] == L'\\' ? 2 : 4;
+            append_run(layout, std::wstring_view(value).substr(index, count), source_start + index, highlight, true); index += count; continue;
+        }
+        if (table && (value.compare(index, 5, L"&amp;") == 0 || value.compare(index, 4, L"&lt;") == 0 || value.compare(index, 4, L"&gt;") == 0)) {
+            const auto count = value.compare(index, 5, L"&amp;") == 0 ? 5 : 4;
+            append_run(layout, std::wstring_view(value).substr(index, count), source_start + index, highlight, true); index += count; continue;
+        }
         // Preserve literal escapes and paths; escaped delimiters are not markup.
         if (value[index] == L'\\' && index + 1 < value.size()) {
             highlight.append(layout, std::wstring_view(value).substr(index, 2), source_start + index); index += 2; continue;
@@ -87,15 +112,15 @@ void append_inline(TextLayout& layout, const std::wstring& value, std::size_t so
             const auto closing = backtick_end(value, end, end - index);
             if (closing == std::wstring::npos) { highlight.append(layout, std::wstring_view(value).substr(index), source_start + index); break; }
             const LONG start = static_cast<LONG>(layout.text.size());
-            highlight.append(layout, std::wstring_view(value).substr(end, closing - end), source_start + end);
-            if (closing > end) layout.ranges.push_back({start, static_cast<LONG>(closing - end), TextStyle::Code, 0});
+            append_run(layout, std::wstring_view(value).substr(end, closing - end), source_start + end, highlight, table);
+            if (closing > end) layout.ranges.push_back({start, static_cast<LONG>(layout.text.size() - start), TextStyle::Code, 0});
             index = closing + end - index; continue;
         }
         if (allow_bold && value.compare(index, 2, L"**") == 0) {
             const auto end = bold_end(value, index + 2);
             if (end != std::wstring::npos && end > index + 2) {
                 const LONG start = static_cast<LONG>(layout.text.size());
-                append_inline(layout, value.substr(index + 2, end - index - 2), source_start + index + 2, highlight, false);
+                append_inline(layout, value.substr(index + 2, end - index - 2), source_start + index + 2, highlight, false, table);
                 layout.ranges.push_back({start, static_cast<LONG>(layout.text.size() - start), TextStyle::Bold, 0});
                 index = end + 2; continue;
             }
@@ -150,9 +175,48 @@ TextLayout make_text_layout(const std::wstring& input, LONG highlightStart, LONG
     bool in_code = false, previous_blank = false;
     wchar_t fence_character = 0;
     std::size_t fence_length = 0;
+    std::size_t table_columns = 0;
+    std::vector<int> table_alignments;
     for (std::size_t line_index = 0; line_index < lines.size(); ++line_index) {
         const auto& line = lines[line_index].text;
         const auto source_start = lines[line_index].start;
+        std::vector<markdown::Cell> cells, separator_cells;
+        const bool table_row = !in_code && markdown::row<wchar_t>(line, cells) && cells.size() <= 63;
+        bool table_header = false;
+        if (table_row && line_index + 1 < lines.size()) {
+            const auto& separator = lines[line_index + 1].text;
+            table_header = markdown::row<wchar_t>(separator, separator_cells) &&
+                separator_cells.size() == cells.size() && markdown::separator<wchar_t>(separator, separator_cells);
+            if (table_header) {
+                table_columns = cells.size(); table_alignments.clear();
+                for (const auto& cell : separator_cells) {
+                    const auto alignment = std::wstring_view(separator).substr(cell.start, cell.length);
+                    table_alignments.push_back(alignment.back() == L':' ? (alignment.front() == L':' ? 1 : 2) : 0);
+                }
+            }
+        }
+        if (table_row && (table_header || table_columns == cells.size())) {
+            layout.has_tables = true;
+            if (!layout.paragraphs.empty()) layout.text += L'\r';
+            TextParagraphStyle paragraph;
+            paragraph.start = static_cast<LONG>(layout.text.size());
+            paragraph.table = true; paragraph.table_header = table_header;
+            paragraph.cell_alignments = table_alignments;
+            for (std::size_t column = 0; column < cells.size(); ++column) {
+                if (column) layout.text += L'\t';
+                const auto& cell = cells[column];
+                append_inline(layout, line.substr(cell.start, cell.length), source_start + cell.start, highlight, true, true);
+                paragraph.cell_ends.push_back(static_cast<LONG>(layout.text.size()) - paragraph.start);
+            }
+            paragraph.length = static_cast<LONG>(layout.text.size()) - paragraph.start;
+            if (table_header && paragraph.length)
+                layout.ranges.push_back({paragraph.start, paragraph.length, TextStyle::Bold, 0});
+            layout.paragraphs.push_back(std::move(paragraph));
+            previous_blank = false;
+            if (table_header) ++line_index;
+            continue;
+        }
+        table_columns = 0;
         std::size_t first = 0;
         int columns = 0;
         while (first < line.size() && (line[first] == L' ' || line[first] == L'\t')) {
@@ -211,8 +275,83 @@ TextLayout make_text_layout(const std::wstring& input, LONG highlightStart, LONG
         layout.paragraphs.push_back(paragraph);
 
     }
+    // Native table rows always terminate in a paragraph, even at document end.
+    if (!layout.paragraphs.empty() && layout.paragraphs.back().table) {
+        layout.text += L'\r';
+        TextParagraphStyle tail; tail.start = static_cast<LONG>(layout.text.size());
+        layout.paragraphs.push_back(tail);
+    }
+    if (layout.has_tables) {
+        layout.native_positions.resize(layout.text.size() + 1);
+        LONG native = 0;
+        for (std::size_t n = 0; n < layout.paragraphs.size(); ++n) {
+            const auto& paragraph = layout.paragraphs[n];
+            if (paragraph.table) native += 2; // Native row opener U+FFF9 and CR.
+            for (LONG p = 0; p < paragraph.length; ++p)
+                layout.native_positions[paragraph.start + p] = native++;
+            layout.native_positions[paragraph.start + paragraph.length] = native;
+            if (paragraph.table) native += 2; // Final cell delimiter and U+FFFB.
+            if (n + 1 < layout.paragraphs.size()) ++native;
+        }
+    }
     highlight.finish(layout);
     return layout;
+}
+LONG native_text_position(const TextLayout& layout, LONG displayed) {
+    if (displayed < 0 || layout.native_positions.empty()) return displayed;
+    const auto limit = static_cast<LONG>(layout.native_positions.size() - 1);
+    return layout.native_positions[std::min(displayed, limit)];
+}
+namespace {
+void rtf_text(std::string& out, std::wstring_view text) {
+    for (const auto ch : text) {
+        if (ch == L'\\' || ch == L'{' || ch == L'}') { out += '\\'; out += static_cast<char>(ch); }
+        else if (ch == L'\t') out += "\\tab ";
+        else if (ch == L'\v') out += "\\line ";
+        else if (ch >= 32 && ch < 127) out += static_cast<char>(ch);
+        else out += "\\u" + std::to_string(static_cast<short>(ch)) + "?";
+    }
+}
+struct RtfInput { const std::string& text; std::size_t offset = 0; };
+DWORD CALLBACK rtf_read(DWORD_PTR cookie, LPBYTE target, LONG count, LONG* read) {
+    auto& input = *reinterpret_cast<RtfInput*>(cookie);
+    *read = static_cast<LONG>(std::min(static_cast<std::size_t>(count), input.text.size() - input.offset));
+    std::memcpy(target, input.text.data() + input.offset, *read); input.offset += *read; return 0;
+}
+}
+bool replace_text_layout(HWND edit, const TextLayout& layout) {
+    if (!layout.has_tables) return SetWindowTextW(edit, layout.text.c_str()) != FALSE;
+    RECT rect{}; SendMessageW(edit, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&rect));
+    HDC dc = GetDC(edit); const auto dpi = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
+    if (dc) ReleaseDC(edit, dc);
+    const LONG width = std::max<LONG>(720, MulDiv(std::max<LONG>(48, rect.right - rect.left - 8), 1440, dpi));
+    std::string rtf = "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Microsoft YaHei UI;}}{\\colortbl;\\red83\\green81\\blue76;\\red49\\green49\\blue46;\\red42\\green42\\blue40;}\\uc1\\fs24 ";
+    for (std::size_t n = 0; n < layout.paragraphs.size(); ++n) {
+        const auto& paragraph = layout.paragraphs[n];
+        if (paragraph.table) {
+            rtf += "\\trowd\\trgaph90\\trleft0";
+            const auto count = paragraph.cell_ends.size();
+            for (std::size_t cell = 0; cell < count; ++cell) {
+                rtf += "\\clvertalt\\clbrdrt\\brdrs\\brdrw10\\brdrcf1\\clbrdrl\\brdrs\\brdrw10\\brdrcf1\\clbrdrb\\brdrs\\brdrw10\\brdrcf1\\clbrdrr\\brdrs\\brdrw10\\brdrcf1";
+                rtf += paragraph.table_header ? "\\clcbpat2" : "\\clcbpat3";
+                rtf += "\\cellx" + std::to_string(width * static_cast<LONG>(cell + 1) / static_cast<LONG>(count));
+            }
+            LONG begin = 0;
+            for (std::size_t cell = 0; cell < count; ++cell) {
+                const auto alignment = cell < paragraph.cell_alignments.size() ? paragraph.cell_alignments[cell] : 0;
+                rtf += alignment == 1 ? "\\pard\\intbl\\qc " : alignment == 2 ? "\\pard\\intbl\\qr " : "\\pard\\intbl\\ql ";
+                rtf_text(rtf, std::wstring_view(layout.text).substr(paragraph.start + begin, paragraph.cell_ends[cell] - begin));
+                rtf += "\\cell "; begin = paragraph.cell_ends[cell] + 1;
+            }
+            rtf += "\\row ";
+        } else {
+            rtf += "\\pard "; rtf_text(rtf, std::wstring_view(layout.text).substr(paragraph.start, paragraph.length));
+            if (n + 1 < layout.paragraphs.size()) rtf += "\\par ";
+        }
+    }
+    rtf += '}'; RtfInput input{rtf}; EDITSTREAM stream{reinterpret_cast<DWORD_PTR>(&input), 0, rtf_read};
+    SendMessageW(edit, EM_STREAMIN, SF_RTF, reinterpret_cast<LPARAM>(&stream));
+    return stream.dwError == 0;
 }
 void apply_text_layout(HWND edit, const TextLayout& layout, int fontPoints, int dpi) {
     (void)dpi; // RichEdit character sizes and paragraph distances are in twips.
@@ -239,7 +378,7 @@ void apply_text_layout(HWND edit, const TextLayout& layout, int fontPoints, int 
     SendMessageW(edit, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&base));
     const auto columns = list_columns(edit, layout, fontPoints);
     for (const auto& paragraph : layout.paragraphs) {
-        select_range(edit, paragraph.start, paragraph.length);
+        select_range(edit, native_text_position(layout, paragraph.start), native_text_position(layout, paragraph.start + paragraph.length) - native_text_position(layout, paragraph.start));
         auto format = body_paragraph(fontPoints);
         if (paragraph.bullet || paragraph.ordered) {
             const auto column = columns[std::clamp(paragraph.indent_level, 0, 8)];
@@ -256,18 +395,32 @@ void apply_text_layout(HWND edit, const TextLayout& layout, int fontPoints, int 
             format.dySpaceAfter = fontPoints * 6;
         }
         if (!paragraph.length) format.dySpaceAfter = 0;
+        if (paragraph.table) { format.dySpaceAfter = 0; format.dySpaceBefore = 0; }
         if (paragraph.code) {
             format.bLineSpacingRule = 0; format.dyLineSpacing = 0;
             format.dySpaceAfter = 0;
             format.dxStartIndent = fontPoints * 10;
         }
         SendMessageW(edit, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&format));
+        if (paragraph.table) {
+            LONG begin = 0;
+            for (std::size_t cell = 0; cell < paragraph.cell_ends.size(); ++cell) {
+                const auto start = native_text_position(layout, paragraph.start + begin);
+                const auto end = native_text_position(layout, paragraph.start + paragraph.cell_ends[cell]);
+                select_range(edit, start, std::max<LONG>(0, end - start));
+                PARAFORMAT2 alignment{}; alignment.cbSize = sizeof(alignment); alignment.dwMask = PFM_ALIGNMENT;
+                const auto value = cell < paragraph.cell_alignments.size() ? paragraph.cell_alignments[cell] : 0;
+                alignment.wAlignment = value == 1 ? PFA_CENTER : value == 2 ? PFA_RIGHT : PFA_LEFT;
+                SendMessageW(edit, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&alignment));
+                begin = paragraph.cell_ends[cell] + 1;
+            }
+        }
     }
     // Structural headings first. Bold inherits their size; literal code wins.
     for (const auto style : {TextStyle::Heading, TextStyle::Bold, TextStyle::Code, TextStyle::Latest})
     for (const auto& range : layout.ranges) {
         if (range.length <= 0 || range.style != style) continue;
-        select_range(edit, range.start, range.length);
+        select_range(edit, native_text_position(layout, range.start), native_text_position(layout, range.start + range.length) - native_text_position(layout, range.start));
         CHARFORMAT2W format{};
         format.cbSize = sizeof(format);
         if (range.style == TextStyle::Bold) {

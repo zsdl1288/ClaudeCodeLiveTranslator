@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <winhttp.h>
 #include "core.hpp"
+#include "markdown_table.hpp"
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -63,6 +64,60 @@ int main(){
     WSADATA wsa{};if(WSAStartup(MAKEWORD(2,2),&wsa))return 2;
     try{
         check(to_utf8(to_wide("中文 English 😀"))=="中文 English 😀","Unicode roundtrip");
+        {
+            const std::string table = "| Item | Time | Notes |\n| :--- | ---: | --- |\n| Shot 1. Second sentence. | 11–14 | a\\|b |\n| Shot 2 | 17–31 |  |";
+            const auto parts = split_text_segments("Before.\n\n" + table + "\n\nAfter.");
+            check(parts.size()==3 && parts[1].text==table && parts[1].paragraph==1,
+                  "Whole table retains rows cells punctuation and empty cell as one structural segment");
+            auto parsed = markdown::table(std::string_view(table));
+            check(parsed.size()==4 && parsed[0].cells.size()==3 && parsed[3].cells[2].length==0,
+                  "Markdown parser preserves column count and empty trailing cell");
+            std::vector<markdown::Cell> cells;
+            const std::string table_with_code="| Kind | Value |\n| --- | --- |\n| code | ```a``b``` |";
+            const auto code_table_parts=split_text_segments(table_with_code);
+            check(code_table_parts.size()==1 && code_table_parts.front().text==table_with_code,
+                  "Multi-backtick inline code inside a table is not stripped as a fenced block");
+            const std::string code_row="| `a|b` | x\\|y |";
+            check(markdown::row(std::string_view(code_row),cells) && cells.size()==2,
+                  "Code and escaped pipes do not create extra columns");
+            const auto plain=split_text_segments("The command is a | b.\nNot a table.");
+            check(plain.size()==2 && plain[0].text=="The command is a | b.",
+                  "Pipe prose without a header separator remains prose");
+            const auto code=split_text_segments("```\n"+table+"\n```\nOutside.");
+            check(code.size()==1 && code[0].text=="Outside.","Fenced table examples are not collected as prose");
+            Ledger ledger(100);
+            ledger.observe_at(snap(table),0);
+            const auto initial=texts(ledger.flush_at(100));
+            check(initial==std::vector<std::string>{table},"Ledger emits one intact table including numeric cells");
+            const auto revised=table+"\n| Shot 3 | 387 | last |";
+            ledger.observe_at(snap(revised),200);
+            const auto revision=texts(ledger.flush_at(300));
+            check(revision==std::vector<std::string>{revised},"Growing table revises the same complete structural unit");
+            const std::string digits="| 项目 | 时长 |\n| --- | --- |\n| 1 | 387 |";
+            Ledger numeric_ledger(100);
+            numeric_ledger.observe_at(snap(digits),0);
+            check(texts(numeric_ledger.flush_at(100))==std::vector<std::string>{digits},
+                  "Numeric and Chinese-only tables retain their full context without English filtering");
+            const std::string path="C:\\sample\\folder\\file | end";
+            const std::string html="literal <br> and &lt; plus actual\nnewline";
+            check(markdown::decode_cell(markdown::encode_cell(html))==html,
+                  "Literal HTML examples and actual cell line breaks round trip distinctly");
+            check(markdown::decode_cell(markdown::encode_cell(path))==path,
+                  "Cell pipe and backslash escaping round trips literal paths");
+            Settings demo; demo.provider="demo";
+            std::atomic_bool cancel{false}; std::vector<std::string> deltas;
+            check(translate(demo,digits,[&](const auto& value){deltas.push_back(value);},cancel)==digits &&
+                  deltas==std::vector<std::string>{digits},"Numeric table structure survives translation in one coherent delta");
+            const std::string sample="| 测试 | 数量 |\n| --- | --- |\n| All tests passed. | 17 |";
+            const auto translated=translate(demo,sample,{},cancel);
+            check(translated=="| 测试 | 数量 |\n| --- | --- |\n| 所有测试均已通过。 | 17 |",
+                  "Table translates text cells while retaining numeric values and exact row structure");
+            bool cancelled=false;
+            try { translate(demo,sample,[&](const auto&){cancel=true;},cancel); }
+            catch(const TranslationCancelled&){cancelled=true;}
+            check(cancelled,"Cancellation after a coherent table delta is honored");
+        }
+
         rejects([]{to_wide(std::string("\xff"));},"Invalid UTF8 rejected");
         auto folder=std::filesystem::path(L"work")/L"cpp-core-tests";std::filesystem::create_directories(folder);auto config=folder/L"settings.json";
         std::error_code ignored;std::filesystem::remove(config,ignored);
@@ -399,6 +454,20 @@ int main(){
         }
         {
             HttpServer server(std::string(2*1024*1024+1,'x'));rejects([&]{translate(api(server),"Hello",{},cancel);},"Oversized response rejected before reading body");
+        }
+        {
+            HttpServer server("{\"choices\":[{\"message\":{\"content\":\"你好 | 世界\\n下一行\"}}]}");
+            std::atomic_bool cancel{false}; std::vector<std::string> deltas;
+            const std::string source="| 内容 | 数量 |\n| --- | --- |\n| Hello | 17 |\n| Hello | 31 |";
+            const auto result=translate(api(server),source,[&](const auto& value){deltas.push_back(value);},cancel);
+            const auto rows=markdown::table(std::string_view(result));
+            check(rows.size()==4 && rows[2].cells.size()==2 && rows[3].cells.size()==2 &&
+                  result.find("你好 \\| 世界<br>下一行")!=std::string::npos,
+                  "Provider-added pipes and multiline text stay inside their original table cell");
+            check(deltas==std::vector<std::string>{result},"Cell translation never streams broken partial tables");
+            server.wait(); check(server.requests==1,"Repeated identical cells share a completed in-memory translation");
+            check(json::parse(server.received.substr(server.received.find("\r\n\r\n") + 4))["messages"].back()["content"] == "Hello",
+                  "Only translatable cell text is sent to the provider, excluding table structure and numbers");
         }
         SetEnvironmentVariableW(L"CCLIVE_TEST_KEY",nullptr);
     }catch(const std::exception& e){++failures;std::cerr<<"UNEXPECTED: "<<e.what()<<"\n";}

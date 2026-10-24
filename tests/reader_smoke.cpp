@@ -50,11 +50,28 @@ std::wstring quote(const std::wstring& text) {
     result.append(slashes * 2, L'\\'); result += L'\"';
     return result;
 }
-void require(bool condition, const char* description) { if (!condition) throw std::runtime_error(description); }
+void require(bool condition, const std::string& description) { if (!condition) throw std::runtime_error(description); }
+HWND fixture_input_window = nullptr;
 void write_source(const fs::path& path, const std::string& value) {
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    output << value;
-    require(static_cast<bool>(output), "cannot write synthetic fixture input");
+    auto staged = path; staged += L".next";
+    {
+        std::ofstream output(staged, std::ios::binary | std::ios::trunc);
+        output << value; output.flush();
+        require(static_cast<bool>(output), "cannot write synthetic fixture input");
+    }
+    bool published = false;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        if (MoveFileExW(staged.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { published = true; break; }
+        const auto error = GetLastError();
+        if (error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED) break;
+        Sleep(5);
+    }
+    require(published, "cannot atomically publish synthetic fixture input");
+    if (fixture_input_window && IsWindow(fixture_input_window)) {
+        DWORD_PTR applied = 0;
+        require(SendMessageTimeoutW(fixture_input_window, WM_APP + 17, 0, 0, SMTO_ABORTIFHUNG, 2000, &applied) != 0 && applied == 1,
+                "synthetic fixture did not apply the published input frame");
+    }
 }
 HWND find_window(DWORD pid) {
     struct Lookup { DWORD pid; HWND hwnd = nullptr; } lookup{pid};
@@ -64,6 +81,7 @@ HWND find_window(DWORD pid) {
         if (owner == state.pid && IsWindowVisible(hwnd)) { state.hwnd = hwnd; return FALSE; }
         return TRUE;
     }, reinterpret_cast<LPARAM>(&lookup));
+    if (lookup.hwnd) fixture_input_window = lookup.hwnd;
     return lookup.hwnd;
 }
 json read_once(const fs::path& app, HWND hwnd, bool allow_fixture = true, bool info = false) {
@@ -196,7 +214,19 @@ int wmain(int argc, wchar_t** argv) {
                 const auto stream_key = captured.at("blocks").at(0).at("key");
                 write_source(input, "stream\nCURRENT STREAM MUST BE TRANSLATED. A growing tail."); Sleep(200);
                 const auto growing = read_once(app, history_hwnd);
-                require(growing.at("blocks").at(0).at("key") == stream_key && block_text(growing).find("A growing tail.") != std::string::npos, "paged stream growth changed source identity or lost new text");
+                require(!growing.at("blocks").empty() && growing.at("blocks").at(0).at("key") == stream_key && block_text(growing).find("A growing tail.") != std::string::npos, "paged stream growth changed source identity or lost new text: " + growing.dump());
+                // A partial frame must not replace the headless stream's body;
+                // a real empty named turn followed by streaming must also restore
+                // the fixed source node rather than leave a destroyed HWND.
+                write_source(input, "\n");
+                const auto partial = read_once(app, history_hwnd);
+                require(block_text(partial).find("A growing tail.") != std::string::npos, "partial fixture frame changed the confirmed stream");
+                write_source(input, "empty\n");
+                require(read_once(app, history_hwnd).at("blocks").empty(), "empty paging fixture unexpectedly exposed history");
+                write_source(input, "stream\nCURRENT STREAM MUST BE TRANSLATED. A resumed tail.");
+                const auto resumed_stream = read_once(app, history_hwnd);
+                require(!resumed_stream.at("blocks").empty() && resumed_stream.at("blocks").at(0).at("key") == stream_key && block_text(resumed_stream).find("A resumed tail.") != std::string::npos,
+                        "paging fixture lost its live body after empty-to-stream transition");
                 write_source(input, "idle\nCURRENT STREAM MUST BE TRANSLATED."); Sleep(200);
                 require(read_once(app, history_hwnd).at("blocks").empty(), "unconfirmed headless tail inherited old assistant identity after response status ended");
             }
@@ -544,6 +574,27 @@ int wmain(int argc, wchar_t** argv) {
             require(GetForegroundWindow() != structure_hwnd, "response structure capture activated fixture");
             report["checks"].push_back(mode == L"--nested-response-structure" ? "confirmed tool region never excludes a shared wrapper containing assistant paragraphs" : mode == L"--row-structure" ? "shared Feed generic ancestors preserve distinct message-row paragraphs and reject tool/status summaries" : mode == L"--response-structure" ? "single font response preserves generic P boundaries, literal inline fragments and genuine command explanations" : "semantic response fallback preserves generic P and inline whitespace while excluding tool/status subtrees");
             PostMessageW(structure_hwnd, WM_CLOSE, 0, 0); WaitForSingleObject(structure_window.process.hProcess, 2000);
+        }
+        for (const std::wstring mode : {L"--table", L"--semantic-table", L"--grid-table", L"--noheader-table"}) {
+            Child table_window;
+            auto table_command = quote(fixture.wstring()) + L" " + quote(input.wstring()) + L" " + mode + L" --ready";
+            require(CreateProcessW(fixture.c_str(), table_command.data(), nullptr, nullptr, FALSE, 0, nullptr, fixture.parent_path().c_str(), &startup, &table_window.process), "table fixture could not start");
+            HWND table_hwnd = nullptr;
+            for (int retry = 0; retry < 50 && !table_hwnd; ++retry) { Sleep(50); table_hwnd = find_window(table_window.process.dwProcessId); }
+            require(table_hwnd != nullptr, "table fixture window did not appear");
+            const auto captured = read_once(app, table_hwnd);
+            const auto text = block_text(captured);
+            const auto prefix = mode == L"--noheader-table" ? "|  |  |  |\n| --- | --- | --- |\n| Task | Duration | Notes |" : "| Task | Duration | Notes |\n| --- | --- | --- |";
+            require(text.find(prefix) != std::string::npos, "table header/column boundaries were flattened or guessed: " + text);
+            require(text.find("| Clip A | 11–14 s | red \\| blue |\n| Clip B | 17–31 s |  |") != std::string::npos, "table rows, escaped pipes, or empty cell alignment lost: " + text);
+            require(text.find("| Code | 387 s | `helper()` |") != std::string::npos, "table inline code formatting lost: " + text);
+            require(text.find("| Multiline | 736 s | one<br>two |") != std::string::npos, "multiline table cell boundary lost: " + text);
+            require(text.find("| Literal | 867 s | &lt;br&gt; &amp;lt; &gt; |") != std::string::npos, "literal markup/entity text was interpreted as table cell formatting: " + text);
+            require(text.find("Before table prose.") < text.find(prefix) && text.find("After table prose. Plain 261 s stays prose.") > text.find("one<br>two"), "table reconstruction moved or consumed adjacent prose");
+            require(text.find("Clip A", text.find("Clip A") + 1) == std::string::npos, "table aggregate name duplicated child text");
+            require(GetForegroundWindow() != table_hwnd, "table capture activated fixture");
+            report["checks"].push_back(mode == L"--grid-table" ? "GridItem coordinates restore row/column order independently of reversed UIA tree order" : mode == L"--semantic-table" ? "semantic assistant preserves table headers, rows, empty cells, inline code and adjacent prose" : mode == L"--noheader-table" ? "headerless table retains its first data row and explicit empty header" : "named assistant preserves table headers, rows, pipe escapes and multiline cells");
+            PostMessageW(table_hwnd, WM_CLOSE, 0, 0); WaitForSingleObject(table_window.process.hProcess, 2000);
         }
         fs::remove(input);
         report["passed"] = true;

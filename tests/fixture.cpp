@@ -25,6 +25,7 @@ HWND identity_document = nullptr, identity_background_document = nullptr;
 bool identity_multi_mode = false, identity_parent_mode = false;
 bool identity_race_mode = false;
 bool heading_mode = false, heading_semantic_mode = false;
+bool table_mode = false, table_semantic_mode = false, table_coordinates_mode = false, table_noheader_mode = false;
 std::atomic<int> identity_reads{0};
 std::mutex identity_mutex;
 std::wstring identity_url;
@@ -32,18 +33,24 @@ bool stream_list_mode = false, semantic_list_mode = false;
 bool response_structure_mode = false, row_structure_mode = false, semantic_structure_mode = false, nested_structure_mode = false;
 HWND stream_article = nullptr, stream_heading = nullptr;
 bool ready_mode = false, history_mode = false, history_paging_mode = false, history_headless_mode = false, history_feed_semantic_mode = false, history_feed_mode = false, history_semantic_mode = false, history_named_semantic_mode = false, history_semantic_named_mode = false;
-HWND history_host = nullptr, history_status = nullptr, history_status_text = nullptr, history_latest = nullptr;
+HWND history_host = nullptr, history_status = nullptr, history_status_text = nullptr, history_latest = nullptr, history_stream_body = nullptr;
 std::string history_stage;
 std::wstring decode_utf8(const std::string& value);
 void reload_history(const std::string& value) {
     const bool semantic_latest = history_semantic_mode || history_named_semantic_mode;
     const auto split = value.find('\n');
     const auto stage = value.substr(0, split);
+    // Ignore incomplete protocol frames rather than interpreting a partial file
+    // write as a real UI transition and replacing the live assistant subtree.
+    if (split == std::string::npos || (stage != "stream" && stage != "idle" && stage != "ready" && stage != "empty" && stage != "tool" && stage != "waiting")) return;
     const auto text = split == std::string::npos ? std::wstring{} : decode_utf8(value.substr(split + 1));
     if (history_paging_mode) {
         SetWindowTextW(history_status_text, stage == "stream" ? L"Claude 正在回复" : L"");
-        if (body) SetWindowTextW(body, text.c_str());
         if (stage == "stream" || stage == "idle") {
+            // Keep the fixed headless stream separate from the temporary
+            // named-message body that is destroyed when streaming resumes.
+            body = history_stream_body;
+            if (body) SetWindowTextW(body, text.c_str());
             if (history_latest) { DestroyWindow(history_latest); history_latest = nullptr; }
             history_stage = stage; return;
         }
@@ -107,10 +114,11 @@ void reload() {
         SetWindowTextW(stream_article, L"消息 2");
     }
 }
-class FeedProvider final : public IRawElementProviderSimple, public IValueProvider {
+class FeedProvider final : public IRawElementProviderSimple, public IValueProvider, public IGridItemProvider {
     std::atomic<ULONG> refs_{1};
     HWND hwnd_;
     bool article_, list_item_, document_, status_, tool_, paragraph_;
+    bool table_ = false, grid_ = false, row_ = false, cell_ = false, header_ = false, code_ = false;
     int heading_level_ = -1;
 public:
     explicit FeedProvider(HWND hwnd) : hwnd_(hwnd) {
@@ -119,6 +127,9 @@ public:
         tool_ = std::wstring(name) == L"CCLiveFixtureTool";
         paragraph_ = std::wstring(name) == L"CCLiveFixtureParagraph";
         const std::wstring class_name(name);
+        table_ = class_name == L"CCLiveFixtureTable"; grid_ = class_name == L"CCLiveFixtureGrid";
+        row_ = class_name == L"CCLiveFixtureRow";
+        cell_ = class_name == L"CCLiveFixtureCell"; header_ = class_name == L"CCLiveFixtureHeader"; code_ = class_name == L"CCLiveFixtureCode";
         const std::wstring heading_prefix = L"CCLiveFixtureHeading";
         if (class_name.find(heading_prefix) == 0 && class_name.size() == heading_prefix.size() + 1) heading_level_ = class_name.back() - L'0';
     }
@@ -127,6 +138,7 @@ public:
         *result = nullptr;
         if (iid == __uuidof(IUnknown) || iid == __uuidof(IRawElementProviderSimple)) { *result = static_cast<IRawElementProviderSimple*>(this); AddRef(); return S_OK; }
         if (document_ && iid == __uuidof(IValueProvider)) { *result = static_cast<IValueProvider*>(this); AddRef(); return S_OK; }
+        if ((cell_ || header_) && GetPropW(hwnd_, L"TableRow") && iid == __uuidof(IGridItemProvider)) { *result = static_cast<IGridItemProvider*>(this); AddRef(); return S_OK; }
         return E_NOINTERFACE;
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
@@ -137,8 +149,14 @@ public:
     HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID pattern, IUnknown** result) override {
         if (!result) return E_POINTER; *result = nullptr;
         if (document_ && pattern == UIA_ValuePatternId) { *result = static_cast<IValueProvider*>(this); AddRef(); }
+        if ((cell_ || header_) && GetPropW(hwnd_, L"TableRow") && pattern == UIA_GridItemPatternId) { *result = static_cast<IGridItemProvider*>(this); AddRef(); }
         return S_OK;
     }
+    HRESULT STDMETHODCALLTYPE get_Row(int* result) override { if (!result) return E_POINTER; *result = static_cast<int>(reinterpret_cast<INT_PTR>(GetPropW(hwnd_, L"TableRow"))) - 1; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_Column(int* result) override { if (!result) return E_POINTER; *result = static_cast<int>(reinterpret_cast<INT_PTR>(GetPropW(hwnd_, L"TableColumn"))) - 1; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_RowSpan(int* result) override { if (!result) return E_POINTER; *result = 1; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_ColumnSpan(int* result) override { if (!result) return E_POINTER; *result = 1; return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_ContainingGrid(IRawElementProviderSimple** result) override { if (!result) return E_POINTER; *result = nullptr; return S_OK; }
     HRESULT STDMETHODCALLTYPE SetValue(LPCWSTR) override { return E_ACCESSDENIED; }
     HRESULT STDMETHODCALLTYPE get_Value(BSTR* result) override {
         if (!result) return E_POINTER;
@@ -152,9 +170,13 @@ public:
     HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID property, VARIANT* result) override {
         if (!result) return E_POINTER;
         VariantInit(result);
-        if (property == UIA_AriaRolePropertyId) { result->vt = VT_BSTR; result->bstrVal = SysAllocString(heading_level_ >= 0 ? L"heading" : document_ ? L"document" : status_ ? L"status" : paragraph_ ? L"paragraph" : tool_ ? L"group" : list_item_ ? L"listitem" : article_ ? L"article" : L"feed"); }
-        else if (property == UIA_ControlTypePropertyId) { result->vt = VT_I4; result->lVal = heading_level_ >= 0 ? UIA_TextControlTypeId : document_ ? UIA_DocumentControlTypeId : status_ ? UIA_StatusBarControlTypeId : list_item_ ? UIA_ListItemControlTypeId : UIA_GroupControlTypeId; }
-        else if (property == UIA_NamePropertyId && (list_item_ || document_ || status_ || tool_ || heading_level_ >= 0)) { wchar_t text[1024]{}; GetWindowTextW(hwnd_, text, 1024); result->vt = VT_BSTR; result->bstrVal = SysAllocString(text); }
+        if (property == UIA_AriaRolePropertyId) { result->vt = VT_BSTR; result->bstrVal = SysAllocString(code_ ? L"code" : table_ ? L"table" : grid_ ? L"grid" : row_ ? L"row" : cell_ ? L"cell" : header_ ? L"columnheader" : heading_level_ >= 0 ? L"heading" : document_ ? L"document" : status_ ? L"status" : paragraph_ ? L"paragraph" : tool_ ? L"group" : list_item_ ? L"listitem" : article_ ? L"article" : L"feed"); }
+        else if (property == UIA_ControlTypePropertyId) { result->vt = VT_I4; result->lVal = table_ ? UIA_TableControlTypeId : grid_ ? UIA_DataGridControlTypeId : header_ ? UIA_HeaderItemControlTypeId : row_ || cell_ ? UIA_DataItemControlTypeId : heading_level_ >= 0 ? UIA_TextControlTypeId : document_ ? UIA_DocumentControlTypeId : status_ ? UIA_StatusBarControlTypeId : list_item_ ? UIA_ListItemControlTypeId : UIA_GroupControlTypeId; }
+        else if (property == UIA_NamePropertyId && (list_item_ || document_ || status_ || tool_ || cell_ || header_ || heading_level_ >= 0)) { wchar_t text[1024]{}; GetWindowTextW(hwnd_, text, 1024); result->vt = VT_BSTR; result->bstrVal = SysAllocString(text); }
+        else if ((cell_ || header_) && (property == UIA_GridItemRowPropertyId || property == UIA_GridItemColumnPropertyId || property == UIA_GridItemColumnSpanPropertyId)) {
+            const auto encoded = reinterpret_cast<INT_PTR>(GetPropW(hwnd_, property == UIA_GridItemRowPropertyId ? L"TableRow" : property == UIA_GridItemColumnPropertyId ? L"TableColumn" : L"TableSpan"));
+            if (encoded) { result->vt = VT_I4; result->lVal = static_cast<LONG>(encoded - 1); }
+        }
         else if (property == UIA_HeadingLevelPropertyId && heading_level_ >= 0) { result->vt = VT_I4; result->lVal = 80050 + heading_level_; }
         else if (property == UIA_IsControlElementPropertyId || property == UIA_IsContentElementPropertyId) { result->vt = VT_BOOL; result->boolVal = VARIANT_TRUE; }
         return S_OK;
@@ -171,6 +193,9 @@ LRESULT CALLBACK feed_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam
     return DefWindowProcW(hwnd, message, wparam, lparam);
 }
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    // Test-only barrier: the driver can publish one complete input frame and
+    // wait for this window's UI thread to apply it before an accessibility read.
+    if (message == WM_APP + 17) { reload(); return 1; }
     if (message == WM_CREATE) {
         if (history_mode) {
             if (history_paging_mode) {
@@ -196,6 +221,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
                 CreateWindowExW(0, L"BUTTON", history_headless_mode ? L"Load later messages" : L"加载后续消息", WS_CHILD | WS_VISIBLE, 0, 0, 580, 26, wrapper, nullptr, GetModuleHandleW(nullptr), nullptr);
                 const HWND paragraph = CreateWindowExW(0, L"CCLiveFixtureParagraph", L"", WS_CHILD | WS_VISIBLE, 0, 32, 580, 130, wrapper, nullptr, GetModuleHandleW(nullptr), nullptr);
                 body = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_NOPREFIX, 0, 0, 560, 100, paragraph, nullptr, GetModuleHandleW(nullptr), nullptr);
+                history_stream_body = body;
             }
             reload(); SetTimer(hwnd, 1, 100, nullptr); return 0;
         }
@@ -246,6 +272,39 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             const HWND action_status = CreateWindowExW(0, L"CCLiveFixtureStatus", L"", WS_CHILD | WS_VISIBLE, 0, 700, 600, 24, response, nullptr, GetModuleHandleW(nullptr), nullptr);
             text(action_status, L"Inspecting project files");
             text(paragraph(730), L"Final paragraph without punctuation");
+            return 0;
+        }
+        if (table_mode) {
+            const HWND assistant = CreateWindowExW(0, table_semantic_mode ? L"assistant-message" : L"BUTTON", table_semantic_mode ? L"" : L"Assistant message",
+                WS_CHILD | WS_VISIBLE | (table_semantic_mode ? 0 : BS_GROUPBOX), 8, 8, 640, 650, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            if (!table_semantic_mode) CreateWindowExW(0, L"STATIC", L"Claude responded:", WS_CHILD | WS_VISIBLE, 8, 12, 600, 24, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CreateWindowExW(0, L"STATIC", L"Before table prose.", WS_CHILD | WS_VISIBLE, 8, 40, 600, 24, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const HWND table = CreateWindowExW(0, table_coordinates_mode ? L"CCLiveFixtureGrid" : L"CCLiveFixtureTable", L"", WS_CHILD | WS_VISIBLE, 8, 72, 610, 400, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const wchar_t* values[][3] = {{L"Task", L"Duration", L"Notes"}, {L"Clip A", L"11–14 s", L"red | blue"}, {L"Clip B", L"17–31 s", L""}, {L"Code", L"387 s", L"helper()"}, {L"Multiline", L"736 s", L"one\ntwo"}, {L"Literal", L"867 s", L"<br> &lt; >"}};
+            const HFONT mono = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, L"Consolas");
+            // Deliberately create coordinate-backed rows and cells in reverse
+            // order: a reader must use GridItem positions, not tree order.
+            for (int order = 0; order < 6; ++order) {
+                const int r = table_coordinates_mode ? 5 - order : order;
+                const HWND row = table_coordinates_mode ? table : CreateWindowExW(0, L"CCLiveFixtureRow", L"", WS_CHILD | WS_VISIBLE, 0, r * 70, 600, 68, table, nullptr, GetModuleHandleW(nullptr), nullptr);
+                for (int part = 0; part < 3; ++part) {
+                    const int c = table_coordinates_mode ? 2 - part : part;
+                    const HWND cell = CreateWindowExW(0, r == 0 && !table_noheader_mode ? L"CCLiveFixtureHeader" : L"CCLiveFixtureCell", L"", WS_CHILD | WS_VISIBLE, c * 195, table_coordinates_mode ? r * 70 : 0, 190, 60, row, nullptr, GetModuleHandleW(nullptr), nullptr);
+                    if (table_coordinates_mode) {
+                        SetPropW(cell, L"TableRow", reinterpret_cast<HANDLE>(static_cast<INT_PTR>(r + 1)));
+                        SetPropW(cell, L"TableColumn", reinterpret_cast<HANDLE>(static_cast<INT_PTR>(c + 1)));
+                    }
+                    // Native Static's accessibility Name treats '&' as an
+                    // accelerator. A web cell provider exposes its literal Name.
+                    if (r == 5 && c == 2) SetWindowTextW(cell, values[r][c]);
+                    else if (*values[r][c]) {
+                        const HWND content = r == 3 && c == 2 ? CreateWindowExW(0, L"CCLiveFixtureCode", L"", WS_CHILD | WS_VISIBLE, 0, 0, 185, 55, cell, nullptr, GetModuleHandleW(nullptr), nullptr) : cell;
+                        const HWND text = CreateWindowExW(0, L"STATIC", values[r][c], WS_CHILD | WS_VISIBLE | SS_NOPREFIX, 0, 0, 185, 55, content, nullptr, GetModuleHandleW(nullptr), nullptr);
+                        if (r == 3 && c == 2) SendMessageW(text, WM_SETFONT, reinterpret_cast<WPARAM>(mono), FALSE);
+                    }
+                }
+            }
+            CreateWindowExW(0, L"STATIC", L"After table prose. Plain 261 s stays prose.", WS_CHILD | WS_VISIBLE, 8, 490, 600, 28, assistant, nullptr, GetModuleHandleW(nullptr), nullptr);
             return 0;
         }
         if (heading_mode) {
@@ -508,6 +567,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (args && count > 2) identity_race_mode = std::wstring(args[2]) == L"--identity-race";
     if (args && count > 2) stream_list_mode = std::wstring(args[2]) == L"--stream-list";
     if (args && count > 2) semantic_list_mode = std::wstring(args[2]) == L"--semantic-list";
+    if (args && count > 2) {
+        const std::wstring mode(args[2]);
+        table_mode = mode == L"--table" || mode == L"--semantic-table" || mode == L"--grid-table" || mode == L"--noheader-table";
+        table_semantic_mode = mode == L"--semantic-table";
+        table_coordinates_mode = mode == L"--grid-table";
+        table_noheader_mode = mode == L"--noheader-table";
+    }
     if (args && count > 2) heading_mode = std::wstring(args[2]) == L"--headings" || std::wstring(args[2]) == L"--semantic-headings";
     if (args && count > 2) heading_semantic_mode = std::wstring(args[2]) == L"--semantic-headings";
     if (args) LocalFree(args);
@@ -550,6 +616,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (!RegisterClassW(&semantic_class)) return 16;
     semantic_class.lpszClassName = L"CCLiveFixtureTool";
     if (!RegisterClassW(&semantic_class)) return 17;
+    for (const auto* name : {L"CCLiveFixtureTable", L"CCLiveFixtureGrid", L"CCLiveFixtureRow", L"CCLiveFixtureCell", L"CCLiveFixtureHeader", L"CCLiveFixtureCode"}) {
+        semantic_class.lpszClassName = name;
+        if (!RegisterClassW(&semantic_class)) return 18;
+    }
     semantic_class.lpszClassName = L"CCLiveFixtureParagraph";
     if (!RegisterClassW(&semantic_class)) return 18;
     semantic_class.lpszClassName = L"CCLiveFixtureDocument";

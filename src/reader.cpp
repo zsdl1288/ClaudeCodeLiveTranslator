@@ -144,7 +144,7 @@ struct Node {
     Ptr<IUIAutomationElement> element;
     std::wstring name, class_name, automation_id, aria_role, localized_type;
     CONTROLTYPEID type = 0;
-    int heading_level = 0;
+    int heading_level = 0, grid_row = -1, grid_column = -1, column_span = 1;
     std::string id;
 };
 using N = std::shared_ptr<Node>;
@@ -170,15 +170,124 @@ bool is_message(const N& node) {
 }
 std::string safe_role(const std::wstring& role) {
     const auto value = lower(role);
-    for (const wchar_t* known : {L"article",L"feed",L"heading",L"paragraph",L"group",L"generic",L"list",L"listitem",L"document",L"textbox",L"button",L"link",L"navigation",L"main",L"region"})
+    for (const wchar_t* known : {L"article",L"feed",L"heading",L"paragraph",L"group",L"generic",L"list",L"listitem",L"document",L"textbox",L"button",L"link",L"navigation",L"main",L"region",L"table",L"grid",L"treegrid",L"row",L"cell",L"gridcell",L"columnheader",L"rowheader"})
         if (value == known) return utf8(value);
     return value.empty() ? "empty" : "other";
 }
 struct Block { std::string key, kind; std::wstring text; };
 struct Selection { bool selected = false; std::vector<Block> blocks; N anchor; };
+bool table_role(const N& node) {
+    const auto role = lower(node->aria_role);
+    return node->type == UIA_TableControlTypeId || node->type == UIA_DataGridControlTypeId ||
+        role == L"table" || role == L"grid" || role == L"treegrid";
+}
+bool cell_role(const N& node) {
+    const auto role = lower(node->aria_role);
+    return role == L"cell" || role == L"gridcell" || role == L"columnheader" || role == L"rowheader" ||
+        node->type == UIA_HeaderItemControlTypeId || (node->grid_row >= 0 && node->grid_column >= 0);
+}
+struct TableCellRef {
+    std::string table, row, cell, paragraph;
+    int row_index = -1, column = -1, span = 1;
+    bool header = false;
+    explicit operator bool() const { return !table.empty() && !row.empty() && !cell.empty(); }
+};
+struct TableText {
+    struct Cell { std::string key, paragraph; std::wstring text; int column = -1, span = 1; bool header = false; };
+    struct Row { std::string key; int index = -1; std::vector<Cell> cells; };
+    std::string key;
+    std::vector<Row> rows;
+    std::size_t characters = 0;
+    static std::wstring escaped(const std::wstring& value) {
+        std::wstring result;
+        for (std::size_t n = 0; n < value.size(); ++n) {
+            const auto c = value[n];
+            if (c == L'\r' || c == L'\n') {
+                if (c == L'\r' && n + 1 < value.size() && value[n + 1] == L'\n') ++n;
+                result += L"<br>";
+            } else if (c == L'&') result += L"&amp;";
+            else if (c == L'<') result += L"&lt;";
+            else if (c == L'>') result += L"&gt;";
+            else { if (c == L'\\' || c == L'|') result += L'\\'; result += c; }
+        }
+        return result;
+    }
+    void add(const TableCellRef& ref, const std::wstring& value, bool monospace) {
+        auto row = std::find_if(rows.begin(), rows.end(), [&](const Row& r) { return r.key == ref.row; });
+        if (row == rows.end()) {
+            if (rows.size() >= 512) return;
+            rows.push_back({ref.row, ref.row_index, {}}); row = std::prev(rows.end());
+        }
+        auto cell = std::find_if(row->cells.begin(), row->cells.end(), [&](const Cell& c) { return c.key == ref.cell; });
+        if (cell == row->cells.end()) {
+            if (row->cells.size() >= 63) return;
+            row->cells.push_back({ref.cell, {}, {}, ref.column, ref.span, ref.header}); cell = std::prev(row->cells.end());
+        }
+        if (!cell->text.empty() && !cell->paragraph.empty() && !ref.paragraph.empty() && cell->paragraph != ref.paragraph) cell->text += L"<br>";
+        cell->paragraph = ref.paragraph;
+        // A provider can expose many leaves even for one huge table. Bound its
+        // accumulated cell content before rendering or UTF-8 serialization.
+        if (characters >= 64000) return;
+        const auto allowance = (64000 - characters) / 2;
+        auto limited = value.substr(0, allowance);
+        if (!limited.empty() && limited.back() >= 0xD800 && limited.back() <= 0xDBFF) limited.pop_back();
+        auto content = escaped(limited);
+        if (monospace && !content.empty()) {
+            std::size_t longest = 0, run = 0;
+            for (auto c : content) { if (c == L'`') longest = (std::max)(longest, ++run); else run = 0; }
+            const auto fence = std::wstring(longest + 1, L'`'); content = fence + content + fence;
+        }
+        characters += content.size();
+        cell->text += content;
+    }
+    std::wstring finish() {
+        if (rows.empty()) return {};
+        std::stable_sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+            if ((a.index >= 0) != (b.index >= 0)) return a.index >= 0;
+            return a.index >= 0 && a.index < b.index;
+        });
+        std::vector<std::vector<std::wstring>> grid;
+        std::size_t columns = 0;
+        for (auto& row : rows) {
+            std::vector<std::wstring> cells(63);
+            std::vector<bool> occupied(63, false);
+            std::stable_sort(row.cells.begin(), row.cells.end(), [](const Cell& a, const Cell& b) {
+                if ((a.column >= 0) != (b.column >= 0)) return a.column >= 0;
+                return a.column >= 0 && a.column < b.column;
+            });
+            std::size_t width = 0;
+            for (const auto& cell : row.cells) {
+                std::size_t column = cell.column >= 0 ? static_cast<std::size_t>(cell.column) : 0;
+                if (cell.column < 0) while (column < occupied.size() && occupied[column]) ++column;
+                if (column >= cells.size()) continue;
+                cells[column] = cell.text;
+                const auto end = (std::min)(cells.size(), column + static_cast<std::size_t>((std::max)(1, cell.span)));
+                for (auto n = column; n < end; ++n) occupied[n] = true;
+                width = (std::max)(width, end);
+            }
+            columns = (std::max)(columns, width); cells.resize(width); grid.push_back(std::move(cells));
+        }
+        if (!columns) return {};
+        std::wstring result;
+        auto append = [&](const std::vector<std::wstring>& cells) {
+            std::wstring line = L"|";
+            for (std::size_t column = 0; column < columns; ++column) line += L" " + (column < cells.size() ? cells[column] : std::wstring{}) + L" |";
+            line += L'\n';
+            if (result.size() + line.size() > 64000) return false;
+            result += line; return true;
+        };
+        const bool first_header = std::any_of(rows.front().cells.begin(), rows.front().cells.end(), [](const Cell& c) { return c.header; });
+        append(first_header ? grid.front() : std::vector<std::wstring>{});
+        append(std::vector<std::wstring>(columns, L"---"));
+        for (std::size_t n = first_header ? 1 : 0; n < grid.size(); ++n) if (!append(grid[n])) break;
+        if (!result.empty()) result.pop_back();
+        return result;
+    }
+};
 struct ResponseText {
     std::wstring text, code;
     std::string paragraph;
+    TableText table;
     bool previous_standalone = false;
     void flush_code() {
         if (code.empty()) return;
@@ -186,7 +295,18 @@ struct ResponseText {
         else text += L"`" + code + L"`";
         code.clear();
     }
+    void flush_table() {
+        if (table.key.empty()) return;
+        const auto table_key = table.key;
+        auto value = table.finish(); table = {};
+        if (!value.empty()) add(value, false, table_key, true);
+    }
+    void add_cell(const TableCellRef& ref, const std::wstring& value, bool monospace) {
+        if (!table.key.empty() && table.key != ref.table) flush_table();
+        flush_code(); table.key = ref.table; table.add(ref, value, monospace);
+    }
     void add(const std::wstring& value, bool monospace, const std::string& block, bool standalone = false) {
+        flush_table();
         if (standalone || previous_standalone || (!block.empty() && !paragraph.empty() && block != paragraph)) {
             flush_code();
             // These are verified structural paragraphs, not visual soft wraps.
@@ -201,7 +321,7 @@ struct ResponseText {
         else { flush_code(); text += value; }
         previous_standalone = standalone;
     }
-    std::wstring finish() { flush_code(); return text; }
+    std::wstring finish() { flush_table(); flush_code(); return text; }
 };
 class Reader {
     Ptr<IUIAutomation> uia_;
@@ -259,6 +379,14 @@ class Reader {
                 result->heading_level = static_cast<int>(level.lVal - 80050);
             VariantClear(&level);
         }
+        auto cached_index = [&](PROPERTYID property, int fallback) {
+            VARIANT index; VariantInit(&index); int value = fallback;
+            if (SUCCEEDED(result->element->GetCachedPropertyValueEx(property, TRUE, &index)) && index.vt == VT_I4 && index.lVal >= 0 && index.lVal <= 100000) value = index.lVal;
+            VariantClear(&index); return value;
+        };
+        result->grid_row = cached_index(UIA_GridItemRowPropertyId, -1);
+        result->grid_column = cached_index(UIA_GridItemColumnPropertyId, -1);
+        result->column_span = cached_index(UIA_GridItemColumnSpanPropertyId, 1);
         nodes_.emplace(key, result);
         return result;
     }
@@ -297,6 +425,37 @@ class Reader {
             return response->id;
         }
         return fallback->id;
+    }
+    bool code_style(const N& item, const N& boundary) {
+        auto current = item;
+        for (int depth = 0; current && current->id != boundary->id && depth < 64; ++depth, current = parent(current)) {
+            const auto type = lower(current->localized_type);
+            if (lower(current->aria_role) == L"code" || type == L"code" || type == L"代码" || has_class(current->class_name, L"font-mono")) return true;
+        }
+        return false;
+    }
+    TableCellRef table_cell(const N& item, const N& boundary) {
+        N cell, row, table;
+        int depth = 0;
+        for (auto current = item; current && current->id != boundary->id && depth++ < 64; current = parent(current)) {
+            if (table_role(current)) { table = current; break; }
+            const auto role = lower(current->aria_role);
+            if (!cell && cell_role(current)) cell = current;
+            if (!row && role == L"row") row = current;
+            if (current == cell && current->grid_row >= 0) break;
+        }
+        // GridItem coordinates can identify a cell even when providers omit Row.
+        if (cell && !table) {
+            auto current = parent(cell);
+            for (int depth = 0; current && current->id != boundary->id && depth < 64; ++depth, current = parent(current))
+                if (table_role(current)) { table = current; break; }
+        }
+        if (!cell || !table || (!row && cell->grid_row < 0)) return {};
+        const auto role = lower(cell->aria_role);
+        TableCellRef ref{table->id, row ? row->id : table->id + "|row|" + std::to_string(cell->grid_row), cell->id,
+            display_paragraph(item, cell), cell->grid_row, cell->grid_column, cell->column_span,
+            role == L"columnheader" || cell->type == UIA_HeaderItemControlTypeId};
+        return ref;
     }
     std::vector<N> descendants(const N& root, CONTROLTYPEID control = 0, std::size_t limit = 100000) {
         Ptr<IUIAutomationCondition> condition;
@@ -584,14 +743,14 @@ class Reader {
             if (leaf->type != UIA_TextControlTypeId) continue;
             auto current = parent(leaf);
             for (int depth = 0; current && current->id != message->id && depth < 64; ++depth, current = parent(current))
-                if (current->type == UIA_ListItemControlTypeId || current->type == UIA_DataItemControlTypeId || current->type == UIA_HeaderItemControlTypeId || current->heading_level)
+                if (current->type == UIA_ListItemControlTypeId || current->type == UIA_DataItemControlTypeId || current->type == UIA_HeaderItemControlTypeId || current->heading_level || cell_role(current))
                     containers_with_text.insert(current->id);
         }
         std::vector<Block> result;
         std::unordered_map<std::string, ResponseText> builders;
         for (const auto& item : all) {
             const auto type = item->type;
-            if (type != UIA_TextControlTypeId && !((item->heading_level || type == UIA_ListItemControlTypeId || type == UIA_DataItemControlTypeId || type == UIA_HeaderItemControlTypeId) && (!containers_with_text.count(item->id) || preferred_names.count(item->id)))) continue;
+            if (type != UIA_TextControlTypeId && !((item->heading_level || type == UIA_ListItemControlTypeId || type == UIA_DataItemControlTypeId || type == UIA_HeaderItemControlTypeId || cell_role(item)) && (!containers_with_text.count(item->id) || preferred_names.count(item->id)))) continue;
             if (covered_by_container_name(item, message, preferred_names)) continue;
             if (item->class_name.find(L"sr-only") != std::wstring::npos || is_status(item) || is_assistant_marker(item) || is_user_marker(item)) continue;
             auto current = parent(item); auto child = item;
@@ -624,17 +783,19 @@ class Reader {
                     VariantClear(&attribute);
                 }
             }
-            if (text.empty()) continue;
+            const auto table_ref = table_cell(item, message);
+            if (text.empty() && !table_ref) continue;
             paragraph = display_paragraph(item, message);
             if (type == UIA_ListItemControlTypeId) { paragraph = item->id; text = L"- " + text; }
             else if (type == UIA_DataItemControlTypeId || type == UIA_HeaderItemControlTypeId) paragraph = item->id;
-            const bool monospace = rx(font, mono_font);
+            const bool monospace = rx(font, mono_font) || code_style(item, message);
             if (code_block && !monospace) continue;
             const auto block_key = key + "|" + kind + "|" + (kind == "answer" ? "message-body" : region);
             if (!builders.count(block_key)) { builders.emplace(block_key, ResponseText{}); result.push_back({block_key, kind, {}}); }
             const bool heading = item->heading_level && !monospace;
             if (heading) { paragraph = item->id; text = std::wstring(item->heading_level, L'#') + L" " + text; }
-            builders.at(block_key).add(text, monospace, paragraph, heading);
+            if (table_ref) builders.at(block_key).add_cell(table_ref, text, monospace);
+            else builders.at(block_key).add(text, monospace, paragraph, heading);
         }
         for (auto& block : result) block.text = builders.at(block.key).finish();
         return result;
@@ -821,13 +982,13 @@ class Reader {
         for (const auto& leaf : semantic_nodes) if (leaf->type == UIA_TextControlTypeId) {
             auto ancestor = parent(leaf);
             for (int depth = 0; ancestor && ancestor->id != window->id && depth < 24; ++depth, ancestor = parent(ancestor))
-                if (ancestor->type == UIA_ListItemControlTypeId || ancestor->type == UIA_DataItemControlTypeId || ancestor->type == UIA_HeaderItemControlTypeId || ancestor->heading_level) containers_with_text.insert(ancestor->id);
+                if (ancestor->type == UIA_ListItemControlTypeId || ancestor->type == UIA_DataItemControlTypeId || ancestor->type == UIA_HeaderItemControlTypeId || ancestor->heading_level || cell_role(ancestor)) containers_with_text.insert(ancestor->id);
         }
         for (const auto& item : semantic_nodes) {
             if (!inside(item, selected_owner)) continue;
-            if (item->type != UIA_TextControlTypeId && !((item->heading_level || item->type == UIA_ListItemControlTypeId || item->type == UIA_DataItemControlTypeId || item->type == UIA_HeaderItemControlTypeId) && (!containers_with_text.count(item->id) || preferred_names.count(item->id)))) continue;
+            if (item->type != UIA_TextControlTypeId && !((item->heading_level || item->type == UIA_ListItemControlTypeId || item->type == UIA_DataItemControlTypeId || item->type == UIA_HeaderItemControlTypeId || cell_role(item)) && (!containers_with_text.count(item->id) || preferred_names.count(item->id)))) continue;
             if (covered_by_container_name(item, window, preferred_names)) continue;
-            if (item->name.empty() || item->name.size() > 64000 || item->class_name.find(L"sr-only") != std::wstring::npos || is_status(item) || is_assistant_marker(item) || is_user_marker(item)) continue;
+            if ((item->name.empty() && !cell_role(item)) || item->name.size() > 64000 || item->class_name.find(L"sr-only") != std::wstring::npos || is_status(item) || is_assistant_marker(item) || is_user_marker(item)) continue;
             try {
                 auto current = parent(item);
                 std::string key, strong_key, message_key; N owner, strong_owner, message_owner; bool skip = false;
@@ -856,7 +1017,21 @@ class Reader {
                 auto& builder = builders.at(key);
                 if (builder.text.size() + item->name.size() + 16 < 64000) {
                     auto value = (item->heading_level ? std::wstring(item->heading_level, L'#') + L" " : item->type == UIA_ListItemControlTypeId ? L"- " : L"") + item->name;
-                    builder.add(value, false, display_paragraph(item, owner), item->heading_level != 0);
+                    const auto table_ref = table_cell(item, owner);
+                    if (table_ref) {
+                        bool monospace = code_style(item, owner);
+                        Ptr<IUIAutomationTextPattern> pattern;
+                        if (SUCCEEDED(item->element->GetCurrentPatternAs(UIA_TextPatternId, __uuidof(IUIAutomationTextPattern), reinterpret_cast<void**>(pattern.out()))) && pattern) {
+                            Ptr<IUIAutomationTextRange> range;
+                            if (SUCCEEDED(pattern->get_DocumentRange(range.out())) && range) {
+                                VARIANT font; VariantInit(&font);
+                                if (SUCCEEDED(range->GetAttributeValue(UIA_FontNameAttributeId, &font)) && font.vt == VT_BSTR && font.bstrVal) monospace = monospace || rx(font.bstrVal, mono_font);
+                                VariantClear(&font);
+                            }
+                        }
+                        builder.add_cell(table_ref, item->name, monospace);
+                    }
+                    else builder.add(value, false, display_paragraph(item, owner), item->heading_level != 0);
                 }
             } catch (const UiaError&) {}
         }
@@ -869,7 +1044,7 @@ public:
         check(CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, __uuidof(IUIAutomation), reinterpret_cast<void**>(uia_.out())));
         check(uia_->CreateCacheRequest(cache_.out()));
         check(cache_->put_TreeScope(TreeScope_Element));
-        for (const PROPERTYID property : {UIA_NamePropertyId, UIA_ControlTypePropertyId, UIA_ClassNamePropertyId, UIA_AutomationIdPropertyId, UIA_AriaRolePropertyId, UIA_LocalizedControlTypePropertyId, UIA_HeadingLevelPropertyId}) check(cache_->AddProperty(property));
+        for (const PROPERTYID property : {UIA_NamePropertyId, UIA_ControlTypePropertyId, UIA_ClassNamePropertyId, UIA_AutomationIdPropertyId, UIA_AriaRolePropertyId, UIA_LocalizedControlTypePropertyId, UIA_HeadingLevelPropertyId, UIA_GridItemRowPropertyId, UIA_GridItemColumnPropertyId, UIA_GridItemColumnSpanPropertyId}) check(cache_->AddProperty(property));
         check(uia_->get_RawViewWalker(walker_.out()));
     }
     json profile(HWND hwnd, bool fixture) {

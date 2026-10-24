@@ -1,4 +1,5 @@
 #include "task_cache.hpp"
+#include "markdown_table.hpp"
 #include <atomic>
 #include <chrono>
 #include <fstream>
@@ -261,6 +262,105 @@ int main() {
                 done.back()["source"] == lines("long-source-", 20, 100),
             "completed record line budget follows translation and caps source "
             "tail");
+    }
+    {
+      auto data_rows = [](bool translated, int first, int count) {
+        std::string text;
+        for (int n = first; n != first + count; ++n)
+          text += std::string("| ") + (translated ? "镜头 " : "Shot ") +
+                  std::to_string(n) + " | " + std::to_string(n * 11) +
+                  (translated ? " 秒" : " sec") + " | $" +
+                  std::to_string(n * 7) + " |\r\n";
+        return text;
+      };
+      auto make_table = [&](bool translated, int first, int count) {
+        return std::string(translated ? "| 镜头 | 时长 | 成本 |\r\n"
+                                      : "| Shot | Time | Cost |\r\n") +
+               "| --- | ---: | ---: |\r\n" + data_rows(translated, first, count);
+      };
+      auto cell_text = [](const std::string &text,
+                          const std::vector<cclive::markdown::Line> &rows,
+                          std::size_t row, std::size_t column) {
+        const auto &line = rows.at(row);
+        const auto &cell = line.cells.at(column);
+        return text.substr(line.start + cell.start, cell.length);
+      };
+      const json table_record{{"key", "table-source"}, {"serial", 17},
+                              {"source", make_table(false, 1, 150)},
+                              {"translation", make_table(true, 1, 150)},
+                              {"source_signature", "original-table-signature"},
+                              {"state", "done"}, {"displayed_update", 23}};
+      const json original_payload{{"records", json::array({table_record})},
+                                  {"title", "Table task"},
+                                  {"translation_scroll_y", 250}};
+      const auto table_cache_path = folder / "table-cache-must-not-exist" / "cache.json";
+      TaskCache cache(table_cache_path, true);
+      cache.put("table-A", original_payload);
+      const auto saved_payload = *cache.get("table-A");
+      const auto saved_record = saved_payload.at("records").at(0);
+      const auto source = saved_record.at("source").get<std::string>();
+      const auto translation = saved_record.at("translation").get<std::string>();
+      const auto source_rows = cclive::markdown::table(std::string_view(source));
+      const auto translated_rows = cclive::markdown::table(std::string_view(translation));
+      check(cache.healthy() && source_rows.size() == 100 && translated_rows.size() == 100,
+            "100-line RAM cache keeps large source and translated tables parseable");
+      bool values_match = source_rows.size() == 100 && translated_rows.size() == 100;
+      if (values_match)
+        for (std::size_t row = 2; row < translated_rows.size(); ++row) {
+          const auto n = static_cast<int>(row) + 51;
+          values_match = values_match &&
+              cell_text(source, source_rows, row, 0) == "Shot " + std::to_string(n) &&
+              cell_text(source, source_rows, row, 1) == std::to_string(n * 11) + " sec" &&
+              cell_text(source, source_rows, row, 2) == "$" + std::to_string(n * 7) &&
+              cell_text(translation, translated_rows, row, 0) == "镜头 " + std::to_string(n) &&
+              cell_text(translation, translated_rows, row, 1) == std::to_string(n * 11) + " 秒" &&
+              cell_text(translation, translated_rows, row, 2) == "$" + std::to_string(n * 7);
+        }
+      check(values_match,
+            "trimmed table retains matching latest 98 shot duration and cost rows");
+      check(!source_rows.empty() && !translated_rows.empty() &&
+                cell_text(source, source_rows, 0, 0) == "Shot" &&
+                cell_text(source, source_rows, 0, 2) == "Cost" &&
+                cell_text(translation, translated_rows, 0, 0) == "镜头" &&
+                cell_text(translation, translated_rows, 0, 2) == "成本",
+            "large table cache retains both original and translated headers");
+      cache.put("table-B", {{"records", json::array({{{"source", "Other task"},
+                                                      {"translation", "其他任务"},
+                                                      {"state", "done"}}})}});
+      check(cache.get("table-A") == std::optional<json>(saved_payload) &&
+                saved_record.at("source_signature") == "original-table-signature" &&
+                saved_record.at("key") == "table-source" &&
+                saved_record.at("displayed_update") == 23 &&
+                saved_payload.at("translation_scroll_y") == 250,
+            "switching RAM table tasks preserves source signature identity highlight and reading position");
+      check(original_payload.at("records").at(0) == table_record &&
+                cclive::markdown::table(std::string_view(
+                    table_record.at("translation").get_ref<const std::string &>())).size() == 152,
+            "table tail normalization leaves caller payload and source table untouched");
+      for (int available = 1; available <= 3; ++available) {
+        std::string following;
+        for (int n = available; n < 100; ++n)
+          following += "Following " + std::to_string(n) + "\r\n";
+        cache.put("small-table-budget",
+                  {{"records", json::array({table_record,
+                      {{"source", following}, {"translation", following}, {"state", "done"}}})}});
+        const auto small_records = cache.get("small-table-budget")->at("records");
+        const auto small_translation = small_records.at(0).at("translation").get<std::string>();
+        const auto small_rows = cclive::markdown::table(std::string_view(small_translation));
+        if (available < 3)
+          check(small_records.size() == 2 && small_rows.empty() &&
+                    small_translation == data_rows(true, 151 - available, available) &&
+                    small_records.at(0).at("source_signature") == "original-table-signature",
+                "one or two remaining lines use stable plain tail without exceeding budget");
+        else
+          check(small_rows.size() == 3 &&
+                    cell_text(small_translation, small_rows, 2, 0) == "镜头 150" &&
+                    cell_text(small_translation, small_rows, 2, 2) == "$1050",
+                "three remaining lines retain table header separator and newest numeric row");
+      }
+      cache.flush();
+      check(!std::filesystem::exists(table_cache_path.parent_path()),
+            "table normalization and flush remain RAM only without creating cache files");
     }
     check(std::distance(std::filesystem::directory_iterator(folder),
                         std::filesystem::directory_iterator()) == 1,

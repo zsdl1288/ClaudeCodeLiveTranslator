@@ -244,6 +244,98 @@ void native_paragraph_checks() {
     check(GetForegroundWindow() != edit, "paragraph formatting activated hidden RichEdit");
     DestroyWindow(edit); FreeLibrary(library);
 }
+void native_table_checks() {
+    const auto library = LoadLibraryW(L"Msftedit.dll");
+    check(library != nullptr, "table RichEdit library could not load");
+    const HWND edit = CreateWindowExW(0, MSFTEDIT_CLASS, L"", WS_POPUP | ES_MULTILINE | ES_READONLY,
+        0, 0, 640, 400, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    check(edit != nullptr, "table RichEdit could not be created");
+    const std::wstring raw = L"Before\n| **项目** | 时长 | 说明 |\n| :--- | ---: | :---: |\n| Codex | 261 秒 | 路径 `C:\\\\work\\\\file` 与 a\\|b<br>下一行 \U0001F600 |\n| Qwen | 867 秒 | 结束 |\nAfter **正文**";
+    const auto position = static_cast<LONG>(raw.find(L"路径"));
+    const auto layout = cclive::make_text_layout(raw, position, static_cast<LONG>(raw.find(L" |\n| Qwen")) - position);
+    check(layout.has_tables && layout.native_positions.size() == layout.text.size() + 1, "Markdown table lost native-position mapping");
+    check(layout.text == L"Before\r项目\t时长\t说明\rCodex\t261 秒\t路径 C:\\work\\file 与 a|b\v下一行 \U0001F600\rQwen\t867 秒\t结束\rAfter 正文", "table cell boundaries escapes line breaks Unicode or surrounding prose changed");
+    check(layout.paragraphs.size() == 5 && layout.paragraphs[1].table_header && layout.paragraphs[2].table && !layout.paragraphs[4].table, "table header/body/ordinary paragraph scope incorrect");
+    check(layout.paragraphs[1].cell_alignments == std::vector<int>({0, 2, 1}), "Markdown table column alignment lost");
+    check(cclive::replace_text_layout(edit, layout), "native RTF table stream failed");
+    auto read_text = [&] {
+        std::wstring result(layout.text.size() + 64, L'\0'); GETTEXTEX request{};
+        request.cb = static_cast<DWORD>(result.size() * sizeof(wchar_t)); request.codepage = 1200;
+        result.resize(SendMessageW(edit, EM_GETTEXTEX, reinterpret_cast<WPARAM>(&request), reinterpret_cast<LPARAM>(result.data())));
+        return result;
+    };
+    check(read_text() == layout.text, "native RTF visible text differs from parsed display text");
+    for (std::size_t cp = 0; cp < layout.text.size(); ++cp) {
+        if (layout.text[cp] == L'\r' || (layout.text[cp] >= 0xdc00 && layout.text[cp] <= 0xdfff)) continue;
+        wchar_t value[3]{}; const auto native = cclive::native_text_position(layout, static_cast<LONG>(cp));
+        TEXTRANGEW range{{native, native + 1}, value}; SendMessageW(edit, EM_GETTEXTRANGE, 0, reinterpret_cast<LPARAM>(&range));
+        if (value[0] != layout.text[cp]) std::cerr << "Table mapping display=" << cp << " native=" << native << " expected=" << static_cast<unsigned>(layout.text[cp]) << " actual=" << static_cast<unsigned>(value[0]) << "\n";
+        check(value[0] == layout.text[cp], "native table UTF16 mapping selected a different glyph");
+    }
+    CHARRANGE selected{1, 4}; SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selected));
+    cclive::apply_text_layout(edit, layout, 12, 96);
+    CHARRANGE restored{}; SendMessageW(edit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&restored));
+    check(restored.cpMin == 1 && restored.cpMax == 4, "table formatting did not preserve native selection");
+    auto read_style = [&](const std::wstring& word) {
+        auto start = static_cast<LONG>(layout.text.find(word)); start = cclive::native_text_position(layout, start);
+        CHARRANGE range{start, start + 1}; SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
+        CHARFORMAT2W format{}; format.cbSize = sizeof(format);
+        SendMessageW(edit, EM_GETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format)); return format;
+    };
+    check(read_style(L"项目").dwEffects & CFE_BOLD, "native table header is not bold");
+    check(read_style(L"路径").crTextColor == cclive::text_layout_palette.latest &&
+          read_style(L"Qwen").crTextColor == cclive::text_layout_palette.body, "table latest highlight selected a different row or leaked");
+    check(read_style(L"C:\\work").dwEffects == 0 && std::wcscmp(read_style(L"C:\\work").szFaceName, L"Consolas") == 0,
+          "inline code in a table lost its literal font");
+    check(read_style(L"正文").dwEffects & CFE_BOLD, "text after native table lost formatting due to hidden row positions");
+    auto read_paragraph = [&](LONG position) {
+        const auto start = cclive::native_text_position(layout, position);
+        CHARRANGE range{start, start + 1}; SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
+        PARAFORMAT2 format{}; format.cbSize = sizeof(format);
+        SendMessageW(edit, EM_GETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&format)); return format;
+    };
+    check(read_paragraph(layout.paragraphs[1].start).wEffects & PFE_TABLE, "table is tab-aligned prose rather than native RichEdit grid");
+    check(read_paragraph(static_cast<LONG>(layout.text.find(L"261"))).wAlignment == PFA_RIGHT &&
+          read_paragraph(static_cast<LONG>(layout.text.find(L"路径"))).wAlignment == PFA_CENTER, "native table cell alignment lost after formatting");
+    const auto table_only = cclive::make_text_layout(L"| A | B |\n| --- | --- |\n| 1 | 2 |");
+    check(table_only.text == L"A\tB\r1\t2\r", "table at document end lost its canonical native row separator");
+    check(cclive::replace_text_layout(edit, table_only), "table-only native stream failed");
+    check(read_text() == table_only.text, "table at document end gained or lost text");
+    auto second_column_x = [&] {
+        POINT point{}; SendMessageW(edit, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&point), cclive::native_text_position(table_only, 2));
+        return point.x;
+    };
+    const auto wide_column = second_column_x();
+    SetWindowPos(edit, nullptr, 0, 0, 320, 400, SWP_NOACTIVATE | SWP_NOZORDER);
+    check(cclive::replace_text_layout(edit, table_only), "narrow table restream failed");
+    cclive::apply_text_layout(edit, table_only, 18, 144);
+    check(read_text() == table_only.text, "narrow table reflow or font change changed data");
+    check(second_column_x() < wide_column, "narrow table retained old column widths rather than reflowing native cells");
+    const auto plain = cclive::make_text_layout(L"正文恢复");
+    check(cclive::replace_text_layout(edit, plain), "table-to-prose replacement failed");
+    cclive::apply_text_layout(edit, plain, 12, 96);
+    PARAFORMAT2 body{}; body.cbSize = sizeof(body);
+    CHARRANGE first{0, 1}; SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&first));
+    SendMessageW(edit, EM_GETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&body));
+    check(!(body.wEffects & PFE_TABLE), "plain replacement retained native table structure");
+    check(GetForegroundWindow() != edit, "table rendering activated hidden RichEdit");
+    for (const auto& candidate : {L"a | b\nplain", L"| A | B |\n| -- | --- |\n| a | b |", L"```\n| A | B |\n| --- | --- |\n```"})
+        check(!cclive::make_text_layout(candidate).has_tables, "ordinary pipes malformed delimiter or fenced code became a table");
+    const auto empty = cclive::make_text_layout(L"| A | B |\n| --- | --- |\n| | x |\n| y | |");
+    check(empty.has_tables && empty.text == L"A\tB\r\tx\ry\t\r", "empty table cells were removed or shifted");
+    check(cclive::replace_text_layout(edit, empty), "empty native cells failed to stream");
+    check(read_text() == empty.text, "empty cells changed native table text");
+    const std::wstring literal_raw = L"| HTML | Lines |\n| --- | --- |\n| `&lt;br&gt;` &amp;lt; &amp;amp; | a<br>b |";
+    const auto literal_position = static_cast<LONG>(literal_raw.find(L"&lt;"));
+    const auto literal = cclive::make_text_layout(literal_raw, literal_position, 11);
+    check(literal.text == L"HTML\tLines\r<br> &lt; &amp;\ta\vb\r", "table HTML entities were decoded recursively or confused with a real line break");
+    const auto latest = std::find_if(literal.ranges.begin(), literal.ranges.end(), [](const auto& range) { return range.style == cclive::TextStyle::Latest; });
+    check(latest != literal.ranges.end() && literal.text.substr(latest->start, latest->length) == L"<br>", "literal HTML entity latest span lost its displayed glyphs");
+    check(cclive::replace_text_layout(edit, literal), "literal HTML table stream failed");
+    cclive::apply_text_layout(edit, literal, 12, 96);
+    check(read_text() == literal.text, "RTF reinterpreted literal HTML table text");
+    DestroyWindow(edit); FreeLibrary(library);
+}
 int main() {
     try {
         const auto plain = cclive::make_text_layout(L"你好\nsecond\r\nthird\r");
@@ -300,6 +392,7 @@ int main() {
         native_highlight_checks();
         native_format_checks();
         native_paragraph_checks();
+        native_table_checks();
         std::cout << checks << " text layout checks, 0 failures\n";
         return 0;
     } catch (const std::exception& error) {

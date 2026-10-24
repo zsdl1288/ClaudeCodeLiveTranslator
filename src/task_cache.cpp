@@ -1,4 +1,5 @@
 #include "task_cache.hpp"
+#include "markdown_table.hpp"
 #include <algorithm>
 #include <atomic>
 #include <list>
@@ -45,9 +46,15 @@ std::size_t payload_size(const json &value, std::size_t limit) {
   stream << value;
   return buffer.size();
 }
-std::string_view tail_lines(std::string_view text, std::size_t maximum) {
+std::string tail_lines(std::string_view text, std::size_t maximum,
+                       std::size_t maximum_bytes) {
   if (!maximum)
     return {};
+  if (auto table = markdown::table_tail(text, maximum)) {
+    if (table->size() > maximum_bytes)
+      throw std::length_error("task payload too large");
+    return std::move(*table);
+  }
   auto end = text.size();
   while (end && (text[end - 1] == '\r' || text[end - 1] == '\n'))
     --end;
@@ -59,10 +66,16 @@ std::string_view tail_lines(std::string_view text, std::size_t maximum) {
     const auto begin = end + 1;
     if (text[end] == '\n' && end && text[end - 1] == '\r')
       --end;
-    if (lines++ == maximum)
-      return text.substr(begin);
+    if (lines++ == maximum) {
+      text = text.substr(begin);
+      break;
+    }
   }
-  return text;
+  // Check before materializing ordinary text; a retained line can itself be
+  // much larger than the cache's per-task byte limit.
+  if (text.size() > maximum_bytes)
+    throw std::length_error("task payload too large");
+  return std::string(text);
 }
 std::size_t logical_lines(std::string_view text) {
   auto end = text.size();
@@ -128,10 +141,10 @@ json normalized_payload(const json &payload, std::size_t limit) {
         if ((field.key() == "source" || field.key() == "translation") &&
             field.value().is_string()) {
           auto tail = tail_lines(field.value().get_ref<const std::string &>(),
-                                 remaining);
+                                 remaining, budget);
           if (tail.size() > budget)
             throw std::length_error("task payload too large");
-          copy_field(record, field.key(), std::string(tail));
+          copy_field(record, field.key(), std::move(tail));
         } else
           copy_field(record, field.key(), field.value());
       }
