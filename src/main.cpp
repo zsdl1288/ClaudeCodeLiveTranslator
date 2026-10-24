@@ -1861,6 +1861,7 @@ public:
       else
         SendMessageW(view.window, EM_SETSCROLLPOS, 0,
                      reinterpret_cast<LPARAM>(&view.scroll));
+      repaintBody(view.window);
     }
     InvalidateRect(hwnd, nullptr, FALSE);
   }
@@ -2193,6 +2194,8 @@ public:
       if (!followingTranslation)
         SendMessageW(translationEdit, EM_SETSCROLLPOS, 0,
                      reinterpret_cast<LPARAM>(&translatedScroll));
+      repaintBody(sourceEdit);
+      repaintBody(translationEdit);
     }
     for (auto &record : records)
       if (record.state == "waiting") {
@@ -2616,6 +2619,7 @@ public:
       if (!follows(view.window))
         SendMessageW(view.window, EM_SETSCROLLPOS, 0,
                      reinterpret_cast<LPARAM>(&view.scroll));
+      repaintBody(view.window);
     }
   }
   void refresh() {
@@ -2872,6 +2876,16 @@ public:
     explicit ScrollGuard(bool &v) : value(v), previous(v) { value = true; }
     ~ScrollGuard() { value = previous; }
   };
+  static void repaintBody(HWND edit) {
+    if (!edit || !IsWindow(edit))
+      return;
+    // RichEdit may otherwise keep old glyphs in the exposed blank area after
+    // scrolling or WM_SETREDRAW. Finish erasing/painting before returning, even
+    // when no more translation events arrive.
+    RedrawWindow(edit, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW |
+                     RDW_NOCHILDREN);
+  }
   void goLatest() {
     followingSource = followingTranslation = true;
     ScrollGuard guard(internalScroll);
@@ -2880,7 +2894,7 @@ public:
         continue;
       SendMessageW(edit, EM_GETLINECOUNT, 0, 0);
       SendMessageW(edit, WM_VSCROLL, SB_BOTTOM, 0);
-      InvalidateRect(edit, nullptr, FALSE);
+      repaintBody(edit);
     }
     status("正在跟随最新译文；向上滚动可暂停跟随");
   }
@@ -2891,12 +2905,20 @@ public:
       RemoveWindowSubclass(edit, bodyProc, id);
       return DefSubclassProc(edit, msg, wp, lp);
     }
+    if (msg == WM_ERASEBKGND && app && wp) {
+      // Native RichEdit acknowledges this message without reliably clearing
+      // unused pixels. Fill the invalid DC region, including below the text.
+      RECT client{};
+      GetClientRect(edit, &client);
+      FillRect(reinterpret_cast<HDC>(wp), &client, app->panel);
+      return 1;
+    }
     bool navigation =
         msg == WM_KEYDOWN && (wp == VK_UP || wp == VK_DOWN || wp == VK_PRIOR ||
                               wp == VK_NEXT || wp == VK_HOME || wp == VK_END);
     bool manual = app && !app->closed && !app->internalScroll &&
                   (msg == WM_MOUSEWHEEL || msg == WM_VSCROLL ||
-                   msg == EM_LINESCROLL || navigation);
+                   msg == EM_LINESCROLL || msg == EM_SETSCROLLPOS || navigation);
     POINT before{};
     if (manual)
       SendMessageW(edit, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&before));
@@ -2908,6 +2930,8 @@ public:
         app->follows(edit) = false;
         app->cacheDirty = true;
       }
+      if (after.x != before.x || after.y != before.y)
+        repaintBody(edit);
     }
     return result;
   }
@@ -2939,13 +2963,13 @@ public:
     rendered.dpi = dpi;
     rendered.valid = true;
     SendMessageW(edit, EM_EXSETSEL, 0, (LPARAM)&selected);
-    SendMessageW(edit, WM_SETREDRAW, TRUE, 0);
     SendMessageW(edit, EM_GETLINECOUNT, 0, 0);
     if (bottom)
       SendMessageW(edit, WM_VSCROLL, SB_BOTTOM, 0);
     else
       SendMessageW(edit, EM_SETSCROLLPOS, 0, (LPARAM)&scroll);
-    InvalidateRect(edit, nullptr, FALSE);
+    SendMessageW(edit, WM_SETREDRAW, TRUE, 0);
+    repaintBody(edit);
   }
   void render() {
     if (closed)
@@ -2980,6 +3004,7 @@ public:
       if (!follows(view.window))
         SendMessageW(view.window, EM_SETSCROLLPOS, 0,
                      reinterpret_cast<LPARAM>(&view.scroll));
+      repaintBody(view.window);
     }
   }
   void applySettings(cclive::Settings updated, bool keyChanged) {
@@ -4116,6 +4141,101 @@ public:
     editText(translationEdit, lines(360));
     check("latest_button_restores_continuous_follow",
           followingTranslation && atBottom(translationEdit));
+    // Fill a synthetic bitmap with stale pixels. Native RichEdit claims to
+    // erase its background but leaves these pixels untouched without bodyProc.
+    for (HWND edit : {sourceEdit, translationEdit}) {
+      RECT savedBounds{}, client{};
+      GetWindowRect(edit, &savedBounds);
+      GetClientRect(edit, &client);
+      const bool needsSize = client.right <= 0 || client.bottom <= 0;
+      if (needsSize) {
+        SetWindowPos(edit, nullptr, 0, 0, 640, 320,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        GetClientRect(edit, &client);
+      }
+      BITMAPINFO bitmap{};
+      bitmap.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+      bitmap.bmiHeader.biWidth = client.right;
+      bitmap.bmiHeader.biHeight = -client.bottom;
+      bitmap.bmiHeader.biPlanes = 1;
+      bitmap.bmiHeader.biBitCount = 32;
+      bitmap.bmiHeader.biCompression = BI_RGB;
+      void *pixels = nullptr;
+      HDC dc = CreateCompatibleDC(nullptr);
+      HBITMAP surface = CreateDIBSection(dc, &bitmap, DIB_RGB_COLORS, &pixels,
+                                       nullptr, 0);
+      HGDIOBJ previous = surface ? SelectObject(dc, surface) : nullptr;
+      bool blank = dc && surface && pixels;
+      if (blank) {
+        auto *colors = static_cast<DWORD *>(pixels);
+        const auto size = static_cast<std::size_t>(client.right) * client.bottom;
+        std::fill_n(colors, size, 0x00ff00ff);
+        SendMessageW(edit, WM_ERASEBKGND, reinterpret_cast<WPARAM>(dc), 0);
+        GdiFlush();
+        const DWORD expected = RGB(GetBValue(PANEL), GetGValue(PANEL), GetRValue(PANEL));
+        blank = std::all_of(colors, colors + size, [&](DWORD color) {
+          return (color & 0x00ffffff) == expected;
+        });
+      }
+      check(edit == sourceEdit ? "source_blank_area_erases_stale_pixels"
+                               : "translation_blank_area_erases_stale_pixels", blank);
+      if (previous) SelectObject(dc, previous);
+      if (surface) DeleteObject(surface);
+      if (dc) DeleteDC(dc);
+      if (needsSize)
+        SetWindowPos(edit, nullptr, 0, 0, savedBounds.right - savedBounds.left,
+                     savedBounds.bottom - savedBounds.top,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    // An offscreen, non-activating synthetic window lets Windows deliver real
+    // WM_PAINT synchronously while the main self-test window stays hidden.
+    HWND paintFixture = CreateWindowExW(
+        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, MSFTEDIT_CLASS, L"",
+        WS_POPUP | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY,
+        -32000, -32000, 640, 320, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    check("offscreen_repaint_fixture_created", paintFixture != nullptr);
+    if (paintFixture) {
+      struct PaintCounts { unsigned paints = 0, erases = 0; } paintCounts;
+      SetWindowSubclass(paintFixture, bodyProc, 1, reinterpret_cast<DWORD_PTR>(this));
+      SetWindowSubclass(paintFixture,
+          [](HWND edit, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) -> LRESULT {
+            auto &counts = *reinterpret_cast<PaintCounts *>(data);
+            if (message == WM_PAINT) ++counts.paints;
+            if (message == WM_ERASEBKGND) ++counts.erases;
+            return DefSubclassProc(edit, message, wp, lp);
+          }, 2, reinterpret_cast<DWORD_PTR>(&paintCounts));
+      const auto savedSource = sourceEdit, savedTranslation = translationEdit;
+      const bool savedSourceFollow = followingSource, savedTranslationFollow = followingTranslation;
+      sourceEdit = nullptr;
+      translationEdit = paintFixture;
+      followingTranslation = true;
+      auto paintedNow = [&](PaintCounts before) {
+        return paintCounts.paints > before.paints &&
+               !GetUpdateRect(paintFixture, nullptr, FALSE);
+      };
+      auto before = paintCounts;
+      editText(paintFixture, lines(180));
+      check("output_update_finishes_erase_and_paint_before_return", paintedNow(before));
+      before = paintCounts;
+      SendMessageW(paintFixture, WM_VSCROLL, SB_TOP, 0);
+      check("manual_scroll_repaints_without_new_output", paintedNow(before) && !followingTranslation);
+      before = paintCounts;
+      goLatest();
+      check("latest_repaints_without_new_output", paintedNow(before) && followingTranslation);
+      before = paintCounts;
+      editText(paintFixture, L"Only one remaining line.");
+      check("shorter_output_clears_old_rows_immediately", paintedNow(before));
+      before = paintCounts;
+      editText(paintFixture, L"Only one remaining line.");
+      check("unchanged_output_does_not_repaint_in_idle_loop",
+            paintCounts.paints == before.paints && paintCounts.erases == before.erases);
+      sourceEdit = savedSource;
+      translationEdit = savedTranslation;
+      followingSource = savedSourceFollow;
+      followingTranslation = savedTranslationFollow;
+      renderedBodies.erase(paintFixture);
+      DestroyWindow(paintFixture);
+    }
     refreshing = true;
     EnableWindow(refreshButton, FALSE);
     auto ticket = ++refreshGeneration;
