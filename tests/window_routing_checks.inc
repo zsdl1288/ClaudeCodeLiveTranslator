@@ -156,6 +156,41 @@
               restoredB && !followingTranslation && !followingSource &&
               abs(routingScroll().y - scrollA.y) <= 2 && scrollA.y > scrollB.y);
 
+        // A real partial wheel message must pause follow before RichEdit's
+        // accumulated delta produces any synchronous native scroll movement.
+        routingSelect("B");
+        goLatest();
+        routingSelect("A");
+        followingTranslation = true;
+        {
+          ScrollGuard guard(internalScroll);
+          SendMessageW(translationEdit, WM_VSCROLL, SB_BOTTOM, 0);
+        }
+        const auto beforeFractionalWheel = routingScroll();
+        cacheDirty = false;
+        SendMessageW(translationEdit, WM_MOUSEWHEEL, MAKEWPARAM(0, 1), 0);
+        const auto afterFractionalWheel = routingScroll();
+        check("fractional_upward_native_wheel_pauses_follow_before_scroll_position_changes",
+              beforeFractionalWheel.y > 0 &&
+              beforeFractionalWheel.x == afterFractionalWheel.x &&
+              beforeFractionalWheel.y == afterFractionalWheel.y &&
+              !followingTranslation && cacheDirty);
+        {
+          ScrollGuard guard(internalScroll);
+          POINT deferredPosition{0, s(155)};
+          SendMessageW(translationEdit, EM_SETSCROLLPOS, 0,
+                       reinterpret_cast<LPARAM>(&deferredPosition));
+        }
+        const auto deferredScrollA = routingScroll();
+        const auto beforeWheelSelection = worker->submitted.load();
+        routingSelect("B");
+        const bool wheelRestoredBFollow = followingTranslation && isAtBottom(translationEdit);
+        routingSelect("A");
+        check("deferred_native_wheel_reading_position_restores_without_changing_other_window_follow",
+              wheelRestoredBFollow && activeTaskId == taskA && !followingTranslation &&
+              deferredScrollA.y > 0 && abs(routingScroll().y - deferredScrollA.y) <= 2 &&
+              worker->submitted.load() == beforeWheelSelection);
+
         accept(routingText("A", taskA, "revision", "A pending revision."));
         const auto oldRevisionA = routingJob(taskA, "A pending revision.");
         accept(routingText("B", taskB, "revision", "B pending revision."));

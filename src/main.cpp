@@ -3996,8 +3996,22 @@ public:
                   (msg == WM_MOUSEWHEEL || msg == WM_VSCROLL ||
                    msg == EM_LINESCROLL || msg == EM_SETSCROLLPOS || navigation);
     POINT before{};
-    if (manual)
+    if (manual) {
       SendMessageW(edit, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&before));
+      // High-resolution wheels can accumulate a partial delta before RichEdit
+      // moves. Honor upward reading intent immediately, even when the native
+      // scroll position will change only after this message returns.
+      const bool upward =
+          (msg == WM_MOUSEWHEEL && static_cast<short>(HIWORD(wp)) > 0) ||
+          (msg == WM_KEYDOWN && (wp == VK_UP || wp == VK_PRIOR || wp == VK_HOME)) ||
+          (msg == WM_VSCROLL && (LOWORD(wp) == SB_LINEUP ||
+                                LOWORD(wp) == SB_PAGEUP || LOWORD(wp) == SB_TOP)) ||
+          (msg == EM_LINESCROLL && lp < 0);
+      if (upward) {
+        app->follows(edit) = false;
+        app->cacheDirty = true;
+      }
+    }
     auto result = DefSubclassProc(edit, msg, wp, lp);
     if (manual) {
       POINT after{};
