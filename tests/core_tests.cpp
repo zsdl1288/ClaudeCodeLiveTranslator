@@ -188,6 +188,46 @@ int main(){
             Ledger bounded(0);auto many=bounded.observe_at({{"context","a"},{"blocks",blocks}},0);check(many.size()==512&&many[0]["block_key"]=="88"&&many.back()["block_key"]=="599","Ledger retains latest 512 blocks");
             rejects([]{Ledger bad(-1);},"Negative settle rejected");rejects([&]{l.observe_at(json::array(),0);},"Invalid snapshot rejected");
         }
+        {
+            Ledger sliding(0);
+            const auto initial=sliding.observe_at(snap("Alpha source.\n\nBeta source.\n\nGamma source."),0);
+            const auto moved=sliding.observe_at(snap("Beta source.\n\nGamma source.\n\nDelta source."),1);
+            check(texts(moved)==std::vector<std::string>({"Delta source."}),"Sliding source window only emits new suffix and never deletes departed history");
+            check(moved.size()==1&&moved[0]["segment"]==3&&moved[0]["source_segment"]==2&&moved[0]["key"]!=initial[2]["key"],"Occurrence ID remains monotonic while source index moves");
+            check(sliding.observe_at(snap("Beta source.\n\nGamma source.\n\nDelta source."),2).empty(),"Unchanged shifted window retains paragraph identity without replay");
+            const auto again=sliding.observe_at(snap("Gamma source.\n\nDelta source.\n\nEpsilon source."),3);
+            check(texts(again)==std::vector<std::string>({"Epsilon source."})&&again[0]["segment"]==4&&again[0]["source_segment"]==2,"Repeated sliding windows append stable occurrences without duplicate overlap");
+            const auto corrected=sliding.observe_at(snap("Corrected Gamma source.\n\nDelta source.\n\nEpsilon source."),4);
+            check(corrected.size()==1&&corrected[0]["key"]==initial[2]["key"]&&corrected[0]["revision"]==2&&corrected[0]["source_segment"]==0,"Correction after sliding retains original occurrence key and advances revision");
+            const auto shortened=sliding.observe_at(snap("Corrected Gamma source."),5);
+            check(texts(shortened)==std::vector<std::string>({"",""})&&shortened[0]["key"]==moved[0]["key"]&&shortened[1]["key"]==again[0]["key"],"Real shortened replacement still deletes its current trailing occurrences");
+        }
+        {
+            Ledger repeated(0);
+            const auto initial=repeated.observe_at(snap("Repeated source.\n\nMiddle source.\n\nRepeated source.\n\nLast source."),0);
+            const auto moved=repeated.observe_at(snap("Repeated source.\n\nLast source.\n\nNext source."),1);
+            check(texts(moved)==std::vector<std::string>({"Next source."}),"Sliding overlap matches ordered occurrences rather than global text equality");
+            const auto corrected=repeated.observe_at(snap("Corrected repeated source.\n\nLast source.\n\nNext source."),2);
+            check(corrected.size()==1&&corrected[0]["key"]==initial[2]["key"]&&corrected[0]["key"]!=initial[0]["key"],"Repeated sentence overlap preserves the correct latest occurrence key");
+            const auto separate=repeated.observe_at(snap("Corrected repeated source.\n\nLast source.\n\nNext source.","chat-a","answer","genuinely-new-block"),3);
+            check(separate.size()==3&&separate[0]["key"]!=corrected[0]["key"],"Identical text in a genuine new block remains separate occurrences");
+        }
+        {
+            Ledger pending(900);
+            pending.observe_at(snap("Alpha source.\n\nBeta source.\n\nGamma source."),0);
+            const auto initial=pending.flush_at(1000);
+            check(initial.size()==3,"Sliding stability fixture starts with completed occurrences");
+            check(pending.observe_at(snap("Beta source.\n\nGamma source.\n\nDelta source."),1100).empty()&&pending.flush_at(1500).empty(),"New sliding suffix keeps its independent settle timer");
+            const auto matured=pending.flush_at(2100);
+            check(texts(matured)==std::vector<std::string>({"Delta source."})&&matured[0]["source_segment"]==2,"Only the current new suffix matures after a sliding window");
+        }
+        {
+            Ledger repeated_prefix(0);
+            repeated_prefix.observe_at(snap("Alpha source.\n\nBeta source.\n\nAlpha source.\n\nBeta source."),0);
+            check(repeated_prefix.observe_at(snap("Alpha source.\n\nBeta source.\n\nAlpha source.\n\nBeta source."),1).empty(),"Unchanged repeated pattern is not mistaken for source scrolling");
+            const auto appended=repeated_prefix.observe_at(snap("Alpha source.\n\nBeta source.\n\nAlpha source.\n\nBeta source.\n\nGamma source."),2);
+            check(texts(appended)==std::vector<std::string>({"Gamma source."})&&appended[0]["segment"]==4,"Normal append after repeated pattern retains all existing occurrences");
+        }
         check(parse_openai_content(json::parse(R"({"choices":[{"delta":{"content":"你"}}]})"),true)=="你","OpenAI delta parser");
         check(parse_openai_content(json::parse(R"({"choices":[{"message":{"content":"你好"}}]})"),false)=="你好","OpenAI nonstream parser");
         check(parse_openai_content(json::parse(R"({"choices":[],"usage":{}})"),true).empty(),"Usage-only chunk accepted");

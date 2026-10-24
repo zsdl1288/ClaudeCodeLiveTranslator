@@ -3,8 +3,8 @@
 IDI_APP_ICON ICON "../assets/app.ico"
 
 1 VERSIONINFO
- FILEVERSION 1,2,5,0
- PRODUCTVERSION 1,2,5,0
+ FILEVERSION 1,2,6,0
+ PRODUCTVERSION 1,2,6,0
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
  FILEFLAGS 0
  FILEOS VOS_NT_WINDOWS32
@@ -16,11 +16,11 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "FileDescription", "Claude Desktop Live Translator"
-            VALUE "FileVersion", "1.2.5.0"
+            VALUE "FileVersion", "1.2.6.0"
             VALUE "InternalName", "ClaudeTranslator"
             VALUE "OriginalFilename", "ClaudeTranslator.exe"
             VALUE "ProductName", "Claude Desktop Live Translator"
-            VALUE "ProductVersion", "1.2.5"
+            VALUE "ProductVersion", "1.2.6"
         END
     END
     BLOCK "VarFileInfo"

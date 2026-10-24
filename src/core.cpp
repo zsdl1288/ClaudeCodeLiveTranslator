@@ -587,9 +587,45 @@ std::vector<json> Ledger::observe_at(const json& snapshot,std::int64_t now){
         if(pos!=blocks_.end()){block=std::move(*pos);blocks_.erase(pos);}else{block.key=in.key;block.kind=in.kind;}
         bool absent=!block.present,kind_changed=block.kind!=in.kind;block.kind=in.kind;block.present=true;
         auto candidates=split_text_segments(in.segments[0].text);if(candidates.size()>4096)candidates.resize(4096);
+        // UIA can expose a sliding source window while a reply grows. Match a
+        // nontrivial ordered suffix before treating shifted indices as rewrites.
+        // Departed prefixes are history; they must not delete or overwrite the
+        // caption occurrences that have already been emitted.
+        std::size_t active = block.segments.size();
+        while (active && block.segments[active - 1].text.empty()) --active;
+        std::size_t shifted = 0, matching_prefix = 0;
+        const auto prefix_bound = (std::min)(active, candidates.size());
+        while (matching_prefix < prefix_bound &&
+               block.segments[matching_prefix].text == candidates[matching_prefix].text &&
+               block.segments[matching_prefix].paragraph - block.segments.front().paragraph ==
+                   candidates[matching_prefix].paragraph - candidates.front().paragraph)
+            ++matching_prefix;
+        if (!kind_changed && active > 2 && candidates.size() >= 2) {
+            for (auto overlap = (std::min)(active - 1, candidates.size());
+                 overlap >= 2 && overlap > matching_prefix; --overlap) {
+                const auto start = active - overlap;
+                const auto old_paragraph = block.segments[start].paragraph;
+                const auto new_paragraph = candidates.front().paragraph;
+                bool same = old_paragraph >= new_paragraph;
+                for (std::size_t i = 0; same && i < overlap; ++i)
+                    same = block.segments[start + i].text == candidates[i].text &&
+                           block.segments[start + i].paragraph - old_paragraph ==
+                               candidates[i].paragraph - new_paragraph;
+                if (same) {
+                    shifted = start;
+                    block.paragraph_offset = old_paragraph - new_paragraph;
+                    break;
+                }
+            }
+        }
+        if (shifted) {
+            block.segments.resize(active);
+            block.segments.erase(block.segments.begin(), block.segments.begin() + shifted);
+        }
+        for (auto& candidate : candidates) candidate.paragraph += block.paragraph_offset;
         std::size_t count=(std::max)(candidates.size(),block.segments.size());
         for(std::size_t i=0;i<count;++i){std::string candidate=i<candidates.size()?candidates[i].text:"";std::size_t paragraph=i<candidates.size()?candidates[i].paragraph:0;
-            if(i>=block.segments.size()){Segment seg;seg.text=candidate;seg.paragraph=paragraph;seg.changed=now;block.segments.push_back(std::move(seg));continue;}
+            if(i>=block.segments.size()){Segment seg;seg.id=block.next_segment_id++;seg.text=candidate;seg.paragraph=paragraph;seg.changed=now;block.segments.push_back(std::move(seg));continue;}
             auto& slot=block.segments[i];if(candidate!=slot.text||kind_changed||paragraph!=slot.paragraph){slot.text=candidate;slot.paragraph=paragraph;slot.changed=now;}
             else if(absent&&(!slot.emitted||slot.text!=slot.emitted_text))slot.changed=now;
         }
@@ -603,7 +639,7 @@ std::vector<json> Ledger::flush_at(std::int64_t now){
         std::string wanted=english(slot.text)?slot.text:"";
         if(slot.emitted&&slot.emitted_text==wanted&&slot.emitted_kind==block.kind&&slot.emitted_paragraph==slot.paragraph)continue;
         if(wanted.empty()&&slot.emitted_text.empty()){slot.emitted=true;slot.emitted_text="";slot.emitted_kind=block.kind;slot.emitted_paragraph=slot.paragraph;continue;}
-        ++slot.revision;out.push_back({{"type","text"},{"key",json::array({epoch_,block.key,i}).dump()},{"block_key",block.key},{"segment",i},{"paragraph",slot.paragraph},{"text",wanted},{"kind",block.kind},{"epoch",epoch_},{"revision",slot.revision},{"stable",true}});
+        ++slot.revision;out.push_back({{"type","text"},{"key",json::array({epoch_,block.key,slot.id}).dump()},{"block_key",block.key},{"segment",slot.id},{"source_segment",i},{"paragraph",slot.paragraph},{"text",wanted},{"kind",block.kind},{"epoch",epoch_},{"revision",slot.revision},{"stable",true}});
         slot.emitted=true;slot.emitted_text=wanted;slot.emitted_kind=block.kind;slot.emitted_paragraph=slot.paragraph;
     }}return out;
 }

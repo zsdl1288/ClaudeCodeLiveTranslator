@@ -789,6 +789,8 @@ struct Watcher {
   std::map<std::string, std::size_t> sourceIndices;
   std::map<std::string, json> forwardedSlots;
   std::map<std::string, std::string> acceptedBodies;
+  std::map<std::string, std::string> blockAliases, acceptedKinds;
+  uint64_t forwardedOrder = 0;
   bool sourceIdentityPending = false;
   std::set<std::string> previousBlockKeys;
   std::size_t previousSourceCount = 0, previousMinimum = 0;
@@ -896,6 +898,9 @@ struct Watcher {
       consistentTaskSnapshots = 0;
       forwardedSlots.clear();
       acceptedBodies.clear();
+      blockAliases.clear();
+      acceptedKinds.clear();
+      forwardedOrder = 0;
       sourceIndices.clear();
       previousBlockKeys.clear();
       previousSourceCount = previousMinimum = minimumSourceIndex = 0;
@@ -942,7 +947,36 @@ struct Watcher {
     }
     auto effective = snapshot;
     effective["blocks"] = json::array();
-    std::map<std::string, std::string> nextBodies;
+    std::map<std::string, std::string> nextBodies, nextKinds, nextAliases;
+    std::set<std::string> surviving, reused;
+    for (const auto &raw : snapshot["blocks"])
+      if (raw.is_object() && raw.contains("key") && raw["key"].is_string()) {
+        auto key = raw["key"].get<std::string>();
+        if (auto found = blockAliases.find(key); found != blockAliases.end())
+          key = found->second;
+        if (acceptedBodies.count(key)) surviving.insert(key);
+      }
+    auto overlapCount = [](const std::string &older, const std::string &newer) {
+      const auto before = cclive::split_sentences(older);
+      const auto after = cclive::split_sentences(newer);
+      std::size_t prefix = 0;
+      while (prefix < before.size() && prefix < after.size() && before[prefix] == after[prefix])
+        ++prefix;
+      std::size_t suffix = 0;
+      for (auto count = std::min(before.size(), after.size()); count > 0; --count)
+        if (std::equal(before.end() - count, before.end(), after.begin())) {
+          suffix = count;
+          break;
+        }
+      std::size_t expanded = 0;
+      if (before.size() >= 2 && after.size() > before.size())
+        for (std::size_t offset = 1; offset + before.size() <= after.size(); ++offset)
+          if (std::equal(before.begin(), before.end(), after.begin() + offset)) {
+            expanded = before.size(); break;
+          }
+      return std::max({prefix, suffix, expanded});
+    };
+    bool slidingWindow = false, expandedWindow = false;
     for (const auto &raw : snapshot["blocks"]) {
       if (effective["blocks"].size() >= 128)
         break;
@@ -956,15 +990,57 @@ struct Watcher {
       if (key.empty() || key.size() > 4096 || body.empty() ||
           body.size() > 64000 * 3)
         continue;
+      const auto rawKey = key;
+      const auto kind = raw.value("kind", std::string("answer"));
+      if (auto found = blockAliases.find(key); found != blockAliases.end())
+        key = found->second;
+      if (!acceptedBodies.count(key)) {
+        // Rebuilds replace runtime IDs while preserving ordered source text.
+        // Only absent blocks can be remapped, once each; a repeated new block
+        // beside a surviving block remains an independent occurrence.
+        std::string matched;
+        std::size_t best = 0;
+        bool ambiguous = false;
+        for (const auto &previous : acceptedBodies) {
+          if (surviving.count(previous.first) || reused.count(previous.first) ||
+              acceptedKinds[previous.first] != kind)
+            continue;
+          auto score = overlapCount(previous.second, body);
+          if (score < 2 && !(score == 1 && body == previous.second && body.size() >= 80))
+            continue;
+          if (score > best) { best = score; matched = previous.first; ambiguous = false; }
+          else if (score == best) ambiguous = true;
+        }
+        if (!matched.empty() && !ambiguous) key = matched;
+      }
+      reused.insert(key);
       auto previous = acceptedBodies.find(key);
+      if (previous != acceptedBodies.end() && previous->second != body) {
+        auto before = cclive::split_sentences(previous->second);
+        auto after = cclive::split_sentences(body);
+        if (before.size() >= 2 && after.size() > before.size())
+          for (std::size_t offset = 1; offset + before.size() <= after.size(); ++offset)
+            if (std::equal(before.begin(), before.end(), after.begin() + offset)) {
+              expandedWindow = true; break;
+            }
+        for (auto count = std::min(before.size(), after.size()); count >= 2; --count)
+          if (count < before.size() &&
+              std::equal(before.end() - count, before.end(), after.begin())) {
+            slidingWindow = true;
+            break;
+          }
+      }
       if (previous != acceptedBodies.end() &&
           body.size() < previous->second.size() &&
           previous->second.compare(0, body.size(), body) == 0)
         body = previous->second;
       auto block = raw;
+      block["key"] = key;
       block["text"] = body;
       effective["blocks"].push_back(std::move(block));
       nextBodies[key] = std::move(body);
+      nextAliases[rawKey] = key;
+      nextKinds[key] = kind;
     }
     if (effective["blocks"].empty()) {
       unavailableBody();
@@ -972,6 +1048,8 @@ struct Watcher {
     }
     // Keep only the currently observed block set; no historical body cache.
     acceptedBodies = std::move(nextBodies);
+    blockAliases = std::move(nextAliases);
+    acceptedKinds = std::move(nextKinds);
     ++consistentTaskSnapshots;
     if (consistentTaskSnapshots < 2 && previousSourceCount)
       return; // Reconnection must not publish an empty source window.
@@ -979,6 +1057,7 @@ struct Watcher {
     meta["type"] = "task";
     meta["source_block_keys"] = json::array();
     meta["source_signatures"] = json::array();
+    meta["source_index_blocks"] = json::array();
     sourceIndices.clear();
     std::vector<std::size_t> englishPositions;
     std::set<std::string> blockKeys;
@@ -1006,6 +1085,7 @@ struct Watcher {
               meta["source_signatures"].size();
           meta["source_signatures"].push_back(
               contentSignature(sentences[index]));
+          meta["source_index_blocks"].push_back(block["key"]);
         }
       }
     }
@@ -1018,9 +1098,10 @@ struct Watcher {
     // Missing blocks become history. A smaller same-block correction normally
     // updates Ledger slots in place; only an earlier cropped window needs replay.
     bool replayWindow = consistentTaskSnapshots >= 2 &&
-                        blockKeys == previousBlockKeys &&
+                        blockKeys == previousBlockKeys && !slidingWindow &&
                         minimumSourceIndex < previousMinimum;
     meta["source_window_replay"] = replayWindow;
+    meta["source_window_rebind"] = expandedWindow;
     emit(std::move(meta));
     if (consistentTaskSnapshots < 2) {
       auto identityOnly = effective;
@@ -1030,7 +1111,12 @@ struct Watcher {
         publishLedger(std::move(event));
       return;
     }
-    if (replayWindow) {
+    if (expandedWindow) {
+      // Earlier source becoming visible again is a rebind, not new history.
+      // App seeds one-to-one cached occurrences before this fresh Ledger epoch.
+      forwardedSlots.clear();
+      ++windowReplayNonce;
+    } else if (replayWindow) {
       // Only the <=100 slots actually forwarded can delete live caption cards.
       // Delete with their old keys before advancing Ledger's epoch.
       for (const auto &item : forwardedSlots) {
@@ -1055,8 +1141,11 @@ struct Watcher {
     previousSourceCount = sourceIndices.size();
     previousMinimum = minimumSourceIndex;
     effective["context"] = ledgerContext();
-    for (auto event : ledger.observe(effective))
+    for (auto event : ledger.observe(effective)) {
+      if (expandedWindow && event.value("type", "") == "reset")
+        event["source_rebind"] = true;
       publishLedger(std::move(event));
+    }
   }
   void publishLedger(json event) {
     for (auto &entry : currentTask.items())
@@ -1064,7 +1153,9 @@ struct Watcher {
     if (event.value("type", "") == "text" && event.contains("block_key") &&
         event.contains("segment")) {
       auto slot = json::array({event["block_key"], event["segment"]}).dump();
-      auto index = sourceIndices.find(slot);
+      auto sourceSlot = json::array({event["block_key"],
+          event.contains("source_segment") ? event["source_segment"] : event["segment"]}).dump();
+      auto index = sourceIndices.find(sourceSlot);
       if (event.value("text", "").empty()) {
         auto previous = forwardedSlots.find(slot);
         if (previous == forwardedSlots.end())
@@ -1075,13 +1166,17 @@ struct Watcher {
         if (index == sourceIndices.end() || index->second < minimumSourceIndex)
           return;
         event["source_index"] = index->second;
-        forwardedSlots[slot] = event;
+        const auto prior = forwardedSlots.find(slot);
+        auto tracked = event;
+        tracked["forwarded_order"] = prior == forwardedSlots.end()
+            ? ++forwardedOrder : prior->second.value("forwarded_order", uint64_t(0));
+        forwardedSlots[slot] = std::move(tracked);
         while (forwardedSlots.size() > 100) {
           auto oldest = std::min_element(
               forwardedSlots.begin(), forwardedSlots.end(),
               [](const auto &left, const auto &right) {
-                return left.second.value("source_index", std::size_t(0)) <
-                       right.second.value("source_index", std::size_t(0));
+                return left.second.value("forwarded_order", uint64_t(0)) <
+                       right.second.value("forwarded_order", uint64_t(0));
               });
           forwardedSlots.erase(oldest);
         }
@@ -1227,7 +1322,7 @@ struct Record {
   bool pendingReplacement = false;
   std::string layoutBlock;
   std::size_t layoutParagraph = 0;
-  bool hasLayout = false;
+  bool hasLayout = false, visible = true;
 };
 class App;
 struct Config {
@@ -1494,10 +1589,13 @@ public:
     return cclive::chatgpt::status(); // Only this application's own DPAPI file.
   };
   struct SourceAlias {
-    std::string record, block;
+    std::string record, block, signature;
   };
   std::map<std::string, SourceAlias> sourceAliases;
   std::set<std::string> replayCandidates;
+  std::vector<std::string> clearedSignatures;
+  std::set<std::string> clearedBlocks;
+  std::set<std::size_t> clearedSourceIndices;
   bool cacheDirty = false, sourceNeedsReplay = false, replayPendingBody = false;
   json lastTaskMetadata, activeProfile;
   std::map<std::string, std::string> windowReplayMemo;
@@ -1986,6 +2084,7 @@ public:
                        {"state", record.state},
                        {"pending_replacement", record.pendingReplacement},
                        {"has_layout", record.hasLayout},
+                       {"visible", record.visible},
                        {"layout_block", record.layoutBlock},
                        {"layout_paragraph", record.layoutParagraph},
                        {"error", record.error},
@@ -2004,6 +2103,8 @@ public:
             {"translation_profile",
              activeProfile.is_object() ? activeProfile : translationProfile()},
             {"records", saved},
+            {"cleared_signatures", clearedSignatures},
+            {"cleared_blocks", clearedBlocks},
             {"source_scroll_x", source.x},
             {"source_scroll_y", source.y},
             {"translation_scroll_x", translated.x},
@@ -2014,7 +2115,7 @@ public:
   void saveActiveTask() {
     if (!activeTaskId.empty() && taskCache) {
       try {
-        if (records.empty())
+        if (records.empty() && clearedSignatures.empty())
           taskCache->erase(activeTaskId);
         else
           taskCache->put(activeTaskId, taskPayload());
@@ -2024,7 +2125,95 @@ public:
     cacheDirty = false;
     lastCacheSave = Clock::now();
   }
+  void updateClearBoundary(const json &metadata, bool restored = false) {
+    if (!metadata.contains("source_signatures") ||
+        !metadata["source_signatures"].is_array() ||
+        metadata["source_signatures"].empty())
+      return;
+    clearedSourceIndices.clear();
+    if (clearedSignatures.empty())
+      return;
+    bool sameBlock = false;
+    if (metadata.contains("source_block_keys") && metadata["source_block_keys"].is_array())
+      for (const auto &key : metadata["source_block_keys"])
+        if (key.is_string() && clearedBlocks.count(key.get<std::string>()))
+          sameBlock = true;
+    if (!sameBlock && !restored)
+      return;
+    const auto &sources = metadata["source_signatures"];
+    const std::set<std::string> dismissed(clearedSignatures.begin(), clearedSignatures.end());
+    std::vector<std::size_t> candidates;
+    const auto first = metadata.value("source_minimum_index", std::size_t(0));
+    const bool blockPositions = metadata.contains("source_index_blocks") &&
+        metadata["source_index_blocks"].is_array() &&
+        metadata["source_index_blocks"].size() == sources.size();
+    for (auto index = first; index < sources.size(); ++index)
+      if (sources[index].is_string() && dismissed.count(sources[index].get<std::string>()) &&
+          (restored || !blockPositions ||
+           clearedBlocks.count(metadata["source_index_blocks"][index].get<std::string>())))
+        candidates.push_back(index);
+    // Match occurrences in order, preferring the earliest equal occurrence.
+    // A cropped prefix must not consume an identical sentence newly appended
+    // at the end (A,B,C -> B,C,D,A still exposes the new final A).
+    const auto rows = clearedSignatures.size(), columns = candidates.size();
+    std::vector<std::vector<unsigned short>> length(rows + 1,
+        std::vector<unsigned short>(columns + 1));
+    for (auto i = rows; i-- > 0;)
+      for (auto j = columns; j-- > 0;)
+        length[i][j] = sources[candidates[j]] == clearedSignatures[i]
+            ? static_cast<unsigned short>(1 + length[i + 1][j + 1])
+            : std::max(length[i + 1][j], length[i][j + 1]);
+    std::size_t i = 0, j = 0;
+    while (i < rows && j < columns) {
+      if (sources[candidates[j]] == clearedSignatures[i]) {
+        clearedSourceIndices.insert(candidates[j]);
+        ++i; ++j;
+      } else if (length[i + 1][j] >= length[i][j + 1]) ++i;
+      else ++j;
+    }
+    const bool exactReplay = sources.size() == clearedSignatures.size() &&
+        std::equal(clearedSignatures.begin(), clearedSignatures.end(), sources.begin());
+    // A cleared occurrence plus a retained pending occurrence also proves a
+    // rebuilt source window (R,R). Count each retained occurrence only once,
+    // without letting the dismissed first R steal its still-running sibling.
+    std::map<std::string, std::size_t> retained;
+    for (const auto &record : records)
+      ++retained[record.sourceSignature.empty() ? contentSignature(record.source) : record.sourceSignature];
+    std::vector<std::size_t> replayEvidence;
+    if (restored)
+      for (auto index = first; index < sources.size(); ++index) {
+        if (clearedSourceIndices.count(index) || !sources[index].is_string()) continue;
+        auto found = retained.find(sources[index].get<std::string>());
+        if (found != retained.end() && found->second) {
+          replayEvidence.push_back(index);
+          --found->second;
+        }
+      }
+    if (!sameBlock && restored && clearedSourceIndices.size() + replayEvidence.size() < 2 && !exactReplay)
+      clearedSourceIndices.clear();
+    if (restored && !clearedSourceIndices.empty()) {
+      if (blockPositions) {
+        std::map<std::string, std::size_t> matchedBlocks;
+        for (auto index : clearedSourceIndices)
+          ++matchedBlocks[metadata["source_index_blocks"][index].get<std::string>()];
+        for (auto index : replayEvidence)
+          ++matchedBlocks[metadata["source_index_blocks"][index].get<std::string>()];
+        for (const auto &entry : matchedBlocks)
+          if (entry.second >= 2 || exactReplay || clearedBlocks.count(entry.first))
+            clearedBlocks.insert(entry.first);
+        for (auto index = clearedSourceIndices.begin(); index != clearedSourceIndices.end();)
+          if (!clearedBlocks.count(metadata["source_index_blocks"][*index].get<std::string>()))
+            index = clearedSourceIndices.erase(index);
+          else ++index;
+      } else if (metadata.contains("source_block_keys") && metadata["source_block_keys"].is_array()) {
+        for (const auto &key : metadata["source_block_keys"])
+          if (key.is_string()) clearedBlocks.insert(key.get<std::string>());
+      }
+    }
+    while (clearedBlocks.size() > 128) clearedBlocks.erase(clearedBlocks.begin());
+  }
   void seedReplay(const json &metadata) {
+    updateClearBoundary(metadata, true);
     replayCandidates.clear();
     std::map<std::string, std::size_t> visible;
     if (metadata.contains("source_signatures") &&
@@ -2036,7 +2225,7 @@ public:
       ++visible[contentSignature(metadata["text"].get<std::string>())];
     }
     sourceNeedsReplay = false;
-    replayPendingBody = !records.empty() && visible.empty();
+    replayPendingBody = (!records.empty() || !clearedSignatures.empty()) && visible.empty();
     // Prefer the latest matching occurrence, not an arbitrarily old "Done"
     // card.
     for (auto i = records.rbegin(); i != records.rend(); ++i) {
@@ -2075,6 +2264,11 @@ public:
         metadata.value("source_minimum_index",
                        sourceCount > 100 ? sourceCount - 100 : std::size_t(0));
     if (id == activeTaskId) {
+      if (metadata.value("source_window_rebind", false)) {
+        sourceAliases.clear();
+        seedReplay(metadata);
+      }
+      updateClearBoundary(metadata);
       if (activeProfile != translationProfile()) {
         windowReplayMemo.clear();
         windowReplayLastIndex = 0;
@@ -2118,6 +2312,9 @@ public:
     serial = 0;
     ledgerEpoch = -1;
     windowReplayMemo.clear();
+    clearedSignatures.clear();
+    clearedBlocks.clear();
+    clearedSourceIndices.clear();
     activeTaskId = id;
     activeProfile = translationProfile();
     activeTaskTitle = titleText;
@@ -2127,6 +2324,10 @@ public:
     POINT sourceScroll{}, translatedScroll{};
     if (auto cached = taskCache->get(id)) {
       try {
+        clearedSignatures = cached->value("cleared_signatures", std::vector<std::string>{});
+        if (clearedSignatures.size() > 100)
+          clearedSignatures.erase(clearedSignatures.begin(), clearedSignatures.end() - 100);
+        clearedBlocks = cached->value("cleared_blocks", std::set<std::string>{});
         bool matching = cached->value("translation_profile", json::object()) ==
                         translationProfile();
         followingSource = cached->value("follow_source", true);
@@ -2146,6 +2347,7 @@ public:
             record.key =
                 item.value("key", "record-" + std::to_string(record.serial));
             record.source = item["source"].get<std::string>();
+            record.visible = item.value("visible", true);
             record.sourceSignature =
                 item.value("source_signature", contentSignature(record.source));
             record.translation = matching ? item.value("translation", "") : "";
@@ -2207,7 +2409,47 @@ public:
     cacheDirty = true;
   }
   void cancelAll() { worker->cancelAll(); }
-  void clear() {
+  void clear(bool continueWork = false) {
+    if (continueWork) {
+      std::set<std::string> removed;
+      for (auto current = records.begin(); current != records.end();) {
+        const bool pending = current->state == "waiting" || current->state == "queued" ||
+            current->state == "translating" || current->state == "rate_limited" ||
+            current->state == "paused";
+        if (pending) {
+          current->visible = false;
+          current->translation.clear();
+          current->pendingReplacement = false;
+          current->error.clear();
+          ++current;
+        } else {
+          clearedSignatures.push_back(current->sourceSignature.empty()
+              ? contentSignature(current->source) : current->sourceSignature);
+          if (current->hasLayout) clearedBlocks.insert(current->layoutBlock);
+          removed.insert(current->key);
+          replayCandidates.erase(current->key);
+          current = records.erase(current);
+        }
+      }
+      if (clearedSignatures.size() > 100)
+        clearedSignatures.erase(clearedSignatures.begin(), clearedSignatures.end() - 100);
+      for (auto &alias : sourceAliases)
+        if (removed.count(alias.second.record)) alias.second.record.clear();
+      updateClearBoundary(lastTaskMetadata);
+      windowReplayMemo.clear();
+      windowReplayLastIndex = 0;
+      followingSource = followingTranslation = true;
+      dirty = cacheDirty = true;
+      saveActiveTask();
+      render();
+      status(paused ? "已清空显示；采集继续，翻译保持暂停"
+             : running ? "已清空显示；正在执行和排队的翻译继续，新内容从下方加入"
+                       : "已清空当前任务；其他任务缓存保留");
+      return;
+    }
+    clearedSignatures.clear();
+    clearedBlocks.clear();
+    clearedSourceIndices.clear();
     ++generation;
     cancelAll();
     records.clear();
@@ -2462,7 +2704,7 @@ public:
       if (incoming >= 0 && ledgerEpoch >= incoming)
         return;
       sourceAliases.clear();
-      if (ledgerEpoch >= 0) {
+      if (ledgerEpoch >= 0 && !v.value("source_rebind", false)) {
         ++generation;
         cancelAll();
         for (auto &record : records)
@@ -2489,6 +2731,9 @@ public:
     if (key.empty())
       return;
     auto alias = sourceAliases.find(key);
+    if (alias != sourceAliases.end() && alias->second.record.empty() &&
+        alias->second.signature == incomingSignature)
+      return;
     auto it = alias == sourceAliases.end()
                   ? records.end()
                   : std::find_if(records.begin(), records.end(),
@@ -2504,7 +2749,14 @@ public:
       dirty = cacheDirty = true;
       return;
     }
-    if (it == records.end()) {
+    if (it == records.end() && v.contains("source_index") &&
+        v["source_index"].is_number_integer() &&
+        (v["source_index"].is_number_unsigned() || v["source_index"].get<int64_t>() >= 0) &&
+        clearedSourceIndices.count(v["source_index"].get<std::size_t>()) &&
+        (!v.contains("block_key") || clearedBlocks.count(v.value("block_key", "")))) {
+      sourceAliases[key] = {"", v.value("block_key", ""), incomingSignature};
+      return;
+    }    if (it == records.end()) {
       it = std::find_if(records.begin(), records.end(),
                         [&](const Record &record) {
                           return replayCandidates.count(record.key) &&
@@ -2514,6 +2766,7 @@ public:
       if (it != records.end())
         replayCandidates.erase(it->key);
     }
+
     bool createdRecord = false;
     if (it == records.end()) {
       std::string memo;
@@ -2567,7 +2820,7 @@ public:
       it->layoutBlock = block;
       it->layoutParagraph = paragraph;
     }
-    sourceAliases[key] = {it->key, v.value("block_key", "")};
+    sourceAliases[key] = {it->key, v.value("block_key", ""), incomingSignature};
     if (!windowReplayMemo.empty() && v.contains("source_index") &&
         v["source_index"].is_number_integer() &&
         v["source_index"].get<std::size_t>() >= windowReplayLastIndex)
@@ -2584,6 +2837,7 @@ public:
     worker->cancel(it->key);
     it->pendingReplacement = it->pendingReplacement ||
         (it->state == "done" && !it->translation.empty());
+    if (it->source != source) it->visible = true;
     it->source = std::move(source);
     it->sourceSignature = incomingSignature;
     if (!it->pendingReplacement)
@@ -2802,14 +3056,12 @@ public:
   }
   std::wstring output(bool original) const {
     if (records.empty())
-      return original ? L"英文原文将在这里显示"
-                      : L"中文译文将在这里显示\r\n\r\n点击开始后，译文会随输出"
-                        L"更新。";
+      return {};
     std::wstring value;
     size_t begin = records.size(), chars = 0;
     while (begin > 0) {
       const auto &record = records[begin - 1];
-      const size_t add = original ? record.source.size() : record.translation.size();
+      const size_t add = !record.visible ? 0 : original ? record.source.size() : record.translation.size();
       if (chars + add > 1000000 && begin < records.size())
         break;
       chars += add;
@@ -2821,6 +3073,7 @@ public:
     wchar_t previousEdge = 0;
     for (size_t index = begin; index < records.size(); ++index) {
       const auto &record = records[index];
+      if (!record.visible) { previous = nullptr; continue; }
       auto content = displayContent(original ? record.source : record.translation);
       if (content.empty()) {
         // Do not join completed text across an untranslated or failed sentence.
@@ -3211,6 +3464,7 @@ public:
     const auto previousState = it->state;
     it->state = v.value("state", "");
     auto translated = v.value("translation", "");
+    if (!translated.empty()) it->visible = true;
     if (!it->pendingReplacement)
       it->translation = std::move(translated);
     else if (it->state == "done" && !translated.empty()) {
@@ -4560,7 +4814,7 @@ public:
       record.version = ++revision;
       records.push_back(std::move(record));
     }
-    sourceAliases["removed-runtime"] = {records[0].key, "old-block"};
+    sourceAliases["removed-runtime"] = {records[0].key, "old-block", ""};
     trimRecords();
     check("subtitle_cache_keeps_latest_100_logical_lines",
           retainedLines() == 100 && records.size() == 100 &&
@@ -4913,7 +5167,7 @@ public:
     oversized.state = "done";
     auto oversizedVersion = oversized.version;
     records.push_back(oversized);
-    sourceAliases["oversized-runtime"] = {oversized.key, "large-block"};
+    sourceAliases["oversized-runtime"] = {oversized.key, "large-block", ""};
     trimRecords();
     check("single_record_keeps_only_last_100_lines",
           records.size() == 1 && retainedLines() == 100 &&
@@ -5262,6 +5516,208 @@ public:
                                            {"kind", "answer"},
                                            {"text", body}}})}};
     };
+    // Same-task runtime rebuilds and rolling source windows must keep actual
+    // occurrences, rather than appending copies or overwriting old captions.
+    auto remount = largeSnapshot("remount-task", "runtime-original", 3);
+    supplied.publishSnapshot(remount, suppliedLedger); drainSupplied();
+    supplied.publishSnapshot(remount, suppliedLedger); drainSupplied();
+    for (std::size_t n = 0; n < records.size(); ++n) complete(n, "译文 " + records[n].source);
+    const auto firstRemountKey = records.front().key;
+    const auto remountSubmissions = worker->submitted.load();
+    remount["blocks"][0]["key"] = "runtime-rebuilt";
+    supplied.publishSnapshot(remount, suppliedLedger); drainSupplied();
+    check("same_task_runtime_rebuild_does_not_duplicate_completed_rows",
+          records.size() == 3 && records.front().key == firstRemountKey &&
+          worker->submitted.load() == remountSubmissions);
+    remount = largeSnapshot("remount-task", "runtime-rebuilt", 4);
+    supplied.publishSnapshot(remount, suppliedLedger); drainSupplied();
+    check("rebuilt_runtime_appends_only_new_tail", records.size() == 4 &&
+          records.back().source == "Large source 3.");
+    complete(records.size() - 1, "译文 " + records.back().source);
+    for (int next = 4; next < 105; ++next) {
+      std::string body;
+      for (int n = next - 3; n <= next; ++n)
+        body += "Large source " + std::to_string(n) + ".\n\n";
+      remount["blocks"][0]["text"] = body;
+      supplied.publishSnapshot(remount, suppliedLedger); drainSupplied();
+      complete(records.size() - 1, "译文 " + records.back().source);
+    }
+    render();
+    check("105_rolling_sources_keep_latest_100_once_in_order",
+          records.size() == 100 && retainedLines() == 100 &&
+          records.front().source == "Large source 5." &&
+          records.back().source == "Large source 104." && isAtBottom(translationEdit));
+    bool orderedRolling = true;
+    for (std::size_t n = 0; n < records.size(); ++n)
+      orderedRolling = orderedRolling && records[n].source == "Large source " + std::to_string(n + 5) + ".";
+    check("rolling_source_overlap_never_reorders_or_retranslates_retained_rows", orderedRolling);
+    auto retainedState = [&] {
+      json state = json::array();
+      for (const auto &record : records)
+        state.push_back({{"key", record.key}, {"version", record.version},
+                         {"source", record.source}, {"translation", record.translation},
+                         {"state", record.state}, {"pending", record.pendingReplacement}});
+      return state;
+    };
+    const auto beforeFullRestore = retainedState();
+    const auto beforeFullSubmissions = worker->submitted.load();
+    auto fullSource = largeSnapshot("remount-task", "runtime-expanded", 105);
+    supplied.publishSnapshot(fullSource, suppliedLedger); drainSupplied();
+    check("full_source_restoration_after_rolling_reuses_all_cached_occurrences",
+          records.size() == 100 && retainedState() == beforeFullRestore &&
+          worker->submitted.load() == beforeFullSubmissions);
+    supplied.publishSnapshot(largeSnapshot("rolling-other", "rolling-other-block", 1), suppliedLedger); drainSupplied();
+    supplied.publishSnapshot(largeSnapshot("rolling-other", "rolling-other-block", 1), suppliedLedger); drainSupplied();
+    supplied.publishSnapshot(remount, suppliedLedger); drainSupplied();
+    supplied.publishSnapshot(remount, suppliedLedger); drainSupplied();
+    check("task_switch_restores_rolling_100_line_ram_cache",
+          records.size() == 100 && records.front().source == "Large source 5." &&
+          records.back().source == "Large source 104.");
+
+    // Use real queued Jobs, without running this isolated worker. Clearing the
+    // display must preserve the exact pending jobs and accept their results.
+    auto originalWorker = worker;
+    worker = std::make_shared<Worker>(bus);
+    paused = false;
+    auto pendingRebind = largeSnapshot("pending-rebind", "pending-rebind-block", 3);
+    supplied.publishSnapshot(pendingRebind, suppliedLedger); drainSupplied();
+    supplied.publishSnapshot(pendingRebind, suppliedLedger); drainSupplied();
+    std::shared_ptr<Job> rebindActive;
+    { std::lock_guard<std::mutex> lock(worker->mutex);
+      worker->active = worker->pending.front(); worker->pending.pop_front();
+      rebindActive = worker->active; }
+    pendingRebind["blocks"][0]["text"] = "Large source 1.\n\nLarge source 2.\n\nLarge source 3.";
+    supplied.publishSnapshot(pendingRebind, suppliedLedger); drainSupplied();
+    const auto pendingRebindGeneration = generation;
+    const auto pendingRebindSubmissions = worker->submitted.load();
+    const auto pendingRebindState = retainedState();
+    pendingRebind = largeSnapshot("pending-rebind", "pending-rebind-expanded", 4);
+    supplied.publishSnapshot(pendingRebind, suppliedLedger); drainSupplied();
+    bool rebindJobsKept = worker->active == rebindActive && !rebindActive->cancel->load();
+    { std::lock_guard<std::mutex> lock(worker->mutex);
+      for (const auto &job : worker->pending) rebindJobsKept = rebindJobsKept && !job->cancel->load(); }
+    check("full_source_rebind_keeps_active_and_queued_jobs_without_cancellation",
+          rebindJobsKept && generation == pendingRebindGeneration &&
+          worker->submitted.load() == pendingRebindSubmissions && retainedState() == pendingRebindState);
+    auto liveClear = largeSnapshot("live-clear-task", "live-clear-block", 3);
+    supplied.publishSnapshot(liveClear, suppliedLedger); drainSupplied();
+    supplied.publishSnapshot(liveClear, suppliedLedger); drainSupplied();
+    complete(0, "清除前已完成");
+    acceptResult({{"generation", generation}, {"task_id", activeTaskId},
+                  {"key", records[1].key}, {"version", records[1].version},
+                  {"state", "translating"}, {"translation", "清除前的部分译文"}});
+    const auto clearGeneration = generation, clearSourceGeneration = sourceGeneration;
+    const auto pendingKey = records[1].key;
+    const auto pendingVersion = records[1].version;
+    const auto pendingSerial = serial;
+    const auto clearSubmitCount = worker->submitted.load();
+    std::vector<std::shared_ptr<Job>> queuedBefore;
+    std::shared_ptr<Job> activeBefore;
+    { std::lock_guard<std::mutex> lock(worker->mutex);
+      worker->active = worker->pending.at(1);
+      worker->pending.erase(worker->pending.begin() + 1);
+      activeBefore = worker->active;
+      queuedBefore.assign(worker->pending.begin(), worker->pending.end()); }
+    clear(true);
+    check("live_clear_immediately_blanks_both_panes_and_keeps_running",
+          running && !paused && output(true).empty() && output(false).empty() &&
+          textOf(translationEdit).empty() && records.size() == 2 &&
+          generation == clearGeneration && sourceGeneration == clearSourceGeneration &&
+          records[0].key == pendingKey && records[0].version == pendingVersion && serial == pendingSerial);
+    bool jobsPreserved = worker->submitted.load() == clearSubmitCount;
+    { std::lock_guard<std::mutex> lock(worker->mutex);
+      jobsPreserved = jobsPreserved && worker->pending.size() == queuedBefore.size() &&
+          worker->active == activeBefore && activeBefore && !activeBefore->cancel->load();
+      for (const auto &job : queuedBefore) jobsPreserved = jobsPreserved && !job->cancel->load(); }
+    check("live_clear_keeps_inflight_and_queued_jobs_without_resubmit", jobsPreserved);
+    complete(0, "清除后继续完成的译文");
+    complete(1, "排队内容继续完成");
+    check("pending_results_continue_after_clear_without_old_partial_text",
+          records[0].visible && records[1].visible &&
+          output(false).find(L"清除后继续完成的译文") != std::wstring::npos &&
+          output(false).find(L"清除前") == std::wstring::npos);
+    liveClear = largeSnapshot("live-clear-task", "live-clear-block", 4);
+    supplied.publishSnapshot(liveClear, suppliedLedger); drainSupplied();
+    check("live_clear_accepts_new_source_with_unique_record_key",
+          records.size() == 3 && records.back().source == "Large source 3." &&
+          records.back().key != pendingKey && serial > pendingSerial);
+    complete(records.size() - 1, "新的末尾译文");
+    clear(true);
+    check("empty_cleared_task_keeps_only_ram_dismissal_boundary",
+          records.empty() && taskCache->get("live-clear-task").has_value() &&
+          taskCache->get("live-clear-task")->at("records").empty());
+    auto clearOther = largeSnapshot("live-clear-other", "live-clear-other-block", 1);
+    supplied.publishSnapshot(clearOther, suppliedLedger); drainSupplied();
+    supplied.publishSnapshot(clearOther, suppliedLedger); drainSupplied();
+    complete(0, "另一个窗口的缓存");
+    liveClear["blocks"][0]["key"] = "live-clear-rebuilt";
+    supplied.publishSnapshot(liveClear, suppliedLedger); drainSupplied();
+    supplied.publishSnapshot(liveClear, suppliedLedger); drainSupplied();
+    check("cleared_task_does_not_refill_on_A_B_A_or_runtime_rebuild", records.empty());
+    liveClear = largeSnapshot("live-clear-task", "live-clear-rebuilt", 5);
+    supplied.publishSnapshot(liveClear, suppliedLedger); drainSupplied();
+    check("new_content_after_cleared_task_restore_still_translates",
+          records.size() == 1 && records.back().source == "Large source 4." && records.back().state == "queued");
+    complete(0, "切换回来后的新内容");
+    supplied.publishSnapshot(clearOther, suppliedLedger); drainSupplied();
+    supplied.publishSnapshot(clearOther, suppliedLedger); drainSupplied();
+    check("clear_preserves_other_window_ram_translation",
+          records.size() == 1 && records[0].translation == "另一个窗口的缓存");
+    auto duplicateClear = largeSnapshot("duplicate-clear-task", "duplicate-clear-block", 1);
+    duplicateClear["blocks"][0]["text"] = "Repeated source.\n\nRepeated source.";
+    supplied.publishSnapshot(duplicateClear, suppliedLedger); drainSupplied();
+    supplied.publishSnapshot(duplicateClear, suppliedLedger); drainSupplied();
+    complete(0, "已完成的首次出现");
+    clear(true);
+    const auto retainedDuplicateKey = records.front().key;
+    supplied.publishSnapshot(clearOther, suppliedLedger); drainSupplied();
+    supplied.publishSnapshot(clearOther, suppliedLedger); drainSupplied();
+    duplicateClear["blocks"][0]["key"] = "duplicate-clear-rebuilt";
+    supplied.publishSnapshot(duplicateClear, suppliedLedger); drainSupplied();
+    supplied.publishSnapshot(duplicateClear, suppliedLedger); drainSupplied();
+    check("cleared_identical_occurrence_cannot_steal_pending_occurrence_on_restore",
+          records.size() == 1 && records.front().key == retainedDuplicateKey &&
+          !records.front().visible && records.front().state == "queued");
+    duplicateClear["blocks"][0]["text"] = "Repeated source.\n\nRepeated source.\n\nRepeated source.";
+    supplied.publishSnapshot(duplicateClear, suppliedLedger); drainSupplied();
+    check("new_identical_occurrence_after_clear_remains_independent",
+          records.size() == 2 && records.front().key == retainedDuplicateKey &&
+          records.back().key != retainedDuplicateKey);
+    accept(taskMeta("clear-paused-task", {"Pending paused source."}));
+    paused = true;
+    accept(taskText("clear-paused-task", "clear-paused-runtime", "Pending paused source."));
+    clear(true);
+    check("clear_while_paused_preserves_hidden_pending_work",
+          running && paused && records.size() == 1 && !records[0].visible && records[0].state == "paused");
+    pause();
+    check("resume_after_clear_requeues_pending_work", !paused && records[0].state == "queued");
+    cancelAll();
+    running = false;
+    records[0].state = "stopped";
+    clear(true);
+    check("clear_while_stopped_does_not_start_translation", !running && records.empty());
+    running = true;
+    clearedSignatures = {"A", "B", "C"};
+    clearedBlocks = {"boundary"};
+    json boundary = {{"source_block_keys", json::array({"boundary"})},
+        {"source_signatures", json::array({"B", "C", "D", "A"})}};
+    updateClearBoundary(boundary);
+    check("clear_boundary_matches_overlap_without_hiding_new_repeated_tail",
+          clearedSourceIndices == std::set<std::size_t>({0, 1}));
+    clearedSignatures = {"A", "A"};
+    boundary["source_signatures"] = json::array({"A", "A", "A"});
+    updateClearBoundary(boundary);
+    check("clear_boundary_preserves_occurrence_count_for_identical_sentences",
+          clearedSourceIndices == std::set<std::size_t>({0, 1}));
+    clearedSignatures = {"A"};
+    boundary["source_block_keys"] = json::array({"new-message"});
+    boundary["source_signatures"] = json::array({"A", "fresh"});
+    updateClearBoundary(boundary, true);
+    check("clear_boundary_does_not_dismiss_new_message_from_one_generic_match",
+          clearedSourceIndices.empty() && !clearedBlocks.count("new-message"));
+    cancelAll();
+    worker = originalWorker;
+    paused = true;
     auto largeA = largeSnapshot("large-task-A", "large-block-A", 150);
     supplied.publishSnapshot(largeA, suppliedLedger);
     drainSupplied();
@@ -5791,7 +6247,7 @@ public:
           a->pause();
           break;
         case IDC_CLEAR:
-          a->clear();
+          a->clear(true);
           break;
         case IDC_LATEST:
           a->goLatest();

@@ -60,6 +60,7 @@ std::string parse_baidu_content(const nlohmann::json& data);
 
 // Call observe/flush on one reader thread. Each sentence retains an independent
 // stability timer, epoch and revision so obsolete asynchronous results can be dropped.
+// Event segment/key identify an occurrence; source_segment is its current snapshot index.
 class Ledger {
 public:
     explicit Ledger(int settle_ms = 900);
@@ -70,7 +71,7 @@ public:
 private:
     struct Segment {
         std::string text, emitted_text, emitted_kind;
-        std::size_t paragraph = 0, emitted_paragraph = 0;
+        std::size_t id = 0, paragraph = 0, emitted_paragraph = 0;
         std::int64_t changed = 0;
         unsigned revision = 0;
         bool emitted = false;
@@ -78,6 +79,7 @@ private:
     struct Block {
         std::string key, kind;
         std::vector<Segment> segments;
+        std::size_t next_segment_id = 0, paragraph_offset = 0;
         bool present = true;
     };
     int settle_;
