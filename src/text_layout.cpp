@@ -3,20 +3,54 @@
 #include <algorithm>
 #include <array>
 #include <cwchar>
+#include <string_view>
 namespace cclive {
 namespace {
-std::vector<std::wstring> split_lines(const std::wstring& input) {
-    std::vector<std::wstring> lines;
+struct SourceLine {
+    std::wstring text;
+    std::size_t start;
+};
+std::vector<SourceLine> split_lines(const std::wstring& input) {
+    std::vector<SourceLine> lines;
     std::size_t begin = 0;
     for (std::size_t index = 0; index < input.size(); ++index) {
         if (input[index] != L'\r' && input[index] != L'\n') continue;
-        lines.push_back(input.substr(begin, index - begin));
+        lines.push_back({input.substr(begin, index - begin), begin});
         if (input[index] == L'\r' && index + 1 < input.size() && input[index + 1] == L'\n') ++index;
         begin = index + 1;
     }
-    lines.push_back(input.substr(begin));
+    lines.push_back({input.substr(begin), begin});
     return lines;
 }
+// Map only the requested source span, keeping layout output and structural
+// parsing unchanged. Source runs remain UTF-16; generated CRs/tabs between
+// surviving glyphs are naturally inside the single resulting style range.
+struct HighlightMap {
+    std::size_t first = 0, last = 0;
+    LONG displayed_first = -1, displayed_last = -1;
+    HighlightMap(std::size_t input_size, LONG start, LONG length) {
+        if (start < 0 || length <= 0) return;
+        first = std::min(input_size, static_cast<std::size_t>(start));
+        last = first + std::min(input_size - first, static_cast<std::size_t>(length));
+    }
+    void append(TextLayout& layout, std::wstring_view run, std::size_t source_start) {
+        if (run.empty()) return;
+        const auto displayed_start = layout.text.size();
+        layout.text.append(run.data(), run.size());
+        if (first >= last) return;
+        const auto overlap_first = std::max(first, source_start);
+        const auto overlap_last = std::min(last, source_start + run.size());
+        if (overlap_first >= overlap_last) return;
+        const auto begin = static_cast<LONG>(displayed_start + overlap_first - source_start);
+        const auto end = static_cast<LONG>(displayed_start + overlap_last - source_start);
+        if (displayed_first < 0) displayed_first = begin;
+        displayed_last = end;
+    }
+    void finish(TextLayout& layout) const {
+        if (displayed_first >= 0 && displayed_last > displayed_first)
+            layout.ranges.push_back({displayed_first, displayed_last - displayed_first, TextStyle::Latest, 0});
+    }
+};
 bool space(wchar_t value) { return value == L' ' || value == L'\t'; }
 std::size_t backtick_end(const std::wstring& value, std::size_t start, std::size_t count) {
     for (std::size_t index = start; index < value.size();) {
@@ -41,19 +75,19 @@ std::size_t bold_end(const std::wstring& value, std::size_t start) {
     }
     return std::wstring::npos;
 }
-void append_inline(TextLayout& layout, const std::wstring& value, bool allow_bold = true) {
+void append_inline(TextLayout& layout, const std::wstring& value, std::size_t source_start, HighlightMap& highlight, bool allow_bold = true) {
     for (std::size_t index = 0; index < value.size();) {
         // Preserve literal escapes and paths; escaped delimiters are not markup.
         if (value[index] == L'\\' && index + 1 < value.size()) {
-            layout.text.append(value, index, 2); index += 2; continue;
+            highlight.append(layout, std::wstring_view(value).substr(index, 2), source_start + index); index += 2; continue;
         }
         if (value[index] == L'`') {
             auto end = index;
             while (end < value.size() && value[end] == L'`') ++end;
             const auto closing = backtick_end(value, end, end - index);
-            if (closing == std::wstring::npos) { layout.text.append(value, index, std::wstring::npos); break; }
+            if (closing == std::wstring::npos) { highlight.append(layout, std::wstring_view(value).substr(index), source_start + index); break; }
             const LONG start = static_cast<LONG>(layout.text.size());
-            layout.text.append(value, end, closing - end);
+            highlight.append(layout, std::wstring_view(value).substr(end, closing - end), source_start + end);
             if (closing > end) layout.ranges.push_back({start, static_cast<LONG>(closing - end), TextStyle::Code, 0});
             index = closing + end - index; continue;
         }
@@ -61,12 +95,12 @@ void append_inline(TextLayout& layout, const std::wstring& value, bool allow_bol
             const auto end = bold_end(value, index + 2);
             if (end != std::wstring::npos && end > index + 2) {
                 const LONG start = static_cast<LONG>(layout.text.size());
-                append_inline(layout, value.substr(index + 2, end - index - 2), false);
+                append_inline(layout, value.substr(index + 2, end - index - 2), source_start + index + 2, highlight, false);
                 layout.ranges.push_back({start, static_cast<LONG>(layout.text.size() - start), TextStyle::Bold, 0});
                 index = end + 2; continue;
             }
         }
-        layout.text += value[index++];
+        highlight.append(layout, std::wstring_view(value).substr(index, 1), source_start + index); ++index;
     }
 }
 PARAFORMAT2 body_paragraph(int fontPoints) {
@@ -109,14 +143,16 @@ std::array<LONG, 9> list_columns(HWND edit, const TextLayout& layout, int fontPo
     return columns;
 }
 }
-TextLayout make_text_layout(const std::wstring& input) {
+TextLayout make_text_layout(const std::wstring& input, LONG highlightStart, LONG highlightLength) {
     TextLayout layout;
+    HighlightMap highlight(input.size(), highlightStart, highlightLength);
     const auto lines = split_lines(input);
     bool in_code = false, previous_blank = false;
     wchar_t fence_character = 0;
     std::size_t fence_length = 0;
     for (std::size_t line_index = 0; line_index < lines.size(); ++line_index) {
-        const auto& line = lines[line_index];
+        const auto& line = lines[line_index].text;
+        const auto source_start = lines[line_index].start;
         std::size_t first = 0;
         int columns = 0;
         while (first < line.size() && (line[first] == L' ' || line[first] == L'\t')) {
@@ -135,7 +171,7 @@ TextLayout make_text_layout(const std::wstring& input) {
         paragraph.start = static_cast<LONG>(layout.text.size());
         if (in_code || fence) {
             paragraph.code = true;
-            layout.text += line;
+            highlight.append(layout, line, source_start);
             if (!line.empty()) layout.ranges.push_back({paragraph.start, static_cast<LONG>(line.size()), TextStyle::Code, 0});
             if (closes) { in_code = false; fence_character = 0; fence_length = 0; }
             else if (!in_code && fence) { in_code = true; fence_character = line[first]; fence_length = fence_run - first; }
@@ -161,13 +197,13 @@ TextLayout make_text_layout(const std::wstring& input) {
                     paragraph.ordered = true;
                     paragraph.indent_level = std::min(columns / 2, 8);
                     paragraph.marker_length = static_cast<int>(digits + 1 - first);
-                    layout.text.append(line, first, paragraph.marker_length);
+                    highlight.append(layout, std::wstring_view(line).substr(first, paragraph.marker_length), source_start + first);
                     layout.text += L'\t';
                     content = digits + 1;
                     while (content < line.size() && space(line[content])) ++content;
                 }
             }
-            append_inline(layout, line.substr(content));
+            append_inline(layout, line.substr(content), source_start + content, highlight);
             if (paragraph.heading_level && layout.text.size() > static_cast<std::size_t>(paragraph.start))
                 layout.ranges.push_back({paragraph.start, static_cast<LONG>(layout.text.size() - paragraph.start), TextStyle::Heading, paragraph.heading_level});
         }
@@ -175,6 +211,7 @@ TextLayout make_text_layout(const std::wstring& input) {
         layout.paragraphs.push_back(paragraph);
 
     }
+    highlight.finish(layout);
     return layout;
 }
 void apply_text_layout(HWND edit, const TextLayout& layout, int fontPoints, int dpi) {
@@ -227,7 +264,7 @@ void apply_text_layout(HWND edit, const TextLayout& layout, int fontPoints, int 
         SendMessageW(edit, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&format));
     }
     // Structural headings first. Bold inherits their size; literal code wins.
-    for (const auto style : {TextStyle::Heading, TextStyle::Bold, TextStyle::Code})
+    for (const auto style : {TextStyle::Heading, TextStyle::Bold, TextStyle::Code, TextStyle::Latest})
     for (const auto& range : layout.ranges) {
         if (range.length <= 0 || range.style != style) continue;
         select_range(edit, range.start, range.length);
@@ -241,6 +278,10 @@ void apply_text_layout(HWND edit, const TextLayout& layout, int fontPoints, int 
             format.dwMask = CFM_BOLD | CFM_SIZE | CFM_COLOR; format.dwEffects = CFE_BOLD;
             format.crTextColor = text_layout_palette.heading;
             format.yHeight = (fontPoints + 4 - std::clamp(range.heading_level, 1, 3)) * 20;
+        } else if (range.style == TextStyle::Latest) {
+            format.dwMask = CFM_COLOR | CFM_BACKCOLOR;
+            format.crTextColor = text_layout_palette.latest;
+            format.crBackColor = text_layout_palette.latest_background;
         } else {
             format.dwMask = CFM_FACE | CFM_SIZE | CFM_BOLD | CFM_COLOR | CFM_BACKCOLOR;
             format.crTextColor = text_layout_palette.code;

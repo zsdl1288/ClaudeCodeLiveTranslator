@@ -3,6 +3,7 @@
 #include <richedit.h>
 #include <cwchar>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 namespace {
 int checks = 0;
@@ -68,6 +69,119 @@ void native_format_checks() {
     check(changed.yHeight == 320 && changed.crTextColor == cclive::text_layout_palette.body && std::wcscmp(changed.szFaceName, L"Microsoft YaHei UI") == 0, "replaced plain body retained prior heading/code format");
     check((changed.dwEffects & (CFE_BOLD | CFE_ITALIC | CFE_UNDERLINE)) == 0 && changed.crBackColor == cclive::text_layout_palette.background, "plain replacement retained prior effects or code background");
     check(GetForegroundWindow() != edit, "formatter activated hidden caller-owned RichEdit");
+    DestroyWindow(edit); FreeLibrary(library);
+}
+void highlight_mapping_checks() {
+    auto marked = [&](const std::wstring& raw, LONG start, LONG length,
+                      const std::wstring& expected, LONG displayed_start) {
+        const auto plain = cclive::make_text_layout(raw);
+        const auto layout = cclive::make_text_layout(raw, start, length);
+        check(layout.text == plain.text, "latest highlight changed visible text");
+        check(layout.paragraphs.size() == plain.paragraphs.size(), "latest highlight changed paragraph count");
+        for (std::size_t n = 0; n < layout.paragraphs.size(); ++n) {
+            const auto& before = plain.paragraphs[n]; const auto& after = layout.paragraphs[n];
+            check(before.start == after.start && before.length == after.length &&
+                  before.heading_level == after.heading_level && before.indent_level == after.indent_level &&
+                  before.bullet == after.bullet && before.code == after.code && before.ordered == after.ordered &&
+                  before.marker_length == after.marker_length, "latest highlight changed structural paragraph metadata");
+        }
+        check(styles(layout, cclive::TextStyle::Latest) == 1, "latest span did not produce exactly one style range");
+        const auto found = std::find_if(layout.ranges.begin(), layout.ranges.end(), [](const auto& range) {
+            return range.style == cclive::TextStyle::Latest;
+        });
+        check(found->start == displayed_start &&
+              layout.text.substr(found->start, found->length) == expected,
+              "raw UTF16 latest span mapped to the wrong displayed occurrence");
+    };
+    marked(L"**x** x", 6, 1, L"x", 2);
+    marked(L"**x** x", 2, 1, L"x", 0);
+    const std::wstring seam = L"**First. Second.** Final.";
+    marked(seam, static_cast<LONG>(seam.find(L"Second.")), 7, L"Second.", 7);
+    marked(L"A\r\nB", 3, 1, L"B", 2);
+    marked(L"A\r\n\r\n\r\nB", 7, 1, L"B", 3);
+    const std::wstring unicode_list = L"开头\r\n- **\U0001F600最新**\r\n10. `尾部`";
+    marked(unicode_list, static_cast<LONG>(unicode_list.find(L"\U0001F600")),
+           static_cast<LONG>(unicode_list.size()), L"\U0001F600最新\r10.\t尾部", 3);
+    marked(L"前\U0001F600中文后", 1, 4, L"\U0001F600中文", 1);
+    marked(L"# **标题**\r\n- `代码`", 0, 1000, L"标题\r代码", 0);
+    marked(L"\\**literal**", 0, 3, L"\\**", 0);
+    marked(L"```\ncode\n```", 0, 3, L"```", 0);
+    marked(L"one two", 4, (std::numeric_limits<LONG>::max)(), L"two", 4);
+    for (const auto& raw : {L"# title", L"- item", L"**bold**", L"`code`"}) {
+        const auto layout = cclive::make_text_layout(raw, 0, raw[0] == L'`' ? 1 : 2);
+        check(styles(layout, cclive::TextStyle::Latest) == 0, "removed marker-only span highlighted unrelated glyphs");
+    }
+    check(styles(cclive::make_text_layout(L"plain", -1, 3), cclive::TextStyle::Latest) == 0,
+          "negative start enabled a latest span");
+    check(styles(cclive::make_text_layout(L"plain", 1, -2), cclive::TextStyle::Latest) == 0,
+          "negative length enabled a latest span");
+    check(styles(cclive::make_text_layout(L"plain", 1, 0), cclive::TextStyle::Latest) == 0,
+          "empty span enabled a latest span");
+    check(styles(cclive::make_text_layout(L"plain", (std::numeric_limits<LONG>::max)(),
+          (std::numeric_limits<LONG>::max)()), cclive::TextStyle::Latest) == 0,
+          "out-of-input highlight range overflowed or selected unrelated text");
+}
+void native_highlight_checks() {
+    const auto library = LoadLibraryW(L"Msftedit.dll");
+    check(library != nullptr, "latest RichEdit library could not load");
+    const HWND edit = CreateWindowExW(0, MSFTEDIT_CLASS, L"", WS_POPUP | ES_MULTILINE | ES_READONLY,
+        -20000, -20000, 640, 400, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    check(edit != nullptr, "latest RichEdit could not be created");
+    const std::wstring raw = L"## **标题**\r\n正文 `code` 与 **加粗**。\r\n尾行";
+    const auto plain = cclive::make_text_layout(raw);
+    SetWindowTextW(edit, plain.text.c_str());
+    auto read_text = [&] {
+        std::wstring text(static_cast<std::size_t>(GetWindowTextLengthW(edit)) + 1, L'\0');
+        GetWindowTextW(edit, text.data(), static_cast<int>(text.size()));
+        text.resize(std::wcslen(text.c_str())); return text;
+    };
+    const auto copied_text = read_text();
+    const LONG heading = static_cast<LONG>(plain.text.find(L"标题"));
+    const LONG code = static_cast<LONG>(plain.text.find(L"code"));
+    const LONG bold = static_cast<LONG>(plain.text.find(L"加粗"));
+    auto read_style = [&](LONG position) {
+        CHARRANGE range{position, position + 1}; SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
+        CHARFORMAT2W result{}; result.cbSize = sizeof(result);
+        SendMessageW(edit, EM_GETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&result)); return result;
+    };
+    auto apply = [&](LONG start, LONG length) {
+        CHARRANGE selected{1, 4}; SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selected));
+        cclive::apply_text_layout(edit, cclive::make_text_layout(raw, start, length), 12, 96);
+        CHARRANGE restored{}; SendMessageW(edit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&restored));
+        check(restored.cpMin == selected.cpMin && restored.cpMax == selected.cpMax,
+              "latest formatting moved the caller selection");
+        check(read_text() == copied_text, "latest formatting changed copied RichEdit text");
+    };
+    apply(static_cast<LONG>(raw.find(L"标题")), 2);
+    const auto newest_heading = read_style(heading);
+    check(newest_heading.crTextColor == cclive::text_layout_palette.latest &&
+          newest_heading.crBackColor == cclive::text_layout_palette.latest_background &&
+          newest_heading.yHeight == 280 && (newest_heading.dwEffects & CFE_BOLD),
+          "latest colors removed heading size or weight");
+    apply(static_cast<LONG>(raw.find(L"code")), 4);
+    const auto old_heading = read_style(heading), newest_code = read_style(code);
+    check(old_heading.crTextColor == cclive::text_layout_palette.heading &&
+          old_heading.crBackColor == cclive::text_layout_palette.background,
+          "moving latest highlight did not reset the old heading colors");
+    check(newest_code.crTextColor == cclive::text_layout_palette.latest &&
+          newest_code.crBackColor == cclive::text_layout_palette.latest_background &&
+          std::wcscmp(newest_code.szFaceName, L"Consolas") == 0 && newest_code.yHeight == 240 &&
+          !(newest_code.dwEffects & CFE_BOLD), "latest colors removed code face, size or weight");
+    apply(static_cast<LONG>(raw.find(L"加粗")), 2);
+    const auto old_code = read_style(code), newest_bold = read_style(bold);
+    check(old_code.crTextColor == cclive::text_layout_palette.code &&
+          old_code.crBackColor == cclive::text_layout_palette.code_background,
+          "moving latest highlight did not reset the old code colors");
+    check(newest_bold.crTextColor == cclive::text_layout_palette.latest &&
+          newest_bold.crBackColor == cclive::text_layout_palette.latest_background &&
+          (newest_bold.dwEffects & CFE_BOLD) && newest_bold.yHeight == 240,
+          "latest colors removed inline bold styling");
+    apply(-1, 0);
+    const auto reset_bold = read_style(bold);
+    check(reset_bold.crTextColor == cclive::text_layout_palette.body &&
+          reset_bold.crBackColor == cclive::text_layout_palette.background && (reset_bold.dwEffects & CFE_BOLD),
+          "disabling latest left stale colors or removed bold styling");
+    check(GetForegroundWindow() != edit, "latest formatter activated its hidden RichEdit");
     DestroyWindow(edit); FreeLibrary(library);
 }
 void native_paragraph_checks() {
@@ -182,6 +296,8 @@ int main() {
             for (const auto& paragraph : layout->paragraphs)
                 check(paragraph.start >= 0 && paragraph.length >= 0 && static_cast<std::size_t>(paragraph.start + paragraph.length) <= layout->text.size(), "paragraph range extends outside rendered text");
         }
+        highlight_mapping_checks();
+        native_highlight_checks();
         native_format_checks();
         native_paragraph_checks();
         std::cout << checks << " text layout checks, 0 failures\n";

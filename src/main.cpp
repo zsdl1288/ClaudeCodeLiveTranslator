@@ -1318,7 +1318,7 @@ struct Watcher {
 struct Record {
   std::string key, source, translation, error, sourceSignature,
       state = "waiting";
-  uint64_t serial = 0, version = 0;
+  uint64_t serial = 0, version = 0, displayedUpdate = 0;
   bool pendingReplacement = false;
   std::string layoutBlock;
   std::size_t layoutParagraph = 0;
@@ -1563,7 +1563,7 @@ public:
   double lastReadMs = 0;
   cclive::Settings settings;
   uint64_t generation = 0, sourceGeneration = 0, serial = 0, revision = 0,
-           refreshGeneration = 0;
+           refreshGeneration = 0, displayedUpdateSequence = 0;
   int ledgerEpoch = -1;
   std::vector<Record> records;
   std::vector<json> windows;
@@ -1575,6 +1575,8 @@ public:
     std::wstring input, displayed;
     uint64_t styleRevision = 0, replacements = 0, formats = 0;
     int fontPoints = 0, dpi = 0;
+    LONG latestInputStart = -1, latestInputLength = 0;
+    CHARRANGE latestDisplay{-1, -1};
     bool valid = false;
   };
   std::map<HWND, BodyRender> renderedBodies;
@@ -1955,7 +1957,7 @@ public:
                    MAKELPARAM(s(14), s(14)));
       SendMessageW(view.window, EM_GETLINECOUNT, 0, 0);
       if (follows(view.window))
-        SendMessageW(view.window, WM_VSCROLL, SB_BOTTOM, 0);
+        scrollToLatest(view.window);
       else
         SendMessageW(view.window, EM_SETSCROLLPOS, 0,
                      reinterpret_cast<LPARAM>(&view.scroll));
@@ -2089,7 +2091,8 @@ public:
                        {"layout_paragraph", record.layoutParagraph},
                        {"error", record.error},
                        {"source_signature", record.sourceSignature},
-                       {"serial", record.serial}});
+                       {"serial", record.serial},
+                       {"displayed_update", record.displayedUpdate}});
     POINT source{}, translated{};
     if (sourceEdit)
       SendMessageW(sourceEdit, EM_GETSCROLLPOS, 0,
@@ -2348,6 +2351,8 @@ public:
                 item.value("key", "record-" + std::to_string(record.serial));
             record.source = item["source"].get<std::string>();
             record.visible = item.value("visible", true);
+            record.displayedUpdate = item.value("displayed_update", uint64_t(0));
+            displayedUpdateSequence = std::max(displayedUpdateSequence, record.displayedUpdate);
             record.sourceSignature =
                 item.value("source_signature", contentSignature(record.source));
             record.translation = matching ? item.value("translation", "") : "";
@@ -2756,7 +2761,8 @@ public:
         (!v.contains("block_key") || clearedBlocks.count(v.value("block_key", "")))) {
       sourceAliases[key] = {"", v.value("block_key", ""), incomingSignature};
       return;
-    }    if (it == records.end()) {
+    }
+    if (it == records.end()) {
       it = std::find_if(records.begin(), records.end(),
                         [&](const Record &record) {
                           return replayCandidates.count(record.key) &&
@@ -2801,6 +2807,7 @@ public:
       record.version = ++revision;
       record.translation = memo;
       record.state = memo.empty() ? "waiting" : "done";
+      if (!memo.empty()) record.displayedUpdate = ++displayedUpdateSequence;
       records.push_back(std::move(record));
       it = std::prev(records.end());
       createdRecord = true;
@@ -3054,10 +3061,25 @@ public:
            (asciiWord(left) && rightCjk) ||
            ((left == L'.' || left == L'!' || left == L'?') && rightCjk);
   }
-  std::wstring output(bool original) const {
+  struct BodyOutput {
+    std::wstring text;
+    LONG latestStart = -1, latestLength = 0;
+  };
+  const Record *latestVisibleRecord(std::size_t begin = 0) const {
+    const Record *latest = nullptr;
+    for (std::size_t index = begin; index < records.size(); ++index) {
+      const auto &record = records[index];
+      if (record.visible && !displayContent(record.translation).empty() &&
+          (!latest || record.displayedUpdate >= latest->displayedUpdate))
+        latest = &record;
+    }
+    return latest;
+  }
+  BodyOutput bodyOutput(bool original) const {
+    BodyOutput body;
     if (records.empty())
-      return {};
-    std::wstring value;
+      return body;
+    auto &value = body.text;
     size_t begin = records.size(), chars = 0;
     while (begin > 0) {
       const auto &record = records[begin - 1];
@@ -3069,6 +3091,7 @@ public:
     }
     if (begin)
       value = L"仅显示最近保留的字幕内容。";
+    const auto *latest = latestVisibleRecord(begin);
     const Record *previous = nullptr;
     wchar_t previousEdge = 0;
     for (size_t index = begin; index < records.size(); ++index) {
@@ -3091,12 +3114,17 @@ public:
                  displaySeamNeedsSpace(previousEdge, edges.first))
           value += L' ';
       }
+      if (&record == latest) {
+        body.latestStart = static_cast<LONG>(value.size());
+        body.latestLength = static_cast<LONG>(content.size());
+      }
       value += content;
       previous = &record;
       previousEdge = edges.second;
     }
-    return value;
+    return body;
   }
+  std::wstring output(bool original) const { return bodyOutput(original).text; }
   std::wstring progressCaption() const {
     std::size_t done = 0, waiting = 0, updating = 0, errors = 0;
     for (const auto &record : records) {
@@ -3139,6 +3167,27 @@ public:
                  RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW |
                      RDW_NOCHILDREN);
   }
+  void scrollToLatest(HWND edit) {
+    auto found = renderedBodies.find(edit);
+    if (found == renderedBodies.end() || found->second.latestDisplay.cpMin < 0 ||
+        found->second.latestDisplay.cpMax >= static_cast<LONG>(found->second.displayed.size())) {
+      SendMessageW(edit, WM_VSCROLL, SB_BOTTOM, 0);
+      return;
+    }
+    const auto end = std::max(found->second.latestDisplay.cpMin,
+                              found->second.latestDisplay.cpMax - 1);
+    POINTL position{};
+    POINT scroll{};
+    RECT viewport{};
+    SendMessageW(edit, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&position), end);
+    SendMessageW(edit, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+    SendMessageW(edit, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&viewport));
+    // Use the text's native position, without moving the user's caret/selection.
+    // This also works when the read-only control has no focus or is hidden.
+    scroll.y = std::max(0L, scroll.y + position.y - viewport.top -
+                            std::max(0L, (viewport.bottom - viewport.top) / 4));
+    SendMessageW(edit, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+  }
   void goLatest() {
     followingSource = followingTranslation = true;
     ScrollGuard guard(internalScroll);
@@ -3146,10 +3195,10 @@ public:
       if (!edit)
         continue;
       SendMessageW(edit, EM_GETLINECOUNT, 0, 0);
-      SendMessageW(edit, WM_VSCROLL, SB_BOTTOM, 0);
+      scrollToLatest(edit);
       repaintBody(edit);
     }
-    status("正在跟随最新译文；向上滚动可暂停跟随");
+    status("青色底纹标记最新更新的字幕；正在跟随，向上滚动可暂停跟随");
   }
   static LRESULT CALLBACK bodyProc(HWND edit, UINT msg, WPARAM wp, LPARAM lp,
                                    UINT_PTR id, DWORD_PTR reference) {
@@ -3188,13 +3237,14 @@ public:
     }
     return result;
   }
-  void editText(HWND edit, const std::wstring &value) {
+  void editText(HWND edit, const std::wstring &value, LONG latestStart = -1, LONG latestLength = 0) {
     auto &rendered = renderedBodies[edit];
     if (rendered.valid && rendered.input == value &&
         rendered.styleRevision == bodyStyleRevision &&
-        rendered.fontPoints == settings.font_size && rendered.dpi == dpi)
+        rendered.fontPoints == settings.font_size && rendered.dpi == dpi &&
+        rendered.latestInputStart == latestStart && rendered.latestInputLength == latestLength)
       return;
-    auto formatted = cclive::make_text_layout(value);
+    auto formatted = cclive::make_text_layout(value, latestStart, latestLength);
     bool bottom = follows(edit);
     ScrollGuard guard(internalScroll);
     POINT scroll{};
@@ -3214,11 +3264,17 @@ public:
     rendered.styleRevision = bodyStyleRevision;
     rendered.fontPoints = settings.font_size;
     rendered.dpi = dpi;
+    rendered.latestInputStart = latestStart;
+    rendered.latestInputLength = latestLength;
+    rendered.latestDisplay = {-1, -1};
+    for (const auto &range : formatted.ranges)
+      if (range.style == cclive::TextStyle::Latest)
+        rendered.latestDisplay = {range.start, range.start + range.length};
     rendered.valid = true;
     SendMessageW(edit, EM_EXSETSEL, 0, (LPARAM)&selected);
     SendMessageW(edit, EM_GETLINECOUNT, 0, 0);
     if (bottom)
-      SendMessageW(edit, WM_VSCROLL, SB_BOTTOM, 0);
+      scrollToLatest(edit);
     else
       SendMessageW(edit, EM_SETSCROLLPOS, 0, (LPARAM)&scroll);
     SendMessageW(edit, WM_SETREDRAW, TRUE, 0);
@@ -3227,10 +3283,14 @@ public:
   void render() {
     if (closed)
       return;
-    if (settings.show_original)
-      editText(sourceEdit, output(true));
-    editText(translationEdit, output(false));
-    SetWindowTextW(countLabel, progressCaption().c_str());
+    if (settings.show_original) {
+      const auto source = bodyOutput(true);
+      editText(sourceEdit, source.text, source.latestStart, source.latestLength);
+    }
+    const auto translated = bodyOutput(false);
+    editText(translationEdit, translated.text, translated.latestStart, translated.latestLength);
+    const auto caption = (translated.latestLength > 0 ? L"青色＝最新 · " : L"") + progressCaption();
+    SetWindowTextW(countLabel, caption.c_str());
     dirty = false;
     lastRender = Clock::now();
   }
@@ -3462,6 +3522,8 @@ public:
     if (it == records.end() || it->version != v.value("version", 0ULL))
       return;
     const auto previousState = it->state;
+    const auto previousTranslation = it->translation;
+    const bool wasVisible = it->visible, wasReplacement = it->pendingReplacement;
     it->state = v.value("state", "");
     auto translated = v.value("translation", "");
     if (!translated.empty()) it->visible = true;
@@ -3473,6 +3535,10 @@ public:
     } else if (it->state == "done") {
       it->state = "error";
     }
+    if (it->visible && !it->translation.empty() &&
+        (!wasVisible || it->translation != previousTranslation ||
+         (wasReplacement && !it->pendingReplacement && it->state == "done")))
+      it->displayedUpdate = ++displayedUpdateSequence;
     it->error = v.value("error", "");
     if (it->pendingReplacement && it->state == "error" && it->error.empty())
       it->error = "更新翻译未完成，可重试";
@@ -4759,10 +4825,12 @@ public:
                    reinterpret_cast<LPARAM>(&actual));
       SendMessageW(sourceEdit, EM_EXSETSEL, 0,
                    reinterpret_cast<LPARAM>(&selected));
+      const auto latest = renderedBodies[sourceEdit].latestDisplay;
+      const bool marked = latest.cpMin == 0 && latest.cpMax > 0;
       return defaults.crTextColor == cclive::text_layout_palette.body &&
-             actual.crTextColor == cclive::text_layout_palette.body &&
+             actual.crTextColor == (marked ? cclive::text_layout_palette.latest : cclive::text_layout_palette.body) &&
              !(actual.dwEffects & CFE_AUTOCOLOR) &&
-             actual.crBackColor == cclive::text_layout_palette.background;
+             actual.crBackColor == (marked ? cclive::text_layout_palette.latest_background : cclive::text_layout_palette.background);
     };
     CHARFORMAT2W black{};
     black.cbSize = sizeof(black);
@@ -5113,7 +5181,9 @@ public:
                  reinterpret_cast<WPARAM>(&zoomNumerator),
                  reinterpret_cast<LPARAM>(&zoomDenominator));
     check("refresh_restores_char_paragraph_zoom_and_current_reading_margins",
-          restoredText.crTextColor == cclive::text_layout_palette.body &&
+          restoredText.crTextColor == (renderedBodies[translationEdit].latestDisplay.cpMin <= refreshSelection.cpMin &&
+              renderedBodies[translationEdit].latestDisplay.cpMax >= refreshSelection.cpMax
+                  ? cclive::text_layout_palette.latest : cclive::text_layout_palette.body) &&
               restoredText.yHeight == settings.font_size * 20 &&
               restoredParagraph.wAlignment == PFA_LEFT &&
               zoomNumerator == 1 && zoomDenominator == 1 &&
@@ -5240,6 +5310,88 @@ public:
                     {"translation", translated},
                     {"error", ""}});
     };
+    accept(taskMeta("latest-marker-task", {"First marker source.", "Second marker source."}));
+    accept(taskText("latest-marker-task", "marker-first", "First marker source."));
+    complete(0, "**相同字幕**");
+    accept(taskText("latest-marker-task", "marker-second", "Second marker source."));
+    complete(1, "**相同字幕**");
+    render();
+    auto markerRange = renderedBodies[translationEdit].latestDisplay;
+    const auto repeatedVisible = renderedBodies[translationEdit].displayed;
+    check("latest_marker_selects_new_occurrence_of_identical_subtitle",
+          latestVisibleRecord() == &records[1] && markerRange.cpMin > 0 &&
+          repeatedVisible.substr(markerRange.cpMin, markerRange.cpMax - markerRange.cpMin) == L"相同字幕" &&
+          paneStyle(translationEdit, markerRange.cpMin, 1).crTextColor == cclive::text_layout_palette.latest &&
+          paneStyle(translationEdit, 0, 1).crTextColor == cclive::text_layout_palette.body);
+    complete(0, "第一条刚刚更新");
+    render();
+    markerRange = renderedBodies[translationEdit].latestDisplay;
+    check("latest_marker_follows_actual_earlier_row_update",
+          latestVisibleRecord() == &records[0] && markerRange.cpMin == 0 &&
+          paneStyle(translationEdit, 0, 1).crTextColor == cclive::text_layout_palette.latest &&
+          paneStyle(translationEdit, markerRange.cpMax + 1, 1).crTextColor == cclive::text_layout_palette.body);
+    const auto markerSequence = records[0].displayedUpdate;
+    acceptResult({{"generation", generation - 1}, {"task_id", activeTaskId},
+                  {"key", records[1].key}, {"version", records[1].version},
+                  {"state", "done"}, {"translation", "过期结果"}});
+    check("obsolete_result_does_not_move_latest_marker",
+          latestVisibleRecord() == &records[0] && records[0].displayedUpdate == markerSequence);
+    accept(taskText("latest-marker-task", "marker-first", "Revised first marker source."));
+    complete(1, "第二条现在更新");
+    acceptResult({{"generation", generation}, {"task_id", activeTaskId},
+                  {"key", records[0].key}, {"version", records[0].version},
+                  {"state", "translating"}, {"translation", "尚未提交的新译文"}});
+    render();
+    check("undisplayed_replacement_delta_does_not_move_latest_marker",
+          latestVisibleRecord() == &records[1] && records[0].translation == "第一条刚刚更新");
+    const auto markerReplacements = renderedBodies[translationEdit].replacements;
+    const auto markerFormats = renderedBodies[translationEdit].formats;
+    complete(0, "第一条刚刚更新");
+    render();
+    check("marker_only_move_reformats_without_replacing_identical_text",
+          latestVisibleRecord() == &records[0] &&
+          renderedBodies[translationEdit].latestDisplay.cpMin == 0 &&
+          renderedBodies[translationEdit].replacements == markerReplacements &&
+          renderedBodies[translationEdit].formats == markerFormats + 1);
+    const auto restoredMarkerSequence = records[0].displayedUpdate;
+    accept(taskMeta("latest-marker-other", {}));
+    accept(taskMeta("latest-marker-task", {"Revised first marker source.", "Second marker source."}));
+    check("RAM_task_restore_preserves_latest_updated_record",
+          records.size() == 2 && records[0].displayedUpdate == restoredMarkerSequence &&
+          latestVisibleRecord() == &records[0]);
+    clear(true);
+    check("clear_removes_latest_highlight_with_old_subtitles",
+          !latestVisibleRecord() && textOf(translationEdit).empty() &&
+          renderedBodies[translationEdit].latestDisplay.cpMin == -1);
+    accept(taskMeta("latest-navigation-task", {}));
+    for (int n = 0; n < 100; ++n) {
+      accept(taskText("latest-navigation-task", "navigation-" + std::to_string(n),
+                      "Navigation source " + std::to_string(n) + "."));
+      complete(records.size() - 1, "历史字幕第 " + std::to_string(n) + " 行");
+    }
+    render();
+    followingTranslation = false;
+    complete(0, "顶部字幕是刚刚更新的内容");
+    render();
+    const auto markerTextLength = static_cast<LONG>(renderedBodies[translationEdit].displayed.size());
+    CHARRANGE markerSelection{markerTextLength - 8, markerTextLength - 4};
+    SendMessageW(translationEdit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&markerSelection));
+    goLatest();
+    POINTL markerPoint{};
+    SendMessageW(translationEdit, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&markerPoint),
+                 renderedBodies[translationEdit].latestDisplay.cpMin);
+    RECT markerClient{}; GetClientRect(translationEdit, &markerClient);
+    CHARRANGE afterMarkerSelection{};
+    SendMessageW(translationEdit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&afterMarkerSelection));
+    check("latest_button_reveals_updated_old_row_and_preserves_selection",
+          followingTranslation && markerPoint.y >= 0 && markerPoint.y < markerClient.bottom &&
+          !isAtBottom(translationEdit) && afterMarkerSelection.cpMin == markerSelection.cpMin &&
+          afterMarkerSelection.cpMax == markerSelection.cpMax);
+    records.erase(records.begin());
+    trimRecords();
+    check("evicted_latest_marker_falls_back_to_newest_remaining_subtitle",
+          latestVisibleRecord() == &records.back() && retainedLines() <= 100);
+    clear();
     accept(taskMeta("layout-cache-task", {"First layout source.", "Second layout source."}));
     auto firstLayoutEvent = taskText("layout-cache-task", "layout-runtime-1", "First layout source.");
     firstLayoutEvent["block_key"] = "layout-cache-block";
