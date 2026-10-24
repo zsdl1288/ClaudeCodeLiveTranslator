@@ -1,5 +1,6 @@
 #include "task_cache.hpp"
 #include "markdown_table.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <fstream>
@@ -35,12 +36,19 @@ int main() {
     {
       TaskCache cache;
       check(cache.healthy(), "empty RAM cache is healthy");
+      const TaskCache &retained = cache;
+      check(retained.keys().empty(), "empty cache exposes no retained identities");
       check(!cache.get("A"), "unknown task misses");
       cache.put("A", {{"title", "Task A"},
                       {"translation", "甲任务译文"},
                       {"scroll", {{"y", 250}}},
                       {"follow", false}});
       cache.put("B", {{"title", "Task B"}, {"translation", "乙任务译文"}});
+      const auto identities = retained.keys();
+      check(identities.size() == 2 &&
+                std::find(identities.begin(), identities.end(), "A") != identities.end() &&
+                std::find(identities.begin(), identities.end(), "B") != identities.end(),
+            "identity snapshot includes all currently retained tasks");
       check(cache.get("A")->at("translation") == "甲任务译文",
             "A/B/A task isolation A");
       check(cache.get("B")->at("translation") == "乙任务译文",
@@ -64,6 +72,8 @@ int main() {
       cache.erase("A");
       check(!cache.get("A") && cache.get("B"),
             "erase current task preserves other task");
+      check(retained.keys() == std::vector<std::string>{"B"},
+            "erased identity is removed from enumeration");
     }
     {
       const auto sentinel_path = folder / "sentinel.json";
@@ -114,6 +124,12 @@ int main() {
       check(!cache.get("B"), "least recently used task evicted");
       check(cache.get("A").has_value() && cache.get("C").has_value(),
             "recent tasks survive eviction");
+      const auto identities = cache.keys();
+      check(identities.size() == 2 &&
+                std::find(identities.begin(), identities.end(), "A") != identities.end() &&
+                std::find(identities.begin(), identities.end(), "C") != identities.end() &&
+                std::find(identities.begin(), identities.end(), "B") == identities.end(),
+            "identity enumeration obeys LRU task eviction");
       cache.put("A", {{"title", "Rename"}});
       check(cache.get("C") && cache.get("A")->at("title") == "Rename",
             "rename does not consume additional LRU slot");
@@ -125,6 +141,10 @@ int main() {
       cache.put("C", std::string(38, 'c'));
       check(!cache.get("A") && cache.get("B") && cache.get("C"),
             "total payload bound evicts oldest task");
+      const auto identities = cache.keys();
+      check(identities.size() == 2 &&
+                std::find(identities.begin(), identities.end(), "A") == identities.end(),
+            "identity enumeration excludes tasks evicted by total byte bound");
       cache.put("C", std::string(1000, 'x'));
       check(cache.get("C")->get<std::string>() == std::string(38, 'c'),
             "oversized update preserves existing task");
@@ -145,6 +165,11 @@ int main() {
         cache.put(std::to_string(n), n);
       check(!cache.get("0") && cache.get("1") && cache.get("50"),
             "default task count bound is 50");
+      const auto identities = cache.keys();
+      check(identities.size() == 50 &&
+                std::find(identities.begin(), identities.end(), "0") == identities.end() &&
+                std::find(identities.begin(), identities.end(), "50") != identities.end(),
+            "identity enumeration respects default maximum task count");
       cache.put("oversized", std::string(2 * 1024 * 1024, 'x'));
       check(!cache.get("oversized"),
             "default single-task bound is 2 MiB serialized");

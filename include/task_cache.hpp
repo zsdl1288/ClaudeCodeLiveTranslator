@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace cclive {
 // Bounded, thread-safe RAM cache. No files, background writer or persistence.
@@ -27,6 +28,8 @@ public:
   TaskCache &operator=(TaskCache &&) = delete;
 
   std::optional<nlohmann::json> get(const std::string &task_id);
+  // Snapshot of retained identities; enumeration does not change LRU order.
+  std::vector<std::string> keys() const;
   void put(const std::string &task_id, const nlohmann::json &payload);
   void erase(const std::string &task_id);
   void flush(); // Compatibility no-op: nothing is written to disk.

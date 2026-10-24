@@ -332,18 +332,41 @@ struct DiagnosticWriter {
 struct Bus {
   std::mutex mutex;
   std::deque<json> source, misc;
-  std::optional<json> reset, telemetry;
+  std::set<std::string> sourceReplays;
+  std::optional<json> reset, telemetry, selection;
   uint64_t captureSequence = 0, resultSequence = 0;
   std::map<std::string, json> results;
   void emit(json v) {
     std::lock_guard<std::mutex> lock(mutex);
     auto t = v.value("type", "");
     {
-      auto &q = (t == "task" || t == "text" || t == "reset") ? source : misc;
-      if (q.size() >= 512)
+      auto &q = (t == "task" || t == "text" || t == "reset" || t == "select_window") ? source : misc;
+      if (t == "select_window") {
+        selection.reset();
+        q.erase(std::remove_if(q.begin(), q.end(), [](const json &event) {
+          return event.value("type", "") == "select_window";
+        }), q.end());
+      }
+      if (q.size() >= 512) {
+        if (&q == &source && q.front().value("type", "") == "select_window") selection = q.front();
+        else if (&q == &source && q.front().value("window_scoped", false)) {
+          sourceReplays.insert(q.front().value("window_token", ""));
+          while (sourceReplays.size() > 50) sourceReplays.erase(sourceReplays.begin());
+        }
         q.pop_front();
+      }
       q.push_back(std::move(v));
     }
+  }
+  bool takeSourceReplay(const std::string &token) {
+    std::lock_guard<std::mutex> lock(mutex);
+    return sourceReplays.erase(token) != 0;
+  }
+  void requestSourceReplay(const std::string &token) {
+    if (token.empty()) return;
+    std::lock_guard<std::mutex> lock(mutex);
+    sourceReplays.insert(token);
+    while (sourceReplays.size() > 50) sourceReplays.erase(sourceReplays.begin());
   }
   void capture(uint64_t generation, const json &snapshot) {
     std::size_t blocks = 0, chars = 0;
@@ -361,6 +384,7 @@ struct Bus {
     if (telemetry && telemetry->value("_generation", 0ULL) > generation)
       return;
     telemetry = {{"_generation", generation},
+                 {"source_hwnd", snapshot.value("source_hwnd", 0ULL)},
                  {"capture_seq", ++captureSequence},
                  {"last_read_ms", duration},
                  {"captured_blocks", blocks},
@@ -368,7 +392,7 @@ struct Bus {
   }
   void result(json v) {
     std::lock_guard<std::mutex> lock(mutex);
-    auto k = std::to_string(v.value("generation", 0ULL)) + "|" +
+    auto k = v.value("task_id", "") + "|" + std::to_string(v.value("generation", 0ULL)) + "|" +
              v.value("key", "") + "|" +
              std::to_string(v.value("version", 0ULL));
     // Coalesce each job's stream while retaining its latest arrival time.
@@ -427,16 +451,26 @@ struct Worker {
   static std::string serviceKey(const cclive::Settings &s) {
     return cclive::translation_service_key(s);
   }
-  void cancel(const std::string &key) {
+  void cancel(const std::string &key, const std::string &taskId = "") {
     std::lock_guard<std::mutex> lock(mutex);
     for (auto i = pending.begin(); i != pending.end();)
-      if ((*i)->key == key) {
+      if ((*i)->key == key && (taskId.empty() || (*i)->taskId == taskId)) {
         (*i)->cancel->store(true);
         i = pending.erase(i);
       } else
         ++i;
-    if (active && active->key == key)
+    if (active && active->key == key && (taskId.empty() || active->taskId == taskId))
       active->cancel->store(true);
+    changed.notify_all();
+  }
+  void cancelTask(const std::string &taskId) {
+    std::lock_guard<std::mutex> lock(mutex);
+    for (auto it = pending.begin(); it != pending.end();)
+      if ((*it)->taskId == taskId) {
+        (*it)->cancel->store(true);
+        it = pending.erase(it);
+      } else ++it;
+    if (active && active->taskId == taskId) active->cancel->store(true);
     changed.notify_all();
   }
   void cancelAll() {
@@ -617,7 +651,7 @@ json workerRateLimitChecks() {
   };
   auto state = [](const std::shared_ptr<Bus> &bus, const std::string &key) {
     std::lock_guard<std::mutex> lock(bus->mutex);
-    const auto found = bus->results.find("0|" + key + "|0");
+    const auto found = bus->results.find("|0|" + key + "|0");
     return found == bus->results.end() ? std::string()
                                        : found->second.value("state", "");
   };
@@ -657,7 +691,7 @@ json workerRateLimitChecks() {
           resumed && calls.load() == 3 && state(bus, "first") == "done");
     {
       std::lock_guard<std::mutex> lock(bus->mutex);
-      const auto found = bus->results.find("0|first|0");
+      const auto found = bus->results.find("|0|first|0");
       check("http_429_retry_discards_partial_translation_before_restart",
             found != bus->results.end() &&
                 found->second.value("translation", "") == "translated first");
@@ -806,11 +840,16 @@ std::vector<wchar_t> readerEnvironment(const std::vector<std::string> &secrets) 
 }
 struct Watcher {
   uint64_t hwnd, generation;
+  // A managed reader is pinned to one native window for its full lifetime.
+  // Empty tokens retain the standalone watcher used by legacy/offline checks.
+  const std::string windowToken;
+  const uint64_t windowPid;
   uint64_t lastClaudeHwnd = 0, lastForeground = 0;
   std::string currentTaskId;
   unsigned consistentTaskSnapshots = 0;
   std::map<std::string, std::size_t> sourceIndices;
   std::map<std::string, json> forwardedSlots;
+  std::map<std::string, json> deletionTombstones;
   std::map<std::string, std::string> acceptedBodies;
   std::map<std::string, std::string> blockAliases, acceptedKinds;
   uint64_t forwardedOrder = 0;
@@ -828,13 +867,31 @@ struct Watcher {
   std::shared_ptr<Bus> bus;
   std::string lastStatus;
   Watcher(uint64_t h, uint64_t g, int s, std::vector<std::string> keys,
-          std::shared_ptr<Bus> b)
-      : hwnd(h), generation(g), settle(s), secretEnvs(std::move(keys)),
-        bus(std::move(b)) {}
+          std::shared_ptr<Bus> b, std::string token = {}, uint64_t pid = 0)
+      : hwnd(h), generation(g), windowToken(std::move(token)), windowPid(pid),
+        settle(s), secretEnvs(std::move(keys)), bus(std::move(b)) {}
+  static std::string scopedTaskId(const std::string &token,
+                                  const std::string &task) {
+    return token.empty() || task.empty() ? task : json::array({token, task}).dump();
+  }
+  json scopedEvent(json v) const {
+    if (!windowToken.empty()) {
+      v["window_scoped"] = true;
+      v["window_token"] = windowToken;
+      v["source_hwnd"] = hwnd;
+      v["source_pid"] = windowPid;
+      const auto task = v.value("task_id", currentTaskId);
+      if (!task.empty()) {
+        v["conversation_id"] = task;
+        v["task_id"] = scopedTaskId(windowToken, task);
+      }
+    }
+    return v;
+  }
   void emit(json v) {
     if (!stopped.load()) {
       v["_generation"] = generation;
-      bus->emit(std::move(v));
+      bus->emit(scopedEvent(std::move(v)));
     }
   }
   void status(const std::string &s) {
@@ -870,6 +927,11 @@ struct Watcher {
     return name == L"claude.exe";
   }
   uint64_t chooseWindow() {
+    if (!windowToken.empty()) {
+      DWORD pid = 0;
+      GetWindowThreadProcessId(reinterpret_cast<HWND>(hwnd), &pid);
+      return pid == windowPid && claudeWindow(hwnd) ? hwnd : 0;
+    }
     auto foreground =
         reinterpret_cast<uint64_t>(GetAncestor(GetForegroundWindow(), GA_ROOT));
     if (foreground != lastForeground) {
@@ -904,6 +966,9 @@ struct Watcher {
     const auto quality = snapshot.value("identity_quality", "view_fallback");
     const auto sourceHwnd = snapshot.value("source_hwnd", hwnd);
     const auto sourcePid = snapshot.value("source_pid", 0ULL);
+    if (!windowToken.empty() &&
+        (sourceHwnd != hwnd || sourcePid != windowPid))
+      return;
     // A reader restart can lose its URL cache. Never publish an unverified
     // fallback body into a task previously identified by URL on this window.
     const bool unverifiedFallback = !currentTaskId.empty() &&
@@ -920,6 +985,7 @@ struct Watcher {
     if (taskChanged) {
       consistentTaskSnapshots = 0;
       forwardedSlots.clear();
+      deletionTombstones.clear();
       acceptedBodies.clear();
       blockAliases.clear();
       acceptedKinds.clear();
@@ -1126,6 +1192,7 @@ struct Watcher {
     meta["source_window_replay"] = replayWindow;
     meta["source_window_rebind"] = expandedWindow;
     emit(std::move(meta));
+    replayOverflowSource();
     if (consistentTaskSnapshots < 2) {
       auto identityOnly = effective;
       identityOnly["blocks"] = json::array();
@@ -1146,6 +1213,8 @@ struct Watcher {
         auto removed = item.second;
         removed["text"] = "";
         removed.erase("source_index");
+        removed["stable"] = true;
+        rememberDeletion(removed, item.first);
         emit(std::move(removed));
       }
       forwardedSlots.clear();
@@ -1170,6 +1239,39 @@ struct Watcher {
       publishLedger(std::move(event));
     }
   }
+  void rememberDeletion(json event, const std::string &slot) {
+    event.erase("source_index");
+    event["stable"] = true;
+    const auto key = event.value("key", slot);
+    deletionTombstones[key] = std::move(event);
+    while (deletionTombstones.size() > 100) {
+      const auto oldest = std::min_element(deletionTombstones.begin(), deletionTombstones.end(),
+          [](const auto &left, const auto &right) {
+            return left.second.value("forwarded_order", 0ULL) <
+                   right.second.value("forwarded_order", 0ULL);
+          });
+      deletionTombstones.erase(oldest);
+    }
+  }
+  void replayOverflowSource() {
+    if (windowToken.empty() || !bus->takeSourceReplay(windowToken)) return;
+    // Queue overflow is the only replay trigger. Preserve occurrence keys,
+    // revisions and Ledger timers so already received captions deduplicate.
+    // At most 100 live slots plus 100 explicit deletions can be replayed. Absent
+    // message blocks are history and never manufacture deletion tombstones.
+    std::vector<json> ordered;
+    ordered.reserve(forwardedSlots.size() + deletionTombstones.size());
+    for (const auto &slot : forwardedSlots) ordered.push_back(slot.second);
+    for (const auto &deleted : deletionTombstones) ordered.push_back(deleted.second);
+    std::sort(ordered.begin(), ordered.end(), [](const json &left, const json &right) {
+      return left.value("forwarded_order", 0ULL) < right.value("forwarded_order", 0ULL);
+    });
+    for (auto &event : ordered) {
+      for (const auto &entry : currentTask.items()) event[entry.key()] = entry.value();
+      event["stable"] = true;
+      emit(std::move(event));
+    }
+  }
   void publishLedger(json event) {
     for (auto &entry : currentTask.items())
       event[entry.key()] = entry.value();
@@ -1183,11 +1285,14 @@ struct Watcher {
         auto previous = forwardedSlots.find(slot);
         if (previous == forwardedSlots.end())
           return;
+        event["forwarded_order"] = previous->second.value("forwarded_order", uint64_t(0));
         forwardedSlots.erase(previous);
         event.erase("source_index");
+        rememberDeletion(event, slot);
       } else {
         if (index == sourceIndices.end() || index->second < minimumSourceIndex)
           return;
+        deletionTombstones.erase(event.value("key", slot));
         event["source_index"] = index->second;
         const auto prior = forwardedSlots.find(slot);
         auto tracked = event;
@@ -1210,6 +1315,10 @@ struct Watcher {
   }
   void once(cclive::Ledger &ledger) {
     auto chosen = chooseWindow();
+    if (!chosen && !windowToken.empty()) {
+      stopped.store(true);
+      return;
+    }
     if (!chosen)
       throw std::runtime_error("等待可用的 Claude 桌面窗口");
     hwnd = chosen;
@@ -1266,6 +1375,10 @@ struct Watcher {
         if (Clock::now() - lastWindowCheck > std::chrono::milliseconds(500)) {
           lastWindowCheck = Clock::now();
           auto next = chooseWindow();
+          if (!next && !windowToken.empty()) {
+            stopped.store(true);
+            break;
+          }
           if (next && next != hwnd) {
             hwnd = next;
             throw WindowChanged();
@@ -1295,7 +1408,7 @@ struct Watcher {
           last = Clock::now();
           if (value.value("type", "") == "snapshot") {
             if (!stopped.load())
-              bus->capture(generation, value);
+              bus->capture(generation, scopedEvent(value));
             status(value.value("status", "正在读取助手文字"));
             publishSnapshot(value, ledger);
           } else if (value.value("type", "") == "error")
@@ -1338,6 +1451,381 @@ struct Watcher {
     }
   }
 };
+struct MultiWindowWatcher {
+  struct WindowIdentity {
+    uint64_t hwnd = 0, pid = 0, processBirth = 0;
+  };
+  struct Entry {
+    WindowIdentity identity;
+    std::string token;
+    std::shared_ptr<Watcher> reader;
+    std::thread thread;
+    ~Entry() {
+      if (reader) reader->stop();
+      if (thread.joinable()) thread.join();
+    }
+  };
+  struct TokenEntry {
+    uint64_t pid = 0, processBirth = 0;
+    std::string token;
+  };
+  // Keep identities while reading is stopped so restarting the same live
+  // window can restore its captions. Observed destruction/replacement mints
+  // another token even if Windows later reuses the native handle.
+  inline static std::mutex tokenMutex;
+  inline static std::map<uint64_t, TokenEntry> tokens;
+  inline static uint64_t tokenSequence = 0;
+  inline static std::mutex hookMutex;
+  inline static std::map<HWINEVENTHOOK, MultiWindowWatcher *> hooks;
+  uint64_t initialHwnd, generation, selectedHwnd = 0;
+  std::string selectedToken;
+  int settle;
+  std::vector<std::string> secretEnvs;
+  std::shared_ptr<Bus> bus;
+  std::atomic_bool stopped{false};
+  std::mutex mutex;
+  std::map<uint64_t, std::shared_ptr<Entry>> entries;
+  std::set<uint64_t> destroyed;
+  HWINEVENTHOOK destroyHook = nullptr;
+  MultiWindowWatcher(uint64_t h, uint64_t g, int s,
+                     std::vector<std::string> keys, std::shared_ptr<Bus> b)
+      : initialHwnd(h), generation(g), settle(s), secretEnvs(std::move(keys)),
+        bus(std::move(b)) {}
+  ~MultiWindowWatcher() { stop(); finishReaders(); }
+  static std::string windowToken(const WindowIdentity &identity) {
+    std::lock_guard<std::mutex> lock(tokenMutex);
+    auto found = tokens.find(identity.hwnd);
+    if (found != tokens.end() && found->second.pid == identity.pid &&
+        found->second.processBirth == identity.processBirth)
+      return found->second.token;
+    const auto token = "window:" + std::to_string(identity.pid) + ":" +
+                       std::to_string(identity.hwnd) + ":" +
+                       std::to_string(identity.processBirth) + ":" +
+                       std::to_string(++tokenSequence);
+    tokens[identity.hwnd] = {identity.pid, identity.processBirth, token};
+    return token;
+  }
+  static void forgetToken(uint64_t hwnd, const std::string &expected = {}) {
+    std::lock_guard<std::mutex> lock(tokenMutex);
+    const auto found = tokens.find(hwnd);
+    if (found != tokens.end() &&
+        (expected.empty() || found->second.token == expected))
+      tokens.erase(found);
+  }
+  static void CALLBACK windowDestroyed(HWINEVENTHOOK hook, DWORD, HWND window,
+                                      LONG object, LONG child, DWORD, DWORD) {
+    if (object != OBJID_WINDOW || child != CHILDID_SELF || !window)
+      return;
+    std::lock_guard<std::mutex> hooksLock(hookMutex);
+    const auto found = hooks.find(hook);
+    if (found == hooks.end()) return;
+    auto &manager = *found->second;
+    const auto handle = reinterpret_cast<uint64_t>(window);
+    std::lock_guard<std::mutex> lock(manager.mutex);
+    if (const auto entry = manager.entries.find(handle);
+        entry != manager.entries.end()) {
+      manager.destroyed.insert(handle);
+      entry->second->reader->stop();
+    }
+  }
+  void stop() {
+    stopped.store(true);
+    std::lock_guard<std::mutex> lock(mutex);
+    for (const auto &entry : entries) entry.second->reader->stop();
+  }
+  static void finish(std::vector<std::shared_ptr<Entry>> readers) {
+    for (const auto &entry : readers) entry->reader->stop();
+    for (const auto &entry : readers)
+      if (entry->thread.joinable()) entry->thread.join();
+  }
+  void finishReaders() {
+    std::vector<std::shared_ptr<Entry>> readers;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      for (auto &entry : entries) readers.push_back(std::move(entry.second));
+      entries.clear();
+    }
+    finish(std::move(readers));
+  }
+  // Selection carries no source text and never stops/restarts any reader.
+  // Synthetic checks use this same method without creating native children.
+  void selectWindow(uint64_t handle) {
+    json event;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      const auto found = entries.find(handle);
+      if (found == entries.end() || found->second->token == selectedToken)
+        return;
+      selectedHwnd = handle;
+      selectedToken = found->second->token;
+      event = {{"type", "select_window"}, {"window_scoped", true},
+               {"window_token", selectedToken}, {"source_hwnd", handle},
+               {"source_pid", found->second->identity.pid},
+               {"_generation", generation}};
+    }
+    if (!stopped.load()) bus->emit(std::move(event));
+  }
+  void reconcile(std::vector<WindowIdentity> windows, bool spawn = true) {
+    // Prefer the selected window if the acquisition/cache limit is reached.
+    const auto preferred = selectedHwnd ? selectedHwnd : initialHwnd;
+    std::stable_sort(windows.begin(), windows.end(), [preferred](const auto &a,
+                                                               const auto &b) {
+      return (a.hwnd == preferred) > (b.hwnd == preferred);
+    });
+    if (windows.size() > 50) windows.resize(50);
+    std::map<uint64_t, WindowIdentity> incoming;
+    for (const auto &window : windows)
+      if (window.hwnd && window.pid) incoming.emplace(window.hwnd, window);
+    std::vector<std::shared_ptr<Entry>> removed, added;
+    uint64_t nextSelection = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      for (auto entry = entries.begin(); entry != entries.end();) {
+        const auto found = incoming.find(entry->first);
+        const auto &identity = entry->second->identity;
+        if (destroyed.count(entry->first) || entry->second->reader->stopped.load() ||
+            (spawn && !entry->second->thread.joinable()) ||
+            found == incoming.end() ||
+            found->second.pid != identity.pid ||
+            found->second.processBirth != identity.processBirth) {
+          forgetToken(entry->first, entry->second->token);
+          removed.push_back(std::move(entry->second));
+          entry = entries.erase(entry);
+        } else ++entry;
+      }
+      destroyed.clear();
+      for (const auto &window : windows) {
+        if (!window.hwnd || !window.pid || entries.count(window.hwnd)) continue;
+        auto entry = std::make_shared<Entry>();
+        entry->identity = window;
+        entry->token = windowToken(window);
+        entry->reader = std::make_shared<Watcher>(
+            window.hwnd, generation, settle, secretEnvs, bus, entry->token,
+            window.pid);
+        entries.emplace(window.hwnd, entry);
+        added.push_back(std::move(entry));
+      }
+      if (entries.count(preferred)) nextSelection = preferred;
+      else if (!entries.empty()) nextSelection = entries.begin()->first;
+    }
+    // Prune only identities absent from the observed live inventory. Normal
+    // stop/start leaves identities untouched; there are at most 50 entries.
+    {
+      std::lock_guard<std::mutex> lock(tokenMutex);
+      for (auto entry = tokens.begin(); entry != tokens.end();)
+        if (!incoming.count(entry->first)) entry = tokens.erase(entry);
+        else ++entry;
+    }
+    selectWindow(nextSelection);
+    if (spawn) {
+      for (const auto &entry : added) {
+        if (stopped.load()) entry->reader->stop();
+        entry->thread = std::thread([reader = entry->reader] { reader->run(); });
+      }
+    }
+    finish(std::move(removed));
+  }
+  static std::vector<WindowIdentity> enumerate() {
+    const auto windows = json::parse(cclive::enumerate_windows_json());
+    std::vector<WindowIdentity> identities;
+    std::map<uint64_t, uint64_t> processBirths;
+    for (const auto &window : windows) {
+      const auto handle = window.value("hwnd", 0ULL);
+      const auto pid = window.value("pid", 0ULL);
+      if (!handle || !pid) continue;
+      if (!processBirths.count(pid)) {
+        Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                   static_cast<DWORD>(pid)));
+        FILETIME creation{}, exit{}, kernel{}, user{};
+        if (!process.h || !GetProcessTimes(process.h, &creation, &exit, &kernel,
+                                          &user)) continue;
+        processBirths[pid] = (static_cast<uint64_t>(creation.dwHighDateTime) << 32)
+                            | creation.dwLowDateTime;
+      }
+      identities.push_back({handle, pid, processBirths[pid]});
+    }
+    return identities;
+  }
+  void run() {
+    destroyHook = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY,
+                                 nullptr, windowDestroyed, 0, 0,
+                                 WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (destroyHook) {
+      std::lock_guard<std::mutex> lock(hookMutex);
+      hooks.emplace(destroyHook, this);
+    }
+    auto lastInventory = Clock::time_point::min();
+    while (!stopped.load()) {
+      MSG message{};
+      while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+      }
+      try {
+        if (lastInventory == Clock::time_point::min() ||
+            Clock::now() - lastInventory >= std::chrono::seconds(1)) {
+          reconcile(enumerate());
+          lastInventory = Clock::now();
+        }
+        const auto foreground = reinterpret_cast<uint64_t>(
+            GetAncestor(GetForegroundWindow(), GA_ROOT));
+        selectWindow(foreground);
+      } catch (const std::exception &) {
+        // Keep already connected readers alive during a transient inventory
+        // failure rather than discarding every window's acquisition state.
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (destroyHook) {
+      {
+        std::lock_guard<std::mutex> lock(hookMutex);
+        hooks.erase(destroyHook);
+      }
+      UnhookWinEvent(destroyHook);
+      destroyHook = nullptr;
+    }
+    finishReaders();
+  }
+};
+json multiWindowWatcherChecks() {
+  json checks = json::array();
+  auto check = [&](const char *name, bool value) {
+    checks.push_back({{"name", name}, {"passed", value}});
+  };
+  auto bus = std::make_shared<Bus>();
+  MultiWindowWatcher manager(11, 7, 0, {}, bus);
+  manager.reconcile({{11, 101, 1001}, {22, 102, 1002}}, false);
+  const auto first = manager.entries.at(11);
+  const auto second = manager.entries.at(22);
+  auto selectionCount = [&] {
+    std::size_t count = 0;
+    for (const auto &event : bus->source)
+      if (event.value("type", "") == "select_window") ++count;
+    for (const auto &event : bus->misc)
+      if (event.value("type", "") == "select_window") ++count;
+    return count;
+  };
+  check("initial_multiwindow_selection_respects_requested_native_window",
+        manager.selectedHwnd == 11 && manager.selectedToken == first->token &&
+        selectionCount() == 1);
+  const std::string conversation = "https://claude.ai/chat/shared-test-task";
+  first->reader->emit({{"type", "task"}, {"task_id", conversation}});
+  second->reader->emit({{"type", "task"}, {"task_id", conversation}});
+  json firstTask, secondTask;
+  for (const auto &event : bus->source)
+    if (event.value("source_hwnd", 0ULL) == 11) firstTask = event;
+    else if (event.value("source_hwnd", 0ULL) == 22) secondTask = event;
+  check("same_conversation_in_two_windows_gets_distinct_caption_identities",
+        !firstTask.empty() && !secondTask.empty() &&
+        firstTask["task_id"] != secondTask["task_id"] &&
+        firstTask["conversation_id"] == secondTask["conversation_id"] &&
+        firstTask.value("window_scoped", false) &&
+        firstTask.value("_generation", 0ULL) == 7);
+  manager.selectWindow(22);
+  const auto afterSelection = selectionCount();
+  manager.selectWindow(22);
+  manager.selectWindow(99); // A non-Claude foreground keeps the last selection.
+  check("window_selection_does_not_stop_other_window_readers",
+        manager.selectedToken == second->token && !first->reader->stopped.load() &&
+        !second->reader->stopped.load() && afterSelection == 1 &&
+        selectionCount() == afterSelection);
+  const auto tokenBeforeRefresh = first->token;
+  manager.reconcile({{11, 101, 1001}, {22, 102, 1002}}, false);
+  check("window_inventory_refresh_preserves_lifecycle_and_reader_identity",
+        manager.entries.at(11) == first &&
+        manager.entries.at(11)->token == tokenBeforeRefresh);
+  manager.reconcile({{22, 102, 1002}}, false);
+  manager.reconcile({{11, 101, 1001}, {22, 102, 1002}}, false);
+  check("reused_native_handle_receives_new_window_identity",
+        manager.entries.at(11)->token != tokenBeforeRefresh &&
+        first->reader->stopped.load());
+  const auto restartToken = manager.entries.at(22)->token;
+  {
+    MultiWindowWatcher restarted(22, 8, 0, {}, std::make_shared<Bus>());
+    restarted.reconcile({{11, 101, 1001}, {22, 102, 1002}}, false);
+    check("same_live_window_identity_survives_manager_restart",
+          restarted.entries.at(22)->token == restartToken);
+  }
+  const auto oldProcessToken = manager.entries.at(22)->token;
+  manager.reconcile({{11, 101, 1001}, {22, 102, 2002}}, false);
+  check("reused_process_and_window_ids_do_not_reuse_old_caption_identity",
+        manager.entries.at(22)->token != oldProcessToken);
+  manager.stop();
+  check("stopping_multiwindow_reader_stops_all_owned_readers",
+        std::all_of(manager.entries.begin(), manager.entries.end(),
+                    [](const auto &entry) { return entry.second->reader->stopped.load(); }));
+  {
+    auto overflowBus = std::make_shared<Bus>();
+    Watcher replaying(33, 9, 0, {}, overflowBus, "overflow-window", 103);
+    cclive::Ledger ledger(0);
+    auto snapshot = json{{"task_id", "overflow-task"}, {"context", "overflow-task"},
+        {"identity_quality", "url"}, {"source_hwnd", 33}, {"source_pid", 103},
+        {"blocks", json::array({{{"key", "overflow-block"},
+                                 {"text", "First retained sentence. Second retained sentence."}}})}};
+    replaying.publishSnapshot(snapshot, ledger);
+    replaying.publishSnapshot(snapshot, ledger);
+    const auto slots = replaying.forwardedSlots;
+    for (int n = 0; n < 513; ++n)
+      overflowBus->emit({{"type", "text"}, {"key", "filler-" + std::to_string(n)}});
+    check("bounded_source_queue_records_managed_window_overflow",
+          slots.size() == 2 && overflowBus->source.size() == 512 &&
+          overflowBus->sourceReplays.count("overflow-window"));
+    overflowBus->source.clear(); // Simulate the UI draining the bounded FIFO.
+    replaying.publishSnapshot(snapshot, ledger);
+    check("managed_source_overflow_replays_occurrences_after_metadata_in_source_order",
+          overflowBus->source.size() == 3 &&
+          overflowBus->source[0].value("type", "") == "task" &&
+          overflowBus->source[1].value("text", "") == "First retained sentence." &&
+          overflowBus->source[2].value("text", "") == "Second retained sentence." &&
+          overflowBus->source[1].value("task_id", "") ==
+              Watcher::scopedTaskId("overflow-window", "overflow-task") &&
+          overflowBus->source[1].value("window_token", "") == "overflow-window" &&
+          replaying.forwardedSlots == slots && overflowBus->sourceReplays.empty());
+    overflowBus->source.clear();
+    replaying.publishSnapshot(snapshot, ledger);
+    check("stable_managed_source_does_not_periodically_replay_its_cache",
+          overflowBus->source.size() == 1 && replaying.forwardedSlots == slots);
+    overflowBus->source.clear();
+    snapshot["blocks"][0]["text"] = "Corrected retained sentence.";
+    replaying.publishSnapshot(snapshot, ledger); // A genuine rewrite deletes the tail slot.
+    std::string removedKey;
+    for (const auto &event : overflowBus->source)
+      if (event.value("type", "") == "text" && event.value("text", "").empty())
+        removedKey = event.value("key", "");
+    for (int n = 0; n < 513; ++n)
+      overflowBus->emit({{"type", "text"}, {"key", "deletion-filler-" + std::to_string(n)}});
+    overflowBus->source.clear();
+    replaying.publishSnapshot(snapshot, ledger);
+    check("source_overflow_replays_lost_explicit_deletion_with_its_original_occurrence_key",
+          !removedKey.empty() && replaying.forwardedSlots.size() == 1 &&
+          replaying.deletionTombstones.size() == 1 && overflowBus->source.size() == 3 &&
+          overflowBus->source[0].value("type", "") == "task" &&
+          overflowBus->source[1].value("text", "") == "Corrected retained sentence." &&
+          overflowBus->source[2].value("type", "") == "text" &&
+          overflowBus->source[2].value("text", "nonempty").empty() &&
+          overflowBus->source[2].value("key", "") == removedKey &&
+          !overflowBus->source[2].contains("source_index") &&
+          overflowBus->sourceReplays.empty());
+    overflowBus->source.clear();
+    snapshot["blocks"][0]["text"] = "Corrected retained sentence. Second retained sentence.";
+    replaying.publishSnapshot(snapshot, ledger);
+    check("nonempty_revision_of_deleted_occurrence_retires_its_tombstone",
+          replaying.deletionTombstones.empty() && replaying.forwardedSlots.size() == 2);
+    overflowBus->source.clear();
+    overflowBus->sourceReplays.insert("overflow-window");
+    snapshot["task_id"] = "another-overflow-task";
+    snapshot["context"] = "another-overflow-task";
+    snapshot["blocks"][0]["text"] = "A different task.";
+    replaying.publishSnapshot(snapshot, ledger);
+    check("overflow_recovery_does_not_replay_slots_from_previous_conversation",
+          replaying.forwardedSlots.empty() && replaying.deletionTombstones.empty() &&
+          std::none_of(overflowBus->source.begin(), overflowBus->source.end(),
+                       [](const json &event) { return event.value("type", "") == "text"; }));
+  }
+  MultiWindowWatcher::forgetToken(11);
+  MultiWindowWatcher::forgetToken(22);
+  return checks;
+}
 struct Record {
   std::string key, source, translation, error, sourceSignature,
       state = "waiting";
@@ -1592,7 +2080,7 @@ public:
   std::vector<json> windows;
   std::shared_ptr<Bus> bus = std::make_shared<Bus>();
   std::shared_ptr<Worker> worker = std::make_shared<Worker>(bus);
-  std::shared_ptr<Watcher> watcher;
+  std::shared_ptr<MultiWindowWatcher> watcher;
   Clock::time_point lastRender = Clock::now(), demoStart, testStart;
   struct BodyRender {
     std::wstring input, displayed;
@@ -1629,6 +2117,10 @@ public:
   std::size_t windowReplayLastIndex = 0;
   std::size_t minimumSourceIndex = 0;
   Clock::time_point lastCacheSave = Clock::now();
+  bool routingWindowEvent = false, suppressTaskUi = false;
+  std::string activeWindowToken, selectedWindowToken;
+  uint64_t windowSeenSequence = 0, activeWindowSeen = 0;
+  POINT taskSourceScroll{}, taskTranslationScroll{};
   App(bool d, bool t, fs::path r, bool automatic, fs::path diagnostic)
       : autoStart(automatic), demo(d), selfTest(t), reportPath(std::move(r)),
         configPath(exePath().parent_path() / "data" / "config.json"),
@@ -1670,7 +2162,7 @@ public:
   }
   int s(int n) const { return MulDiv(n, dpi, 96); }
   void status(const std::string &v) {
-    if (!closed && statusLabel)
+    if (!suppressTaskUi && !closed && statusLabel)
       SetWindowTextW(statusLabel, wide(v).c_str());
   }
   HWND control(const wchar_t *klass, const wchar_t *text, DWORD style, int id,
@@ -2035,8 +2527,15 @@ public:
                                    : std::string()}};
   }
   void updateTaskTitle() {
+    if (suppressTaskUi) return;
     std::string titleText =
         activeTaskTitle.empty() ? "等待选择任务" : activeTaskTitle;
+    const auto suffix = activeWindowToken.find_last_of(':');
+    if (suffix != std::string::npos) {
+      const auto number = activeWindowToken.substr(suffix + 1);
+      if (!number.empty() && number.find_first_not_of("0123456789") == std::string::npos)
+        titleText = "窗口 " + number + " · " + titleText;
+    }
     SetWindowTextW(taskLabel, wide("正在翻译：" + titleText).c_str());
     SetWindowTextW(hwnd, wide("Claude 实时翻译 · " + titleText).c_str());
   }
@@ -2054,7 +2553,7 @@ public:
     return count;
   }
   void invalidateAliases(const Record &record) {
-    worker->cancel(record.key);
+    worker->cancel(record.key, activeTaskId);
     replayCandidates.erase(record.key);
     for (auto i = sourceAliases.begin(); i != sourceAliases.end();)
       if (i->second.record == record.key)
@@ -2120,14 +2619,19 @@ public:
                        {"error", record.error},
                        {"source_signature", record.sourceSignature},
                        {"serial", record.serial},
+                       {"version", record.version},
                        {"displayed_update", record.displayedUpdate}});
-    POINT source{}, translated{};
-    if (sourceEdit)
+    POINT source = taskSourceScroll, translated = taskTranslationScroll;
+    if (!suppressTaskUi && sourceEdit)
       SendMessageW(sourceEdit, EM_GETSCROLLPOS, 0,
                    reinterpret_cast<LPARAM>(&source));
-    if (translationEdit)
+    if (!suppressTaskUi && translationEdit)
       SendMessageW(translationEdit, EM_GETSCROLLPOS, 0,
                    reinterpret_cast<LPARAM>(&translated));
+    json aliases = json::array();
+    for (const auto &entry : sourceAliases)
+        aliases.push_back({{"source", entry.first}, {"record", entry.second.record},
+                           {"block", entry.second.block}, {"signature", entry.second.signature}});
     return {{"task_id", activeTaskId},
             {"task_title", activeTaskTitle},
             {"identity_quality", activeIdentityQuality},
@@ -2141,20 +2645,229 @@ public:
             {"translation_scroll_x", translated.x},
             {"translation_scroll_y", translated.y},
             {"follow_source", followingSource},
-            {"follow_translation", followingTranslation}};
+            {"follow_translation", followingTranslation},
+            {"window_runtime", {{"window_token", activeWindowToken},
+                {"window_seen", activeWindowSeen}, {"source_generation", sourceGeneration},
+                {"generation", generation}, {"serial", serial}, {"ledger_epoch", ledgerEpoch},
+                {"source_hwnd", selectedSourceHwnd}, {"aliases", aliases},
+                {"replay_candidates", replayCandidates}, {"cleared_indices", clearedSourceIndices},
+                {"minimum_index", minimumSourceIndex}, {"source_needs_replay", sourceNeedsReplay},
+                {"replay_pending_body", replayPendingBody}, {"replay_memo", windowReplayMemo},
+                {"replay_last_index", windowReplayLastIndex}, {"metadata", lastTaskMetadata}}}};
   }
   void saveActiveTask() {
     if (!activeTaskId.empty() && taskCache) {
       try {
-        if (records.empty() && clearedSignatures.empty())
+        if (records.empty() && clearedSignatures.empty() && activeWindowToken.empty())
           taskCache->erase(activeTaskId);
-        else
+        else {
+          const auto previous = taskCache->keys();
           taskCache->put(activeTaskId, taskPayload());
+          if (!taskCache->healthy()) {
+            worker->cancelTask(activeTaskId);
+            taskCache->erase(activeTaskId);
+          }
+          const auto retained = taskCache->keys();
+          for (const auto &id : previous)
+            if (std::find(retained.begin(), retained.end(), id) == retained.end()) worker->cancelTask(id);
+        }
       } catch (...) {
       }
     }
     cacheDirty = false;
     lastCacheSave = Clock::now();
+  }
+  json emptyWindowTask(const json &metadata) const {
+    return {{"task_id", metadata.value("task_id", "")},
+            {"task_title", metadata.value("task_title", "Claude 任务")},
+            {"identity_quality", metadata.value("identity_quality", "view_fallback")},
+            {"translation_profile", translationProfile()}, {"records", json::array()},
+            {"window_runtime", {{"window_token", metadata.value("window_token", "")},
+                {"source_hwnd", metadata.value("source_hwnd", 0ULL)},
+                {"source_generation", sourceGeneration}, {"generation", generation},
+                {"metadata", metadata}}}};
+  }
+  void loadWindowTask(const json &payload, bool resume = true) {
+    const auto runtime = payload.value("window_runtime", json::object());
+    const bool matching = payload.value("translation_profile", json::object()) == translationProfile();
+    const bool sameReader = runtime.value("source_generation", 0ULL) == sourceGeneration;
+    const bool live = matching && sameReader &&
+                      runtime.value("generation", 0ULL) == generation;
+    activeTaskId = payload.value("task_id", "");
+    activeTaskTitle = payload.value("task_title", "Claude 任务");
+    activeIdentityQuality = payload.value("identity_quality", "view_fallback");
+    activeProfile = translationProfile();
+    activeWindowToken = runtime.value("window_token", "");
+    activeWindowSeen = runtime.value("window_seen", 0ULL);
+    windowSeenSequence = std::max(windowSeenSequence, activeWindowSeen);
+    selectedSourceHwnd = runtime.value("source_hwnd", 0ULL);
+    serial = runtime.value("serial", 0ULL);
+    ledgerEpoch = runtime.value("ledger_epoch", -1);
+    minimumSourceIndex = runtime.value("minimum_index", std::size_t(0));
+    sourceNeedsReplay = runtime.value("source_needs_replay", false);
+    replayPendingBody = runtime.value("replay_pending_body", false);
+    windowReplayLastIndex = runtime.value("replay_last_index", std::size_t(0));
+    lastTaskMetadata = runtime.value("metadata", json::object());
+    clearedSignatures = payload.value("cleared_signatures", std::vector<std::string>{});
+    clearedBlocks = payload.value("cleared_blocks", std::set<std::string>{});
+    clearedSourceIndices = runtime.value("cleared_indices", std::set<std::size_t>{});
+    replayCandidates = runtime.value("replay_candidates", std::set<std::string>{});
+    windowReplayMemo = matching ? runtime.value("replay_memo", std::map<std::string, std::string>{})
+                               : std::map<std::string, std::string>{};
+    followingSource = payload.value("follow_source", true);
+    followingTranslation = payload.value("follow_translation", true);
+    taskSourceScroll = {payload.value("source_scroll_x", 0L), payload.value("source_scroll_y", 0L)};
+    taskTranslationScroll = {payload.value("translation_scroll_x", 0L), payload.value("translation_scroll_y", 0L)};
+    records.clear();
+    sourceAliases.clear();
+    std::set<std::string> retained;
+    for (const auto &item : payload.value("records", json::array())) {
+      if (!item.is_object() || !item.contains("source") || !item["source"].is_string()) continue;
+      Record r;
+      r.serial = item.value("serial", 0ULL);
+      if (!r.serial) r.serial = ++serial;
+      serial = std::max(serial, r.serial);
+      r.key = item.value("key", "record-" + std::to_string(r.serial));
+      r.source = item["source"].get<std::string>();
+      r.sourceSignature = item.value("source_signature", contentSignature(r.source));
+      r.translation = matching ? item.value("translation", "") : "";
+      r.error = matching ? item.value("error", "") : "";
+      r.state = matching ? item.value("state", "waiting") : "waiting";
+      r.pendingReplacement = matching && item.value("pending_replacement", false) && !r.translation.empty();
+      r.visible = item.value("visible", true);
+      r.displayedUpdate = item.value("displayed_update", 0ULL);
+      displayedUpdateSequence = std::max(displayedUpdateSequence, r.displayedUpdate);
+      r.version = item.value("version", 0ULL);
+      revision = std::max(revision, r.version);
+      if (!r.version) r.version = ++revision;
+      if (!live && r.state != "done" && r.state != "error") {
+        r.version = ++revision;
+        r.state = !running ? "stopped" : paused ? "paused" : "waiting";
+      }
+      r.hasLayout = item.value("has_layout", false);
+      r.layoutBlock = item.value("layout_block", "");
+      r.layoutParagraph = item.value("layout_paragraph", std::size_t(0));
+      retained.insert(r.key);
+      records.push_back(std::move(r));
+    }
+    for (const auto &entry : runtime.value("aliases", json::array())) {
+      const auto key = entry.value("source", ""), record = entry.value("record", "");
+      if (!key.empty() && (record.empty() || retained.count(record)))
+        sourceAliases[key] = {record, entry.value("block", ""), entry.value("signature", "")};
+    }
+    for (auto it = replayCandidates.begin(); it != replayCandidates.end();)
+      if (!retained.count(*it)) it = replayCandidates.erase(it); else ++it;
+    if (!sameReader) {
+      ledgerEpoch = -1;
+      sourceAliases.clear();
+      replayCandidates = std::move(retained);
+      sourceNeedsReplay = true;
+      windowReplayMemo.clear();
+      windowReplayLastIndex = 0;
+    }
+    trimRecords();
+    if (resume && running && !paused)
+      for (auto &r : records) if (r.state == "waiting") enqueue(r);
+  }
+  void restoreWindowView() {
+    updateTaskTitle();
+    dirty = true;
+    render();
+    ScrollGuard guard(internalScroll);
+    if (!followingSource) SendMessageW(sourceEdit, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&taskSourceScroll));
+    if (!followingTranslation) SendMessageW(translationEdit, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&taskTranslationScroll));
+    repaintBody(sourceEdit);
+    repaintBody(translationEdit);
+  }
+  void selectWindowTask(const json &metadata) {
+    const auto id = metadata.value("task_id", "");
+    if (id.empty() || (id == activeTaskId && metadata.value("window_token", "") == activeWindowToken)) return;
+    saveActiveTask();
+    const auto cached = taskCache->get(id);
+    if (!cached) bus->requestSourceReplay(metadata.value("window_token", ""));
+    loadWindowTask(cached.value_or(emptyWindowTask(metadata)));
+    restoreWindowView();
+  }
+  void selectWindow(const json &event) {
+    selectedWindowToken = event.value("window_token", "");
+    if (selectedWindowToken.empty()) return;
+    saveActiveTask();
+    std::optional<json> latest;
+    uint64_t seen = 0;
+    for (const auto &id : taskCache->keys()) {
+      const auto candidate = taskCache->get(id);
+      if (!candidate) continue;
+      const auto runtime = candidate->value("window_runtime", json::object());
+      if (runtime.value("window_token", "") == selectedWindowToken &&
+          (!latest || runtime.value("window_seen", 0ULL) >= seen)) {
+        latest = candidate;
+        seen = runtime.value("window_seen", 0ULL);
+      }
+    }
+    if (latest) {
+      if (latest->value("task_id", "") != activeTaskId) loadWindowTask(*latest);
+    } else {
+      auto pending = event;
+      pending["task_id"] = json::array({selectedWindowToken, "pending"}).dump();
+      pending["task_title"] = "等待当前窗口的会话";
+      loadWindowTask(emptyWindowTask(pending));
+    }
+    restoreWindowView();
+  }
+  template<class F> void inBackgroundWindow(const json &payload, F apply) {
+    const auto visible = taskPayload();
+    const bool previousDirty = dirty, previousCacheDirty = cacheDirty;
+    const bool previousRouting = routingWindowEvent, previousSuppression = suppressTaskUi;
+    saveActiveTask();
+    suppressTaskUi = routingWindowEvent = true;
+    auto restore = [&] {
+      loadWindowTask(visible, false);
+      dirty = previousDirty;
+      cacheDirty = previousCacheDirty;
+      suppressTaskUi = previousSuppression;
+      routingWindowEvent = previousRouting;
+    };
+    try {
+      loadWindowTask(payload);
+      apply();
+      saveActiveTask();
+    } catch (...) { restore(); throw; }
+    restore();
+  }
+  bool routeWindowEvent(const json &event) {
+    if (routingWindowEvent || !event.value("window_scoped", false)) return false;
+    if (event.value("_generation", sourceGeneration) != sourceGeneration) return true;
+    const auto type = event.value("type", "");
+    if (type == "select_window") { selectWindow(event); return true; }
+    const auto token = event.value("window_token", ""), id = event.value("task_id", "");
+    if (token.empty()) return true;
+    if (type == "status" || type == "error") {
+      if (token == selectedWindowToken && (id.empty() || id == activeTaskId)) status(event.value("text", ""));
+      return true;
+    }
+    if (id.empty() || (type != "task" && type != "text" && type != "reset")) return true;
+    if (selectedWindowToken.empty()) selectedWindowToken = token;
+    if (token == selectedWindowToken && (type == "task" || id == activeTaskId)) {
+      selectWindowTask(event);
+      const bool previousRouting = routingWindowEvent;
+      routingWindowEvent = true;
+      try {
+        if (type == "task") activeWindowSeen = ++windowSeenSequence;
+        accept(event);
+        if (type == "task" && running && !paused)
+          for (auto &r : records) if (r.state == "waiting") enqueue(r);
+      } catch (...) { routingWindowEvent = previousRouting; throw; }
+      routingWindowEvent = previousRouting;
+    } else {
+      auto payload = taskCache->get(id);
+      if (!payload && type != "task") return true;
+      if (!payload) bus->requestSourceReplay(token);
+      inBackgroundWindow(payload.value_or(emptyWindowTask(event)), [&] {
+        if (type == "task") activeWindowSeen = ++windowSeenSequence;
+        accept(event);
+      });
+    }
+    return true;
   }
   void updateClearBoundary(const json &metadata, bool restored = false) {
     if (!metadata.contains("source_signatures") ||
@@ -2270,6 +2983,10 @@ public:
     }
   }
   void switchTask(const json &metadata) {
+    if (!routingWindowEvent) {
+      activeWindowToken.clear();
+      selectedWindowToken.clear();
+    }
     const auto id = metadata.value("task_id", "");
     if (id.empty())
       return;
@@ -2500,7 +3217,7 @@ public:
     status("已清空当前任务；其他任务的缓存保留");
   }
   void enqueue(Record &r) {
-    worker->cancel(r.key);
+    worker->cancel(r.key, activeTaskId);
     if (cclive::chinese_passthrough(settings, r.source)) {
       const bool changed = !r.visible || r.translation != r.source || r.pendingReplacement;
       r.translation = r.source;
@@ -2673,6 +3390,7 @@ public:
     SetWindowTextW(dialog.error, wide(event.value("error", "")).c_str());
   }
   void accept(json v) {
+    if (routeWindowEvent(v)) return;
     auto type = v.value("type", "");
     if (type == "chatgpt_identity") {
       cclive::chatgpt::AccountStatus account;
@@ -2749,10 +3467,13 @@ public:
         return;
       sourceAliases.clear();
       if (ledgerEpoch >= 0 && !v.value("source_rebind", false)) {
-        ++generation;
-        cancelAll();
+        if (activeWindowToken.empty()) {
+          ++generation;
+          cancelAll();
+        } else worker->cancelTask(activeTaskId);
         for (auto &record : records)
           if (record.state != "done") {
+            if (!activeWindowToken.empty()) record.version = ++revision;
             record.state = paused ? "paused" : "waiting";
             if (!paused && running)
               enqueue(record);
@@ -2786,7 +3507,7 @@ public:
                                  });
     if (source.empty()) {
       if (it != records.end()) {
-        worker->cancel(it->key);
+        worker->cancel(it->key, activeTaskId);
         records.erase(it);
       }
       sourceAliases.erase(key);
@@ -2829,7 +3550,7 @@ public:
         }
       if (records.size() >= 240) {
         const auto evicted = records.front().key;
-        worker->cancel(evicted);
+        worker->cancel(evicted, activeTaskId);
         records.erase(records.begin());
         replayCandidates.erase(evicted);
         for (auto i = sourceAliases.begin(); i != sourceAliases.end();)
@@ -2880,7 +3601,7 @@ public:
       trimRecords();
       return;
     }
-    worker->cancel(it->key);
+    worker->cancel(it->key, activeTaskId);
     it->pendingReplacement = it->pendingReplacement ||
         (it->state == "done" && !it->translation.empty());
     if (it->source != source) it->visible = true;
@@ -2966,11 +3687,17 @@ public:
       cancelAll();
       sourceAliases.clear();
       sourceNeedsReplay = true;
+      if (!activeWindowToken.empty())
+        for (auto &record : records)
+          if (record.state != "done" && record.state != "error") {
+            record.version = ++revision;
+            record.state = "waiting";
+          }
       ledgerEpoch = -1;
       selectedSourceHwnd = windows[index].value("hwnd", 0ULL);
       captureSeq = capturedBlocks = capturedChars = 0;
       lastReadMs = 0;
-      watcher = std::make_shared<Watcher>(selectedSourceHwnd, sourceGeneration,
+      watcher = std::make_shared<MultiWindowWatcher>(selectedSourceHwnd, sourceGeneration,
                                           settings.settle_ms,
                                           std::vector<std::string>{
                                               settings.api_key_env,
@@ -3031,6 +3758,14 @@ public:
         if (!paused)
           enqueue(r);
       }
+    if (!paused && !activeWindowToken.empty()) {
+      for (const auto &id : taskCache->keys()) {
+        if (id == activeTaskId) continue;
+        const auto payload = taskCache->get(id);
+        if (payload && !payload->value("window_runtime", json::object()).value("window_token", "").empty())
+          inBackgroundWindow(*payload, [] {});
+      }
+    }
     SetWindowTextW(pauseButton, paused ? L"继续" : L"暂停");
     status(paused ? "已暂停翻译，继续收集新增文字" : "已继续翻译");
     dirty = true;
@@ -3338,7 +4073,7 @@ public:
     repaintBody(edit);
   }
   void render() {
-    if (closed)
+    if (closed || suppressTaskUi)
       return;
     if (settings.show_original) {
       const auto source = bodyOutput(true);
@@ -3563,12 +4298,21 @@ public:
   void acceptTelemetry(const json &v) {
     if (v.value("_generation", 0ULL) != sourceGeneration)
       return;
+    if (v.value("source_hwnd", selectedSourceHwnd) != 0 &&
+        v.value("source_hwnd", selectedSourceHwnd) != selectedSourceHwnd) return;
     captureSeq = v.value("capture_seq", 0ULL);
     lastReadMs = v.value("last_read_ms", 0.0);
     capturedBlocks = v.value("captured_blocks", std::size_t(0));
     capturedChars = v.value("captured_chars", std::size_t(0));
   }
   void acceptResult(const json &v) {
+    if (!routingWindowEvent && v.value("task_id", activeTaskId) != activeTaskId) {
+      if (v.value("generation", 0ULL) != generation) return;
+      const auto payload = taskCache->get(v.value("task_id", ""));
+      if (!payload || payload->value("window_runtime", json::object()).value("window_token", "").empty()) return;
+      inBackgroundWindow(*payload, [&] { acceptResult(v); });
+      return;
+    }
     if (v.value("task_id", activeTaskId) != activeTaskId ||
         v.value("generation", 0ULL) != generation)
       return;
@@ -3614,6 +4358,7 @@ public:
     // Self-test only: supplied synthetic events, hidden native windows, demo
     // provider. No window enumeration, Claude reading, clipboard or network.
     json checks = workerRateLimitChecks();
+    for (auto &result : multiWindowWatcherChecks()) checks.push_back(std::move(result));
     auto check = [&](const char *name, bool passed) {
       checks.push_back({{"name", name}, {"passed", passed}});
     };
@@ -6541,6 +7286,7 @@ public:
           order.source.size() == 3 && order.source[0]["type"] == "task" &&
               order.source[1]["type"] == "reset" &&
               order.source[2]["type"] == "text" && !order.reset.has_value());
+#include "../tests/window_routing_checks.inc"
     return checks;
   }
   void tick() {
@@ -6554,6 +7300,10 @@ public:
       reset.swap(bus->reset);
       telemetry.swap(bus->telemetry);
       items.swap(bus->misc);
+      if (bus->selection) {
+        items.push_front(std::move(*bus->selection));
+        bus->selection.reset();
+      }
       while (!bus->source.empty()) {
         items.push_back(std::move(bus->source.front()));
         bus->source.pop_front();

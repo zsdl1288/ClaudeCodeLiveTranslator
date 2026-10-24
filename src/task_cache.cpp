@@ -213,6 +213,10 @@ std::optional<nlohmann::json> TaskCache::get(const std::string &task_id) {
   impl_->touch(found->second);
   return found->second.payload;
 }
+std::vector<std::string> TaskCache::keys() const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return {impl_->lru.begin(), impl_->lru.end()};
+}
 void TaskCache::put(const std::string &task_id, const nlohmann::json &payload) {
   if (task_id.empty() || task_id.size() > max_id_bytes) {
     impl_->good = false;
